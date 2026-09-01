@@ -29,7 +29,7 @@ docker compose -f compose.dev.yaml up -d
 
 # 3. Backend
 python -m venv .venv && source .venv/bin/activate
-pip install -e "apps/api[dev]"
+pip install -r apps/api/requirements-dev.txt
 cd apps/api && python manage.py migrate && python manage.py runserver 127.0.0.1:8000
 
 # 4. Frontend (second terminal)

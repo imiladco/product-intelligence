@@ -1,22 +1,6 @@
-[project]
-name = "product-intelligence-api"
-version = "0.1.0"
-description = "Control plane API: users, workspaces, projects, integrations"
-requires-python = ">=3.11"
-dependencies = [
-    "Django>=5.1,<5.3",
-    "djangorestframework>=3.15",
-    "psycopg[binary]>=3.2",
-    "argon2-cffi>=23.1",
-    "dj-database-url>=2.2",
-    "python-dotenv>=1.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.3",
-    "pytest-django>=4.9",
-]
+# Tool configuration only. The API is a Django application, not a distributable
+# package, so dependencies live in requirements.txt / requirements-dev.txt and
+# there is no [project] table or build backend to install.
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings"
