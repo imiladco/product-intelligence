@@ -1,0 +1,6 @@
+# Direct development dependencies, human-readable.
+# Install from requirements-dev.lock.txt instead. See requirements.txt.
+-r requirements.txt
+
+pytest>=8.3
+pytest-django>=4.9
