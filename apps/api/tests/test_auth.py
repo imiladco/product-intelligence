@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError
 
 from accounts.serializers import SignupSerializer
+from accounts.services import EmailAlreadyRegistered, register_user
 from tests.conftest import PASSWORD
 from workspaces.models import Membership, Workspace
 
@@ -349,3 +351,94 @@ class TestSignupAtomicity:
         membership = Membership.objects.get(user=user)
         assert membership.role == Membership.Role.OWNER
         assert Workspace.objects.filter(pk=membership.workspace_id).exists()
+
+
+class TestSignupErrorClassification:
+    """Only an email collision may be reported as a duplicate email.
+
+    Registration inserts three rows, so an IntegrityError can come from the
+    workspace or the membership as easily as from the user. Reporting any of
+    them as "an account with this email already exists" would hide a real fault
+    behind a validation message the user cannot act on.
+    """
+
+    def test_workspace_integrity_error_is_not_a_duplicate_email(self, db, monkeypatch):
+        def failing_workspace(_user):
+            raise IntegrityError("workspaces_workspace_slug_key")
+
+        monkeypatch.setattr("accounts.services.create_initial_workspace", failing_workspace)
+
+        with pytest.raises(IntegrityError):
+            register_user(email="ws@example.com", password=PASSWORD, name="WS")
+
+        assert not User.objects.filter(email="ws@example.com").exists()
+        assert Workspace.objects.count() == 0
+        assert Membership.objects.count() == 0
+
+    def test_membership_integrity_error_is_not_a_duplicate_email(self, db, monkeypatch):
+        def failing_membership(*_args, **_kwargs):
+            raise IntegrityError("unique_membership_per_workspace")
+
+        monkeypatch.setattr(Membership.objects, "create", failing_membership)
+
+        with pytest.raises(IntegrityError):
+            register_user(email="mem@example.com", password=PASSWORD, name="Mem")
+
+        monkeypatch.undo()
+
+        assert not User.objects.filter(email="mem@example.com").exists()
+        assert Workspace.objects.count() == 0
+        assert Membership.objects.count() == 0
+
+    def test_workspace_integrity_error_reaches_the_api_as_a_server_error(
+        self, csrf_client, monkeypatch
+    ):
+        """Not a 400 telling the user to pick a different email."""
+
+        def failing_workspace(_user):
+            raise IntegrityError("workspaces_workspace_slug_key")
+
+        monkeypatch.setattr("accounts.services.create_initial_workspace", failing_workspace)
+
+        with pytest.raises(IntegrityError):
+            csrf_client.post(
+                "/api/auth/signup",
+                {"email": "boom@example.com", "password": PASSWORD, "name": "Boom"},
+                format="json",
+            )
+
+        assert not User.objects.filter(email="boom@example.com").exists()
+
+    def test_genuine_email_collision_is_still_classified_as_duplicate(
+        self, db, make_user, monkeypatch
+    ):
+        """The user insert itself fails, and the address is genuinely taken."""
+        make_user(email="taken@example.com")
+
+        with pytest.raises(EmailAlreadyRegistered):
+            register_user(email="TAKEN@example.com", password=PASSWORD, name="Dup")
+
+        assert User.objects.filter(email="taken@example.com").count() == 1
+        assert Workspace.objects.count() == 0
+
+    def test_a_non_email_failure_of_the_user_insert_is_not_reclassified(
+        self, db, monkeypatch
+    ):
+        """An IntegrityError on the user insert with no matching row must propagate.
+
+        The probe asks the database whether the address is now taken rather than
+        parsing a driver message, so an unrelated constraint failure on the same
+        statement stays an IntegrityError.
+        """
+
+        def failing_create_user(*_args, **_kwargs):
+            raise IntegrityError("some_other_constraint")
+
+        monkeypatch.setattr(User.objects, "create_user", failing_create_user)
+
+        with pytest.raises(IntegrityError):
+            register_user(email="other@example.com", password=PASSWORD, name="Other")
+
+        monkeypatch.undo()
+
+        assert not User.objects.filter(email="other@example.com").exists()
