@@ -51,6 +51,10 @@ and get approval first.
   user + project + provider. Always validate it.
 - Use minimum read-only Google scopes: `analytics.readonly`,
   `webmasters.readonly`.
+- Never overwrite a stored refresh token with a null or empty value. A token
+  response that omits `refresh_token` is normal; keep the existing one. Send
+  `prompt=consent` only when a new refresh token is actually needed
+  (reauthorization, revoked grant, changed scopes) — never by default.
 - A stored token does not mean healthy. `connected` requires a successful call
   against the selected resource.
 - The domain is always read from environment configuration. Never hard-code it.

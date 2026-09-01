@@ -263,14 +263,53 @@ means disconnecting Search Console cannot weaken GA4, and each consent screen
 asks for exactly one product's read access.
 
 Authorization request parameters: `response_type=code`, `client_id`,
-`redirect_uri`, `scope`, `state`, `access_type=offline`, `prompt=consent`,
-plus PKCE (`code_challenge`, `code_challenge_method=S256`).
+`redirect_uri`, `scope`, `state`, `access_type=offline`, plus PKCE
+(`code_challenge`, `code_challenge_method=S256`).
 
-`prompt=consent` is deliberate: Google issues a refresh token only on the first
-authorization for a client/account/scope combination unless re-consent is
-forced. Without it, a user who previously authorized would return with no
-refresh token and the integration could never refresh. PKCE is not required for
-confidential web clients but costs nothing and hardens the callback.
+`access_type=offline` is always sent: the backend needs to reach the selected
+resource for health checks without the user present, so offline access is a
+genuine requirement of this product.
+
+**`prompt=consent` is not sent by default.** Forcing re-consent on every
+authorization is user-hostile and unnecessary. It is added only when there is a
+concrete reason:
+
+| Case | `prompt` |
+| --- | --- |
+| First connection for a project/provider | omitted |
+| Reconnect from `reauth_required` (refresh token invalid/revoked) | `consent` |
+| User explicitly re-authorizes a working connection | `consent` |
+| Required scopes changed since the stored grant | `consent` |
+| Re-running discovery on an existing valid grant | omitted |
+
+The reason `prompt=consent` is ever needed is that Google issues a refresh token
+only on the first authorization for a client/account/scope combination; when we
+have no usable refresh token, re-consent is the way to obtain one. When we
+already hold a valid refresh token, forcing consent would gain nothing.
+
+Incremental authorization (`include_granted_scopes=true`) is used where it is
+appropriate — when a user authorizes a second provider with the same Google
+account, so the new grant is additive rather than displacing the earlier one.
+Credentials remain stored per provider, so disconnecting Search Console still
+cannot weaken GA4; incremental authorization affects only what the consent
+screen asks for, not how we store or scope credentials.
+
+**Refresh-token preservation is a hard rule.** A token response that omits
+`refresh_token` is normal, not an error — Google returns one only when it issues
+a new one. The token service must therefore:
+
+- write a refresh token only when the response actually contains a non-empty
+  one;
+- never overwrite, null, or blank a stored refresh token because a response
+  lacked the field;
+- treat "response has no refresh token and none is stored" as the only failure
+  case (surface it as `reauth_required` with `prompt=consent` on the retry).
+
+This applies identically to the initial code exchange and to every subsequent
+refresh. It is covered by a required test (§11.10).
+
+PKCE is not required for confidential web clients but costs nothing and hardens
+the callback.
 
 **State / CSRF:** `state` is 32 bytes from `secrets.token_urlsafe`. Only its
 SHA-256 hash is stored, in `OAuthAuthorizationRequest`, with a 10-minute TTL,
@@ -309,7 +348,8 @@ credentials. `get_access_token(connection)`:
   under `select_for_update` on the credential row to avoid concurrent refreshes;
 - if Google returns `invalid_grant` → delete the credential, set
   `reauth_required`, raise `ReauthRequired`;
-- rotates the stored refresh token if the response contains a new one;
+- replaces the stored refresh token **only** if the response contains a
+  non-empty new one, and otherwise leaves the existing one untouched;
 - never logs token values (§9).
 
 **Known refresh-token expiry conditions**, handled as `reauth_required` and
@@ -476,6 +516,10 @@ Required security tests (these gate V1):
    scope does not reach `connected`.
 9. **Disconnect/reconnect** — end-to-end with stubbed Google, asserting the
    credential row is gone and revocation was attempted.
+10. **Refresh-token preservation** — a token response omitting `refresh_token`
+    leaves the stored refresh token unchanged and usable; an empty-string value
+    is likewise ignored; `prompt=consent` is sent on a reauth retry and omitted
+    on a first connection.
 
 Frontend: Vitest + Testing Library for the integration-card state rendering.
 No E2E browser suite in V1 (Playwright is explicitly out of scope).
