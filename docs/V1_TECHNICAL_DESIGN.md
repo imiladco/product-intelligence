@@ -94,8 +94,9 @@ Mechanics:
 - Password hashing: Django default (`PBKDF2` first in the hasher list; Argon2
   added via `argon2-cffi` and placed first — one dependency, meaningfully
   better).
-- Endpoints: `POST /api/auth/signup/`, `POST /api/auth/login/`,
-  `POST /api/auth/logout/`, `GET /api/auth/me/`.
+- Endpoints: `POST /api/auth/signup`, `POST /api/auth/login`,
+  `POST /api/auth/logout`, `GET /api/auth/me`, plus `GET /api/auth/csrf` which
+  sets the CSRF cookie for the client's first unsafe request.
 - Sessions in the database (`django.contrib.sessions.backends.db`). No Redis in
   V1 — there is no demonstrated requirement.
 - Cookies in production: `SESSION_COOKIE_SECURE=True`,
@@ -105,9 +106,14 @@ Mechanics:
   `X-Forwarded-Proto`, HSTS enabled.
 - `SameSite=Lax` is required (not `Strict`) because the Google OAuth callback is
   a top-level cross-site GET back into our origin and must carry the session.
-- CSRF: Django sets a readable `csrftoken` cookie; the web app sends it as the
+- CSRF: Django sets a readable CSRF cookie; the web app sends it as the
   `X-CSRFToken` header on every unsafe request. A small `apiFetch()` wrapper in
   `apps/web/lib/api/client.ts` does this in one place.
+- DRF's `APIView` is `csrf_exempt`, so `CsrfViewMiddleware` does not cover API
+  views, and `SessionAuthentication` enforces CSRF only for requests that
+  already carry a session. Signup and login would therefore be unprotected —
+  login CSRF lets an attacker sign a victim into an account they control — so
+  those views apply `csrf_protect` explicitly.
 - Throttling on login/signup via DRF `ScopedRateThrottle` (anon, per-IP).
 
 Frontend consequence: authenticated data fetching happens in Next.js **server
@@ -450,33 +456,41 @@ the *selected* resource, per the V1 constraint.
 
 ## 10. REST API surface (V1, complete)
 
+**API paths carry no trailing slash** (`/api/auth/login`, not `/api/auth/login/`),
+and `APPEND_SLASH` is off. Next.js normalizes a trailing slash away before
+matching its development rewrites, and Django's `APPEND_SLASH` redirect then
+sends it straight back — a redirect loop that would exist in development only.
+Slashless API paths make the two agree in both environments. Django admin keeps
+its own trailing slashes and is served by the reverse proxy (or reached directly
+on the API port in development), never through Next.js.
+
 ```
-POST   /api/auth/signup/
-POST   /api/auth/login/
-POST   /api/auth/logout/
-GET    /api/auth/me/                          -> user + workspaces
+POST   /api/auth/signup
+POST   /api/auth/login
+POST   /api/auth/logout
+GET    /api/auth/me                          -> user + workspaces
 
-GET    /api/workspaces/
-POST   /api/workspaces/
+GET    /api/workspaces
+POST   /api/workspaces
 
-GET    /api/projects/                         ?workspace=<id>
-POST   /api/projects/
-GET    /api/projects/{id}/
-PATCH  /api/projects/{id}/
-DELETE /api/projects/{id}/
+GET    /api/projects                         ?workspace=<id>
+POST   /api/projects
+GET    /api/projects/{id}
+PATCH  /api/projects/{id}
+DELETE /api/projects/{id}
 
-GET    /api/projects/{id}/integrations/       -> one entry per known provider,
+GET    /api/projects/{id}/integrations       -> one entry per known provider,
                                                  connected or not
-GET    /api/projects/{id}/integrations/{provider}/
-POST   /api/projects/{id}/integrations/{provider}/authorize/
+GET    /api/projects/{id}/integrations/{provider}
+POST   /api/projects/{id}/integrations/{provider}/authorize
                                               -> { authorization_url }
-GET    /api/integrations/oauth/google/callback/   (browser redirect target)
-GET    /api/projects/{id}/integrations/{provider}/resources/
+GET    /api/integrations/oauth/google/callback   (browser redirect target)
+GET    /api/projects/{id}/integrations/{provider}/resources
                                               -> discovered properties/sites
-POST   /api/projects/{id}/integrations/{provider}/resource/
+POST   /api/projects/{id}/integrations/{provider}/resource
                                               -> { resource_id } select + verify
-POST   /api/projects/{id}/integrations/{provider}/health-check/
-POST   /api/projects/{id}/integrations/{provider}/disconnect/
+POST   /api/projects/{id}/integrations/{provider}/health-check
+POST   /api/projects/{id}/integrations/{provider}/disconnect
 ```
 
 Health checks are user-triggered and run on selection; there is **no background
@@ -670,11 +684,12 @@ tests on push.
 
 `compose.dev.yaml` runs only `postgres` (plus optionally `mailpit` later);
 `apps/api` runs `manage.py runserver` and `apps/web` runs `next dev` on the
-host, for fast reloads. Local OAuth uses a separate Google OAuth client with
-redirect `http://localhost:3000/api/integrations/oauth/google/callback/`, with
-Next.js `rewrites()` proxying `/api/*` to `http://localhost:8000` so development
-is same-origin too — the same cookie and CSRF path as production, so nothing is
-development-only.
+host, for fast reloads. Next.js `rewrites()` proxies `/api/*` to the Django dev
+server so development is same-origin too — the same cookie and CSRF path as
+production, so nothing is development-only. Only `/api` is proxied; Django admin
+is reached directly on the API port in development. Local OAuth (Milestone 3)
+uses a separate Google OAuth client with redirect
+`http://localhost:3000/api/integrations/oauth/google/callback`.
 
 ## 13. Frontend structure
 
