@@ -34,6 +34,9 @@ and get approval first.
   `projects` app must not import Google code.
 - Follow the existing module boundaries. Inspect what exists before adding a
   dependency or a new module.
+- Python dependencies are installed from `apps/api/requirements*.lock.txt`.
+  After changing a direct dependency, run `./scripts/lock-python-deps.sh` and
+  commit the regenerated locks with the change.
 - Prefer boring and maintainable. YAGNI. Avoid premature abstraction.
 
 ## Security — non-negotiable

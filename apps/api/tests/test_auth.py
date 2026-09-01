@@ -6,6 +6,7 @@ import pytest
 from django.conf import settings
 from django.contrib.auth import get_user_model
 
+from accounts.serializers import SignupSerializer
 from tests.conftest import PASSWORD
 from workspaces.models import Membership, Workspace
 
@@ -239,3 +240,112 @@ class TestThrottling:
         ]
         assert statuses[0] == 400
         assert statuses[-1] == 429
+
+
+class TestSignupAtomicity:
+    """Successful signup means User + Workspace + owner Membership, or nothing.
+
+    A User with no workspace could sign in but would have nowhere to put a
+    project, and nothing in V1 creates the missing workspace afterwards.
+    """
+
+    def test_workspace_failure_rolls_back_the_user(self, csrf_client, monkeypatch):
+        def boom(_user):
+            raise RuntimeError("workspace backend unavailable")
+
+        monkeypatch.setattr("accounts.services.create_initial_workspace", boom)
+
+        with pytest.raises(RuntimeError, match="workspace backend unavailable"):
+            csrf_client.post(
+                "/api/auth/signup",
+                {"email": "orphan@example.com", "password": PASSWORD, "name": "Orphan"},
+                format="json",
+            )
+
+        assert not User.objects.filter(email="orphan@example.com").exists()
+        assert Workspace.objects.count() == 0
+
+    def test_membership_failure_leaves_no_partial_account(self, csrf_client, monkeypatch):
+        """The workspace row is created before the membership; both must roll back."""
+        original_create = Membership.objects.create
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("membership insert failed")
+
+        monkeypatch.setattr(Membership.objects, "create", boom)
+
+        with pytest.raises(RuntimeError, match="membership insert failed"):
+            csrf_client.post(
+                "/api/auth/signup",
+                {"email": "partial@example.com", "password": PASSWORD, "name": "Partial"},
+                format="json",
+            )
+
+        monkeypatch.setattr(Membership.objects, "create", original_create)
+
+        assert not User.objects.filter(email="partial@example.com").exists()
+        assert Workspace.objects.count() == 0
+        assert Membership.objects.count() == 0
+
+    def test_duplicate_email_race_is_a_validation_error_not_a_500(
+        self, csrf_client, make_user, monkeypatch
+    ):
+        """The database constraint is the backstop the pre-check cannot provide.
+
+        Two concurrent signups both pass validate_email, then one insert loses.
+        Simulated by disabling the pre-check so the unique constraint is what
+        rejects the request.
+        """
+        make_user(email="race@example.com")
+
+        monkeypatch.setattr(
+            SignupSerializer,
+            "validate_email",
+            lambda _self, value: value.strip().lower(),
+        )
+
+        response = csrf_client.post(
+            "/api/auth/signup",
+            {"email": "race@example.com", "password": PASSWORD, "name": "Racer"},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.data["error"]["code"] == "validation_error"
+        assert response.data["error"]["detail"]["email"] == [
+            "An account with this email already exists."
+        ]
+        # Exactly one account, and no stray workspace from the losing attempt.
+        assert User.objects.filter(email="race@example.com").count() == 1
+        assert Workspace.objects.count() == 0
+
+    def test_race_response_is_identical_to_the_ordinary_duplicate(
+        self, csrf_client, make_user, monkeypatch
+    ):
+        make_user(email="same@example.com")
+        payload = {"email": "same@example.com", "password": PASSWORD}
+
+        ordinary = csrf_client.post("/api/auth/signup", payload, format="json")
+
+        monkeypatch.setattr(
+            SignupSerializer,
+            "validate_email",
+            lambda _self, value: value.strip().lower(),
+        )
+        raced = csrf_client.post("/api/auth/signup", payload, format="json")
+
+        assert ordinary.status_code == raced.status_code == 400
+        assert ordinary.data == raced.data
+
+    def test_successful_signup_persists_all_three_rows(self, csrf_client):
+        response = csrf_client.post(
+            "/api/auth/signup",
+            {"email": "whole@example.com", "password": PASSWORD, "name": "Whole"},
+            format="json",
+        )
+        assert response.status_code == 201
+
+        user = User.objects.get(email="whole@example.com")
+        membership = Membership.objects.get(user=user)
+        assert membership.role == Membership.Role.OWNER
+        assert Workspace.objects.filter(pk=membership.workspace_id).exists()

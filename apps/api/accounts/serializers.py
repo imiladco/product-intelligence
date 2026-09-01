@@ -15,6 +15,11 @@ class UserSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+# One message for the serializer's pre-check and for the database's unique
+# constraint, so a lost race looks identical to an ordinary duplicate.
+EMAIL_TAKEN_MESSAGE = "An account with this email already exists."
+
+
 class SignupSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, trim_whitespace=False)
@@ -23,7 +28,7 @@ class SignupSerializer(serializers.Serializer):
     def validate_email(self, value: str) -> str:
         value = value.strip().lower()
         if User.objects.filter(email=value).exists():
-            raise serializers.ValidationError("An account with this email already exists.")
+            raise serializers.ValidationError(EMAIL_TAKEN_MESSAGE)
         return value
 
     def validate(self, attrs):
@@ -37,12 +42,8 @@ class SignupSerializer(serializers.Serializer):
             raise serializers.ValidationError({"password": list(exc.messages)}) from exc
         return attrs
 
-    def create(self, validated_data):
-        return User.objects.create_user(
-            email=validated_data["email"],
-            password=validated_data["password"],
-            name=validated_data.get("name", "").strip(),
-        )
+    # No create(): registration goes through accounts.services.register_user,
+    # the single path that persists the user and their workspace atomically.
 
 
 class LoginSerializer(serializers.Serializer):

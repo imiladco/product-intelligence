@@ -1,4 +1,9 @@
-# Runtime dependencies for the control plane API.
+# Direct runtime dependencies, human-readable.
+#
+# Install from requirements.lock.txt instead — it pins this set and every
+# transitive dependency to an exact version. Edit this file to add or move a
+# dependency, then regenerate the locks with ./scripts/lock-python-deps.sh and
+# commit both changes together.
 Django>=5.1,<5.3
 djangorestframework>=3.15
 psycopg[binary]>=3.2

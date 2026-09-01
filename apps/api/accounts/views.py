@@ -14,15 +14,21 @@ from django.contrib.auth import logout as django_logout
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from workspaces.models import Workspace
 from workspaces.serializers import WorkspaceSerializer
-from workspaces.services import create_initial_workspace
 
-from .serializers import LoginSerializer, SignupSerializer, UserSerializer
+from .services import EmailAlreadyRegistered, register_user
+from .serializers import (
+    EMAIL_TAKEN_MESSAGE,
+    LoginSerializer,
+    SignupSerializer,
+    UserSerializer,
+)
 
 
 def session_payload(request) -> dict:
@@ -56,10 +62,22 @@ class SignupView(APIView):
     def post(self, request):
         serializer = SignupSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+        data = serializer.validated_data
 
-        # Every new user gets a workspace; V1 has no invitation flow.
-        create_initial_workspace(user)
+        # User + Workspace + owner Membership are created in one transaction:
+        # every new user gets a workspace, and V1 has no invitation flow that
+        # would create a missing one later.
+        try:
+            user, _workspace = register_user(
+                email=data["email"],
+                password=data["password"],
+                name=data.get("name", "").strip(),
+            )
+        except EmailAlreadyRegistered:
+            # Lost the race against a concurrent signup for the same normalized
+            # email. Report it exactly as the serializer's pre-check would, so a
+            # race is indistinguishable from the ordinary duplicate.
+            raise ValidationError({"email": [EMAIL_TAKEN_MESSAGE]}) from None
 
         django_login(request, user, backend="django.contrib.auth.backends.ModelBackend")
         return Response(session_payload(request), status=status.HTTP_201_CREATED)

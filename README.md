@@ -29,7 +29,7 @@ docker compose -f compose.dev.yaml up -d
 
 # 3. Backend
 python -m venv .venv && source .venv/bin/activate
-pip install -r apps/api/requirements-dev.txt
+pip install -r apps/api/requirements-dev.lock.txt
 cd apps/api && python manage.py migrate && python manage.py runserver 127.0.0.1:8000
 
 # 4. Frontend (second terminal)
@@ -52,6 +52,29 @@ development.
 
 API paths carry no trailing slash (`/api/auth/login`). See §10 of
 [`docs/V1_TECHNICAL_DESIGN.md`](docs/V1_TECHNICAL_DESIGN.md) for why.
+
+## Python dependencies
+
+Four files, two of which are generated:
+
+| File | Purpose |
+| --- | --- |
+| `requirements.txt` | Direct runtime dependencies, human-readable ranges. Edit this. |
+| `requirements-dev.txt` | Adds the test dependencies. Edit this. |
+| `requirements.lock.txt` | Every runtime dependency pinned exactly. **Install this.** |
+| `requirements-dev.lock.txt` | Same, including test dependencies. **Install this.** |
+
+Install from a lock file so everyone — and the production image — gets the same
+versions. After changing a direct dependency, regenerate both locks and commit
+them with the change:
+
+```bash
+./scripts/lock-python-deps.sh
+```
+
+The script installs the direct requirements into a throwaway virtualenv and
+freezes the resolved set. It needs nothing beyond `pip` and `venv`. The locks
+target Linux / CPython 3.11+, which is what development and production both use.
 
 ## Checks
 
