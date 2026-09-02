@@ -1,5 +1,5 @@
-import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import { IntegrationCard } from "@/components/integrations/integration-card";
 import type { IntegrationConnection, IntegrationEntry } from "@/lib/api/types";
@@ -267,7 +267,9 @@ describe("IntegrationCard action semantics", () => {
     ).toBeInTheDocument();
   });
 
-  it("does not offer a duplicate Connect while one is in flight", () => {
+  it("offers a restart, not a duplicate Connect, while one is in flight", () => {
+    // An abandoned flow never reaches the callback, so without this the user
+    // would be stuck in pending_authorization permanently.
     render(
       <IntegrationCard
         projectId={1}
@@ -278,10 +280,46 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(
-      screen.getByText("Waiting for Google authorization to finish."),
+      screen.getByRole("button", { name: "Restart authorization" }),
+    ).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Connect" })).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Waiting for Google. If that window was closed, start again."),
     ).toBeInTheDocument();
+  });
+
+  it("posts to the same authorize endpoint when restarting", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ authorization_url: "https://accounts.google.com/x" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const assign = vi.fn();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...window.location, assign },
+    });
+    document.cookie = "pi_csrftoken=test-csrf";
+
+    render(
+      <IntegrationCard
+        projectId={9}
+        entry={entry({
+          provider: "search_console",
+          status: "pending_authorization",
+          connection: connection({ status: "pending_authorization" }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Restart authorization" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/projects/9/integrations/search_console/authorize");
+    expect(init.method).toBe("POST");
+    vi.unstubAllGlobals();
   });
 
   it("adds no reconnect or disconnect action to a connected integration", () => {

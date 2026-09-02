@@ -38,9 +38,13 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     label: "Connecting",
     variant: "secondary",
     needsAttention: false,
-    // No second Connect: an authorization is already in flight.
-    actionLabel: null,
-    note: "Waiting for Google authorization to finish.",
+    // An authorization is in flight, but it can be abandoned — a closed tab, a
+    // back button, lost connectivity — and nothing would then arrive at the
+    // callback. Without a way to start over the user is stuck here for good,
+    // so the action restarts the attempt. Not "Reconnect": nothing has
+    // successfully connected yet.
+    actionLabel: "Restart authorization",
+    note: "Waiting for Google. If that window was closed, start again.",
   },
   awaiting_resource_selection: {
     label: "Select a property",

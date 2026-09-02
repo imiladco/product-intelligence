@@ -112,6 +112,18 @@ class OAuthAuthorizationRequest(models.Model):
     single user, project and provider, and is single-use — the callback
     consumes it under a row lock so two concurrent callbacks cannot both
     succeed.
+
+    ``consumed_at`` means "this request can no longer complete an
+    authorization". It is set in two situations, which need no distinction
+    because the effect is identical:
+
+    * a callback used it (successfully or not), or
+    * a newer attempt for the same user + project + provider superseded it.
+
+    Superseding reuses this field rather than adding a status column: the
+    question every code path asks is only ever "is this still usable?", and a
+    second field could disagree with the first. The row itself is kept, so the
+    history of attempts survives.
     """
 
     state_hash = models.CharField(max_length=64, unique=True, db_index=True)

@@ -102,6 +102,23 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
         },
     )
 
+    # Supersede any attempt still outstanding for this exact tuple. Without
+    # this, abandoning a flow (closing the Google tab, losing connectivity)
+    # leaves the connection in pending_authorization with a live request the
+    # user cannot reach, and a stale browser tab could later complete an
+    # authorization the user has already restarted.
+    #
+    # Scoped to user + project + provider, so another user's, project's or
+    # provider's in-flight attempt is untouched. This runs in the same
+    # transaction as the new request's creation, so there is never a moment
+    # with two usable requests for the tuple.
+    OAuthAuthorizationRequest.objects.filter(
+        user=user,
+        project=project,
+        provider=provider.key,
+        consumed_at__isnull=True,
+    ).update(consumed_at=timezone.now())
+
     state = secrets.token_urlsafe(STATE_BYTES)
     redirect = build_authorization_redirect(
         scopes=list(provider.oauth_scopes),

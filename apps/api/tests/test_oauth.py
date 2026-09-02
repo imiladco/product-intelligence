@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import responses
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from audit.models import AuditEvent
 from integrations.google.oauth import TOKEN_URI
@@ -909,3 +910,231 @@ class TestStartingAuthorizationPreservesState:
         assert not IntegrationConnection.objects.filter(
             status=ConnectionStatus.CONNECTED
         ).exists()
+
+
+class TestRestartingAnAbandonedAuthorization:
+    """An abandoned flow must not strand the user in pending_authorization.
+
+    Nothing reaches the callback when a user closes the Google tab, goes back,
+    or loses connectivity. The authorization request expires, but the
+    connection row does not, so without a restart path the user waits forever.
+    Restarting supersedes the outstanding request, which also stops a stale
+    browser tab from completing an authorization the user has moved on from.
+    """
+
+    def outstanding(self, **filters):
+        return OAuthAuthorizationRequest.objects.filter(
+            consumed_at__isnull=True, **filters
+        )
+
+    def test_restart_creates_a_fresh_request_with_a_different_state(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        first_state = start_flow(client, project)
+        second_state = start_flow(client, project)
+
+        assert first_state != second_state
+        assert OAuthAuthorizationRequest.objects.count() == 2
+        # Exactly one is still usable.
+        assert self.outstanding().count() == 1
+        assert self.outstanding().get().state_hash == hash_state(second_state)
+
+    def test_the_previous_request_is_marked_consumed_not_deleted(
+        self, signed_in_client, make_project
+    ):
+        """History survives; only usability is revoked."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        first_state = start_flow(client, project)
+        start_flow(client, project)
+
+        superseded = OAuthAuthorizationRequest.objects.get(
+            state_hash=hash_state(first_state)
+        )
+        assert superseded.is_consumed
+
+    @responses.activate
+    def test_callback_from_the_superseded_attempt_is_rejected(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        stale_state = start_flow(client, project)
+        start_flow(client, project)
+        stub_token()
+
+        response = client.get(CALLBACK, {"state": stale_state, "code": "c"})
+
+        assert "oauth_error=invalid_state" in response["Location"]
+        assert not IntegrationCredential.objects.exists()
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.PENDING_AUTHORIZATION
+        )
+
+    @responses.activate
+    def test_callback_from_the_newest_attempt_still_succeeds(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        start_flow(client, project)
+        current_state = start_flow(client, project)
+        stub_token()
+
+        response = client.get(CALLBACK, {"state": current_state, "code": "c"})
+
+        assert "authorized=1" in response["Location"]
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+
+    @responses.activate
+    def test_the_race_case_a_then_b_then_a_then_b(self, signed_in_client, make_project):
+        """A starts, B starts, A's callback must fail, B's may succeed.
+
+        Guarantees a restarted flow cannot be overwritten later by an older tab.
+        """
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state_a = start_flow(client, project)
+        state_b = start_flow(client, project)
+        stub_token()
+
+        from_a = client.get(CALLBACK, {"state": state_a, "code": "code-a"})
+        assert "oauth_error=invalid_state" in from_a["Location"]
+        assert not IntegrationCredential.objects.exists()
+
+        from_b = client.get(CALLBACK, {"state": state_b, "code": "code-b"})
+        assert "authorized=1" in from_b["Location"]
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+
+    def test_restart_creates_no_duplicate_connection_row(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        for _ in range(4):
+            start_flow(client, project)
+
+        assert IntegrationConnection.objects.count() == 1
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.PENDING_AUTHORIZATION
+        )
+
+    def test_restart_does_not_touch_another_provider(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        gsc_state = start_flow(client, project, "search_console")
+        start_flow(client, project, "ga4")
+        start_flow(client, project, "ga4")
+
+        assert self.outstanding(provider=ProviderKey.SEARCH_CONSOLE).count() == 1
+        assert self.outstanding(provider=ProviderKey.SEARCH_CONSOLE).get().state_hash == (
+            hash_state(gsc_state)
+        )
+
+    @responses.activate
+    def test_another_providers_flow_still_completes(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        gsc_state = start_flow(client, project, "search_console")
+        start_flow(client, project, "ga4")
+        stub_token(scope=GSC_SCOPE)
+
+        response = client.get(CALLBACK, {"state": gsc_state, "code": "c"})
+
+        assert "authorized=1" in response["Location"]
+        assert IntegrationConnection.objects.get(
+            provider=ProviderKey.SEARCH_CONSOLE
+        ).status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+
+    def test_restart_does_not_touch_another_project(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        first = make_project(workspace, name="One", website_url="https://one.example")
+        second = make_project(workspace, name="Two", website_url="https://two.example")
+
+        second_state = start_flow(client, second)
+        start_flow(client, first)
+        start_flow(client, first)
+
+        assert self.outstanding(project=second).count() == 1
+        assert self.outstanding(project=second).get().state_hash == hash_state(second_state)
+
+    def test_restart_does_not_touch_another_users_request(
+        self, signed_in_client, make_user, make_project
+    ):
+        """Two members of the same workspace can have flows in parallel."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        # A genuinely separate client: signed_in_client is built from
+        # csrf_client, so reusing that fixture would just replace the session
+        # on the same client rather than giving a second signed-in user.
+        other = make_user(email="colleague@example.com")
+        Membership.objects.create(workspace=workspace, user=other)
+        other_client = APIClient(enforce_csrf_checks=True)
+        other_client.get("/api/auth/csrf")
+        other_client.credentials(
+            HTTP_X_CSRFTOKEN=other_client.cookies["pi_csrftoken"].value
+        )
+        other_client.post(
+            "/api/auth/login", {"email": other.email, "password": PASSWORD}, format="json"
+        )
+        # Django rotates the CSRF token on login; send the current one.
+        other_client.credentials(
+            HTTP_X_CSRFTOKEN=other_client.cookies["pi_csrftoken"].value
+        )
+        others_state = start_flow(other_client, project)
+
+        start_flow(client, project)
+
+        assert self.outstanding(user=other).count() == 1
+        assert self.outstanding(user=other).get().state_hash == hash_state(others_state)
+
+    @responses.activate
+    def test_a_normal_first_authorization_is_unchanged(
+        self, signed_in_client, make_project
+    ):
+        """The ordinary single-attempt path still behaves exactly as before."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state = start_flow(client, project)
+        stub_token()
+        response = client.get(CALLBACK, {"state": state, "code": "c"})
+
+        assert "authorized=1" in response["Location"]
+        assert OAuthAuthorizationRequest.objects.count() == 1
+        connection = IntegrationConnection.objects.get()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert IntegrationCredential.objects.get().refresh_token == "refresh-token-1"
+
+    @responses.activate
+    def test_restarting_after_a_successful_authorization_keeps_the_credential(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        start_flow(client, project)
+
+        assert IntegrationCredential.objects.count() == 1
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
