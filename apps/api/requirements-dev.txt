@@ -4,3 +4,5 @@
 
 pytest>=8.3
 pytest-django>=4.9
+# HTTP stubbing: no test may reach Google's live servers.
+responses>=0.25

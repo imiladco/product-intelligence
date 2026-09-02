@@ -1,6 +1,6 @@
 # V1 Product Spec — Projects + Integration Management
 
-Status: approved. Milestone 1 complete; Milestone 2 in progress.
+Status: approved. Milestones 1–2 complete; Milestone 3 in progress.
 Last updated: 2026-09-02
 
 ## 1. Purpose

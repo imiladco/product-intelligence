@@ -1,5 +1,5 @@
+import { ConnectButton } from "@/components/integrations/connect-button";
 import { StatusBadge } from "@/components/integrations/status-badge";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
 
@@ -19,7 +19,13 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function IntegrationCard({ entry }: { entry: IntegrationEntry }) {
+export function IntegrationCard({
+  entry,
+  projectId,
+}: {
+  entry: IntegrationEntry;
+  projectId: number | string;
+}) {
   const { connection } = entry;
 
   return (
@@ -59,16 +65,20 @@ export function IntegrationCard({ entry }: { entry: IntegrationEntry }) {
         ) : null}
 
         <div className="flex items-center gap-3">
-          {/* Connecting requires Google OAuth, which arrives in the next
-              milestone. The action is shown so the page reads as the real
-              product, but it is disabled: nothing here may produce a
-              connected state without a real authorization. */}
-          <Button disabled title="Available in the next milestone">
-            Connect
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            Connecting Google accounts is not available yet.
-          </span>
+          <ConnectButton
+            projectId={projectId}
+            provider={entry.provider}
+            label={connection ? "Reconnect" : "Connect"}
+            variant={connection ? "outline" : "default"}
+          />
+          {entry.status === "awaiting_resource_selection" ? (
+            // Choosing the property arrives with resource discovery. Until
+            // then the card says so rather than offering an action that would
+            // do nothing.
+            <span className="text-xs text-muted-foreground">
+              Choosing a property is not available yet.
+            </span>
+          ) : null}
         </div>
       </CardContent>
     </Card>

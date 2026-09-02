@@ -18,10 +18,20 @@ class AuditEvent(models.Model):
     ``metadata`` is for small non-sensitive context (a provider key, a status
     transition). It must never hold tokens, authorization codes, OAuth state,
     or any other secret: this table is long-lived, widely readable in Django
-    admin, and included in database backups.
+    admin, and included in database backups. ``services.record_event`` enforces
+    this with an allowlist rather than trusting callers.
     """
 
     class Action(models.TextChoices):
+        INTEGRATION_AUTHORIZATION_STARTED = (
+            "integration.authorization_started",
+            "Integration authorization started",
+        )
+        INTEGRATION_AUTHORIZED = "integration.authorized", "Integration authorized"
+        INTEGRATION_AUTHORIZATION_FAILED = (
+            "integration.authorization_failed",
+            "Integration authorization failed",
+        )
         INTEGRATION_CONNECTED = "integration.connected", "Integration connected"
         INTEGRATION_RECONNECTED = "integration.reconnected", "Integration reconnected"
         INTEGRATION_DISCONNECTED = "integration.disconnected", "Integration disconnected"

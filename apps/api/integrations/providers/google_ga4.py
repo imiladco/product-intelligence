@@ -15,4 +15,7 @@ PROVIDER = IntegrationProvider(
         "Connect a GA4 property to bring this project's traffic and behaviour "
         "data into the platform."
     ),
+    # Read-only. Verified 2026-09-02 against
+    # https://developers.google.com/identity/protocols/oauth2/scopes
+    oauth_scopes=("https://www.googleapis.com/auth/analytics.readonly",),
 )

@@ -10,3 +10,6 @@ psycopg[binary]>=3.2
 argon2-cffi>=23.1
 dj-database-url>=2.2
 python-dotenv>=1.0
+# Google's maintained OAuth library. Pulls in google-auth; used so the
+# protocol is not hand-built.
+google-auth-oauthlib>=1.2

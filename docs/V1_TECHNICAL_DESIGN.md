@@ -1,6 +1,6 @@
 # V1 Technical Design
 
-Status: approved. Milestone 1 complete; Milestone 2 in progress.
+Status: approved. Milestones 1–2 complete; Milestone 3 in progress.
 Last updated: 2026-09-02
 
 Stack is locked: Next.js + React + TypeScript + shadcn/ui + Tailwind (frontend),
@@ -316,6 +316,50 @@ refresh. It is covered by a required test (§11.10).
 
 PKCE is not required for confidential web clients but costs nothing and hardens
 the callback.
+
+### 7.1 Re-verified for Milestone 3 (2026-09-02)
+
+Google's documentation was re-read before implementation rather than carried
+forward from planning. Sources and what each settled:
+
+| Source | Settled |
+| --- | --- |
+| https://developers.google.com/identity/protocols/oauth2/web-server | Endpoints; the parameter list (`access_type`, `state`, `include_granted_scopes`, `prompt`); `google-auth-oauthlib` as the recommended Python library; `credentials.granted_scopes` for what was actually granted. |
+| https://developers.google.com/identity/protocols/oauth2 | Refresh-token invalidation conditions; that a response's scope may differ from the request's even when everything was granted. |
+| https://developers.google.com/identity/protocols/oauth2/scopes | `analytics.readonly`. |
+| https://developers.google.com/webmaster-tools/v1/sites/list | `webmasters.readonly`. |
+| https://google-auth-oauthlib.readthedocs.io/en/latest/reference/google_auth_oauthlib.flow.html | `Flow.from_client_config`, `authorization_url()`, `fetch_token()`, and `autogenerate_code_verifier=True`. |
+
+Three decisions follow from that reading, each a change from the original plan:
+
+**PKCE — used, but not hand-built.** Google's web-server page does not document
+`code_challenge` for confidential clients, so PKCE is not implemented as
+protocol code. However `google-auth-oauthlib` generates a verifier by default
+for this flow, and empirically sends `code_challenge_method=S256`. Overriding a
+maintained library's security default needs a reason, and there is none, so the
+default stands. The cost is one field: the verifier is stored, encrypted, on the
+single-use authorization request, because it must survive the redirect.
+
+**DPoP — deferred.** Documented as optional and recommended, and not required by
+the library's flow. Implementing it would mean custom proof-JWT code and
+hardware-backed key handling, which is not a V1 requirement.
+
+**Google account identity — not collected in V1.** No `openid`/`email` scope is
+requested. Identity is not needed to complete an authorization securely, and
+adding a scope purely so the UI can print an address is exactly the kind of
+cosmetic scope creep least-privilege forbids. `IntegrationConnection.google_account_email`
+therefore stays blank; if a later milestone needs it, it will be obtained by
+verifying an ID token with a maintained Google library, never by decoding one
+unverified or trusting the frontend.
+
+**oauthlib scope check — relaxed deliberately.** `oauthlib` raises on any
+difference between requested and granted scope. That is simultaneously too
+blunt (Google legitimately returns a different set for
+`include_granted_scopes`, and its own documentation warns the sets may differ)
+and too weak (it does not check that *our* required scope is present). The
+library check is disabled and replaced with an explicit assertion that the
+provider's required scope appears in `granted_scopes`; without it the flow
+refuses to progress.
 
 **State / CSRF:** `state` is 32 bytes from `secrets.token_urlsafe`. Only its
 SHA-256 hash is stored, in `OAuthAuthorizationRequest`, with a 10-minute TTL,

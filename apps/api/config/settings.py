@@ -207,16 +207,59 @@ LOGGING = {
     "formatters": {
         "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
+    "filters": {
+        # Applied to every handler: a token must not reach the log stream even
+        # if some library writes one.
+        "redact_secrets": {"()": "common.logging.RedactSecretsFilter"},
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "standard",
+            "filters": ["redact_secrets"],
         },
     },
     "root": {
         "handlers": ["console"],
         "level": os.environ.get("DJANGO_LOG_LEVEL", "INFO"),
     },
+    "loggers": {
+        # Django's own defaults give these loggers their own handlers and set
+        # propagate=False, so messages would bypass the root handler and its
+        # redaction filter. django.server in particular logs the full request
+        # line — which for the OAuth callback contains `code` and `state`.
+        # Route both through the filtered handler instead.
+        "django": {
+            "handlers": ["console"],
+            "level": os.environ.get("DJANGO_LOG_LEVEL", "INFO"),
+            "propagate": False,
+        },
+        "django.server": {
+            "handlers": ["console"],
+            "level": os.environ.get("DJANGO_LOG_LEVEL", "INFO"),
+            "propagate": False,
+        },
+    },
 }
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:3000")
+
+# --- Credential encryption ---------------------------------------------------
+# Comma-separated urlsafe-base64 Fernet keys, newest first. The first key
+# encrypts; every key can decrypt, which is what makes rotation possible.
+# Separate from DJANGO_SECRET_KEY so either can be rotated alone.
+CREDENTIAL_ENCRYPTION_KEYS = env_list("CREDENTIAL_ENCRYPTION_KEYS")
+
+# --- Google OAuth ------------------------------------------------------------
+# Client credentials live only in the environment, never in the database and
+# never in a per-credential row. The redirect URI is read from configuration
+# because the domain differs per environment and is never hard-coded.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REDIRECT_URI = os.environ.get(
+    "GOOGLE_OAUTH_REDIRECT_URI",
+    f"{APP_URL}/api/integrations/oauth/google/callback",
+)
+
+# How long an in-flight authorization request stays valid.
+OAUTH_STATE_TTL_SECONDS = int(os.environ.get("OAUTH_STATE_TTL_SECONDS", "600"))

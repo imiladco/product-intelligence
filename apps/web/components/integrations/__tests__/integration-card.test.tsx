@@ -35,7 +35,7 @@ function entry(overrides: Partial<IntegrationEntry> = {}): IntegrationEntry {
 describe("IntegrationCard", () => {
   describe("not connected", () => {
     it("shows the provider identity, description and status", () => {
-      render(<IntegrationCard entry={entry()} />);
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       expect(screen.getByText("Google Analytics 4")).toBeInTheDocument();
       expect(screen.getByText("Connect a GA4 property.")).toBeInTheDocument();
@@ -43,28 +43,24 @@ describe("IntegrationCard", () => {
     });
 
     it("shows no resource or health detail", () => {
-      render(<IntegrationCard entry={entry()} />);
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       expect(screen.queryByText("Selected property")).not.toBeInTheDocument();
       expect(screen.queryByText("Last successful access")).not.toBeInTheDocument();
     });
 
-    it("offers a Connect action that is disabled until OAuth exists", () => {
-      // Milestone 2 must never let a click produce a connected state.
-      render(<IntegrationCard entry={entry()} />);
+    it("offers an enabled Connect action", () => {
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       const connect = screen.getByRole("button", { name: "Connect" });
-      expect(connect).toBeDisabled();
-      expect(
-        screen.getByText("Connecting Google accounts is not available yet."),
-      ).toBeInTheDocument();
+      expect(connect).toBeEnabled();
     });
   });
 
   describe("connected", () => {
     it("shows the selected resource and last successful access", () => {
       render(
-        <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+        <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
       );
 
       expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
@@ -76,6 +72,7 @@ describe("IntegrationCard", () => {
     it("reads Never when a check has not happened yet", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "awaiting_resource_selection",
             connection: connection({
@@ -98,6 +95,7 @@ describe("IntegrationCard", () => {
     it("shows the error message alongside the last time it worked", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "error",
             connection: connection({
@@ -121,6 +119,7 @@ describe("IntegrationCard", () => {
     it("shows the reauthorization state", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "reauth_required",
             connection: connection({ status: "reauth_required" }),
@@ -135,7 +134,7 @@ describe("IntegrationCard", () => {
 
     it("renders no alert when there is no error", () => {
       render(
-        <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+        <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
       );
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
@@ -143,7 +142,7 @@ describe("IntegrationCard", () => {
 
   it("never shows a credential-shaped value", () => {
     const { container } = render(
-      <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+      <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
     );
     const text = container.textContent ?? "";
     for (const forbidden of ["token", "secret", "refresh"]) {
@@ -152,8 +151,69 @@ describe("IntegrationCard", () => {
   });
 
   it("is identified by its provider", () => {
-    render(<IntegrationCard entry={entry({ provider: "search_console" })} />);
+    render(<IntegrationCard projectId={1} entry={entry({ provider: "search_console" })} />);
     const card = screen.getByTestId("integration-card-search_console");
     expect(within(card).getByTestId("status-badge")).toBeInTheDocument();
+  });
+});
+
+describe("IntegrationCard after OAuth", () => {
+  it("renders Select a property for awaiting_resource_selection", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({
+            status: "awaiting_resource_selection",
+            external_resource_label: "",
+            last_health_check_at: null,
+            last_successful_check_at: null,
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
+    // Authorized is not connected: no property is chosen yet.
+    expect(screen.getByTestId("status-badge")).not.toHaveTextContent("Connected");
+    expect(
+      screen.getByText("Choosing a property is not available yet."),
+    ).toBeInTheDocument();
+  });
+
+  it("offers Reconnect once a connection exists", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "reauth_required",
+          connection: connection({ status: "reauth_required" }),
+        })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+  });
+
+  it("keeps failure states useful", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "scope_not_granted",
+            last_error_message:
+              "The required read-only permission was not granted. Please connect again.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Error");
+    expect(screen.getByRole("alert")).toHaveTextContent("read-only permission was not granted");
+    // A retry is still offered.
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
   });
 });
