@@ -65,9 +65,14 @@ def stub_token(*, scope=GA4_SCOPE, refresh_token="refresh-token-1", status=200):
     responses.add(responses.POST, TOKEN_URI, json=body, status=status)
 
 
+def authorize(client, project, provider="ga4"):
+    """POST the authorize endpoint (starting a flow has side effects)."""
+    return client.post(authorize_url(project.id, provider), {}, format="json")
+
+
 def start_flow(client, project, provider="ga4") -> str:
     """Run the authorize endpoint and return the plaintext state."""
-    response = client.get(authorize_url(project.id, provider))
+    response = authorize(client, project, provider)
     assert response.status_code == 200, response.data
     url = response.data["authorization_url"]
     return parse_qs(urlparse(url).query)["state"][0]
@@ -77,7 +82,8 @@ class TestAuthorizationStart:
     def test_requires_login(self, csrf_client, make_user_with_workspace, make_project):
         _user, workspace = make_user_with_workspace()
         project = make_project(workspace)
-        assert csrf_client.get(authorize_url(project.id)).status_code == 403
+        response = csrf_client.post(authorize_url(project.id), {}, format="json")
+        assert response.status_code == 403
 
     def test_foreign_project_returns_404(self, signed_in_client, make_user):
         client, _user, _workspace = signed_in_client
@@ -87,13 +93,13 @@ class TestAuthorizationStart:
             name="Theirs",
             website_url="https://theirs.example",
         )
-        assert client.get(authorize_url(other.id)).status_code == 404
+        assert client.post(authorize_url(other.id), {}, format="json").status_code == 404
         assert not OAuthAuthorizationRequest.objects.exists()
 
     def test_unknown_provider_returns_404(self, signed_in_client, make_project):
         client, _user, workspace = signed_in_client
         project = make_project(workspace)
-        assert client.get(authorize_url(project.id, "google_ads")).status_code == 404
+        assert authorize(client, project, "google_ads").status_code == 404
 
     def test_returns_a_google_consent_url_with_the_expected_parameters(
         self, signed_in_client, make_project
@@ -101,7 +107,7 @@ class TestAuthorizationStart:
         client, _user, workspace = signed_in_client
         project = make_project(workspace)
 
-        response = client.get(authorize_url(project.id))
+        response = authorize(client, project)
         assert response.status_code == 200
         url = response.data["authorization_url"]
         assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth")
@@ -123,8 +129,8 @@ class TestAuthorizationStart:
         client, _user, workspace = signed_in_client
         project = make_project(workspace)
 
-        ga4 = parse_qs(urlparse(client.get(authorize_url(project.id, "ga4")).data["authorization_url"]).query)
-        gsc = parse_qs(urlparse(client.get(authorize_url(project.id, "search_console")).data["authorization_url"]).query)
+        ga4 = parse_qs(urlparse(authorize(client, project, "ga4").data["authorization_url"]).query)
+        gsc = parse_qs(urlparse(authorize(client, project, "search_console").data["authorization_url"]).query)
 
         assert ga4["scope"] == [GA4_SCOPE]
         assert gsc["scope"] == [GSC_SCOPE]
@@ -135,7 +141,7 @@ class TestAuthorizationStart:
         client, _user, workspace = signed_in_client
         project = make_project(workspace)
         for provider in ("ga4", "search_console"):
-            url = client.get(authorize_url(project.id, provider)).data["authorization_url"]
+            url = authorize(client, project, provider).data["authorization_url"]
             scope = parse_qs(urlparse(url).query)["scope"][0]
             assert scope.endswith(".readonly")
 
@@ -195,7 +201,7 @@ class TestAuthorizationStart:
     ):
         client, _user, workspace = signed_in_client
         project = make_project(workspace)
-        url = client.get(authorize_url(project.id)).data["authorization_url"]
+        url = authorize(client, project).data["authorization_url"]
 
         params = parse_qs(urlparse(url).query)
         assert params["code_challenge_method"] == ["S256"]
@@ -619,5 +625,287 @@ class TestRefreshTokenRules:
         connection.status = ConnectionStatus.REAUTH_REQUIRED
         connection.save()
 
-        url = client.get(authorize_url(project.id)).data["authorization_url"]
+        url = authorize(client, project).data["authorization_url"]
         assert parse_qs(urlparse(url).query)["prompt"] == ["consent"]
+
+
+class TestAuthorizeIsAStateChangingPost:
+    """Starting an authorization has side effects, so it must not be a GET.
+
+    It creates a connection row on first use, creates a single-use
+    authorization request, and writes an audit event. A state-changing GET
+    would be triggerable by any cross-site navigation and would bypass CSRF.
+    """
+
+    def test_get_is_rejected(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        response = client.get(authorize_url(project.id))
+
+        assert response.status_code == 405
+        assert not IntegrationConnection.objects.exists()
+        assert not OAuthAuthorizationRequest.objects.exists()
+
+    def test_unauthenticated_post_is_rejected(
+        self, csrf_client, make_user_with_workspace, make_project
+    ):
+        _user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+
+        response = csrf_client.post(authorize_url(project.id), {}, format="json")
+
+        assert response.status_code == 403
+        assert not IntegrationConnection.objects.exists()
+        assert not OAuthAuthorizationRequest.objects.exists()
+
+    def test_post_without_csrf_token_is_rejected(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        client.credentials()  # drop the X-CSRFToken header
+
+        response = client.post(authorize_url(project.id), {}, format="json")
+
+        assert response.status_code == 403
+        assert "CSRF" in str(response.data)
+
+    def test_csrf_failure_leaves_no_trace(self, signed_in_client, make_project):
+        """A rejected request must not have started anything."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        client.credentials()
+
+        client.post(authorize_url(project.id), {}, format="json")
+
+        assert not IntegrationConnection.objects.exists()
+        assert not OAuthAuthorizationRequest.objects.exists()
+        assert not AuditEvent.objects.exists()
+
+    def test_post_with_csrf_token_succeeds(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        response = client.post(authorize_url(project.id), {}, format="json")
+
+        assert response.status_code == 200
+        assert response.data["authorization_url"].startswith(
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        )
+        assert OAuthAuthorizationRequest.objects.count() == 1
+
+    def test_foreign_project_post_returns_404(self, signed_in_client, make_user):
+        client, _user, _workspace = signed_in_client
+        stranger = make_user(email="outsider@example.com")
+        other = Project.objects.create(
+            workspace=create_initial_workspace(stranger),
+            name="Theirs",
+            website_url="https://theirs.example",
+        )
+
+        response = client.post(authorize_url(other.id), {}, format="json")
+
+        assert response.status_code == 404
+        assert not OAuthAuthorizationRequest.objects.exists()
+        assert not AuditEvent.objects.exists()
+
+
+class TestNoEmptyCredentialRow:
+    """IntegrationCredential means "we hold credential material".
+
+    It is never a marker that an authorization was attempted, so a failed
+    authorization must leave no row at all.
+    """
+
+    @responses.activate
+    def test_first_authorization_without_refresh_token_stores_nothing(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+
+        response = client.get(CALLBACK, {"state": state, "code": "c"})
+
+        assert "oauth_error=no_refresh_token" in response["Location"]
+        assert IntegrationCredential.objects.count() == 0
+        connection = IntegrationConnection.objects.get()
+        assert connection.status == ConnectionStatus.ERROR
+        assert connection.last_error_code == "no_refresh_token"
+
+    @responses.activate
+    def test_repeated_failures_still_store_nothing(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        for _ in range(3):
+            responses.reset()
+            state = start_flow(client, project)
+            stub_token(refresh_token=None)
+            client.get(CALLBACK, {"state": state, "code": "c"})
+
+        assert IntegrationCredential.objects.count() == 0
+
+    @responses.activate
+    def test_successful_first_authorization_still_stores_the_credential(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token(refresh_token="refresh-first")
+
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        credential = IntegrationCredential.objects.get()
+        assert credential.refresh_token == "refresh-first"
+        assert credential.access_token == "access-token-1"
+
+    @responses.activate
+    def test_retry_after_a_failure_forces_consent_from_connection_state(
+        self, signed_in_client, make_project
+    ):
+        """Re-consent is decided by connection state, not an empty credential row."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+        client.get(CALLBACK, {"state": state, "code": "c"})
+        assert IntegrationCredential.objects.count() == 0
+
+        url = authorize(client, project).data["authorization_url"]
+        assert parse_qs(urlparse(url).query)["prompt"] == ["consent"]
+
+    @responses.activate
+    def test_that_retry_can_then_succeed(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        responses.reset()
+        state = start_flow(client, project)
+        stub_token(refresh_token="refresh-after-consent")
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        connection = IntegrationConnection.objects.get()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert IntegrationCredential.objects.get().refresh_token == "refresh-after-consent"
+
+    @responses.activate
+    def test_existing_refresh_token_is_still_preserved(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        state = start_flow(client, project)
+        stub_token(refresh_token="refresh-original")
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        responses.reset()
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        assert IntegrationCredential.objects.count() == 1
+        assert IntegrationCredential.objects.get().refresh_token == "refresh-original"
+
+
+class TestStartingAuthorizationPreservesState:
+    """An in-flight attempt is the OAuthAuthorizationRequest, not a status change.
+
+    Overwriting the connection's durable status when a flow starts makes
+    cancelling destructive: the user would be left in pending_authorization
+    with no way back to where they were.
+    """
+
+    @responses.activate
+    def _authorize_successfully(self, client, project):
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+    @responses.activate
+    def test_first_authorization_creates_a_pending_row(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        start_flow(client, project)
+
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.PENDING_AUTHORIZATION
+        )
+
+    @responses.activate
+    def test_awaiting_resource_selection_is_not_reset_to_pending(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+
+        # Start a second authorization: the durable status must survive.
+        start_flow(client, project)
+
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+
+    @responses.activate
+    def test_cancelling_that_authorization_preserves_the_previous_state(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        # Re-authorize, then deny at Google.
+        state = start_flow(client, project)
+        response = client.get(CALLBACK, {"state": state, "error": "access_denied"})
+
+        assert "oauth_error=access_denied" in response["Location"]
+        connection = IntegrationConnection.objects.get()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert IntegrationCredential.objects.count() == 1
+
+    @responses.activate
+    def test_reauth_required_is_not_reset_to_pending(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        connection = IntegrationConnection.objects.get()
+        connection.status = ConnectionStatus.REAUTH_REQUIRED
+        connection.save()
+
+        start_flow(client, project)
+
+        assert IntegrationConnection.objects.get().status == (
+            ConnectionStatus.REAUTH_REQUIRED
+        )
+
+    @responses.activate
+    def test_no_fake_connected_transition_exists(self, signed_in_client, make_project):
+        """Nothing in the OAuth flow may produce `connected`."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "c"})
+
+        assert not IntegrationConnection.objects.filter(
+            status=ConnectionStatus.CONNECTED
+        ).exists()

@@ -182,7 +182,7 @@ describe("IntegrationCard after OAuth", () => {
     ).toBeInTheDocument();
   });
 
-  it("offers Reconnect once a connection exists", () => {
+  it("offers Reauthorize when authorization has become invalid", () => {
     render(
       <IntegrationCard
         projectId={1}
@@ -192,7 +192,7 @@ describe("IntegrationCard after OAuth", () => {
         })}
       />,
     );
-    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reauthorize" })).toBeEnabled();
   });
 
   it("keeps failure states useful", () => {
@@ -213,7 +213,86 @@ describe("IntegrationCard after OAuth", () => {
 
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Error");
     expect(screen.getByRole("alert")).toHaveTextContent("read-only permission was not granted");
-    // A retry is still offered.
-    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+    // A truthful retry of the authorization is offered.
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+  });
+});
+
+describe("IntegrationCard action semantics", () => {
+  /** Full reconnect/disconnect UX is a later milestone. A state that already
+   *  has what it needs from Google must not invite re-authorizing. */
+  function statusesOffering(name: string) {
+    return (["not_connected", "pending_authorization", "awaiting_resource_selection",
+      "connected", "error", "reauth_required", "disconnected"] as const).filter(
+      (status) => {
+        const { unmount } = render(
+          <IntegrationCard
+            projectId={1}
+            entry={entry({
+              status,
+              connection: status === "not_connected" ? null : connection({ status }),
+            })}
+          />,
+        );
+        const found = screen.queryByRole("button", { name }) !== null;
+        unmount();
+        return found;
+      },
+    );
+  }
+
+  it("offers Connect only where nothing is authorized", () => {
+    expect(statusesOffering("Connect")).toEqual(["not_connected", "disconnected"]);
+  });
+
+  it("never offers a generic Reconnect", () => {
+    expect(statusesOffering("Reconnect")).toEqual([]);
+  });
+
+  it("does not invite re-authorizing after a successful authorization", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({ status: "awaiting_resource_selection" }),
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
+    expect(
+      screen.getByText("Choosing a property is not available yet."),
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer a duplicate Connect while one is in flight", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "pending_authorization",
+          connection: connection({ status: "pending_authorization" }),
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Waiting for Google authorization to finish."),
+    ).toBeInTheDocument();
+  });
+
+  it("adds no reconnect or disconnect action to a connected integration", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status: "connected", connection: connection() })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
   });
 });

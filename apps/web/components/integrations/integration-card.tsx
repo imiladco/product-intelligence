@@ -2,6 +2,7 @@ import { ConnectButton } from "@/components/integrations/connect-button";
 import { StatusBadge } from "@/components/integrations/status-badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
+import { statusPresentation } from "@/lib/integrations/status";
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Never";
@@ -27,6 +28,7 @@ export function IntegrationCard({
   projectId: number | string;
 }) {
   const { connection } = entry;
+  const { actionLabel, note } = statusPresentation(entry.status);
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -64,22 +66,24 @@ export function IntegrationCard({
           </p>
         ) : null}
 
-        <div className="flex items-center gap-3">
-          <ConnectButton
-            projectId={projectId}
-            provider={entry.provider}
-            label={connection ? "Reconnect" : "Connect"}
-            variant={connection ? "outline" : "default"}
-          />
-          {entry.status === "awaiting_resource_selection" ? (
-            // Choosing the property arrives with resource discovery. Until
-            // then the card says so rather than offering an action that would
-            // do nothing.
-            <span className="text-xs text-muted-foreground">
-              Choosing a property is not available yet.
-            </span>
-          ) : null}
-        </div>
+        {/* Which action a state offers comes from the status mapping, so the
+            card never invents one. A state that already has what it needs from
+            Google offers no authorization action at all. */}
+        {actionLabel || note ? (
+          <div className="flex items-center gap-3">
+            {actionLabel ? (
+              <ConnectButton
+                projectId={projectId}
+                provider={entry.provider}
+                label={actionLabel}
+                variant={entry.status === "not_connected" ? "default" : "outline"}
+              />
+            ) : null}
+            {note ? (
+              <span className="text-xs text-muted-foreground">{note}</span>
+            ) : null}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

@@ -63,13 +63,21 @@ def _needs_forced_consent(connection: IntegrationConnection | None) -> bool:
     Never true for a first connection: Google issues a refresh token on the
     first authorization for a client/account/scope combination anyway, and
     forcing re-consent every time is user-hostile for no gain.
+
+    The signal is connection state, not the presence of an empty credential
+    row — a failed authorization stores no credential at all (see
+    ``_store_credentials``), so there is no blank row to read.
     """
     if connection is None:
         return False
     if connection.status == ConnectionStatus.REAUTH_REQUIRED:
         return True
-    credential = getattr(connection, "credential", None)
-    return credential is not None and not credential.has_refresh_token
+    # The previous attempt ended because Google returned no refresh token and
+    # none was stored. Re-consent is the documented way to obtain one.
+    return (
+        connection.status == ConnectionStatus.ERROR
+        and connection.last_error_code == NoRefreshToken.code
+    )
 
 
 @transaction.atomic
@@ -79,6 +87,12 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
     if provider is None:
         raise ProviderMismatch
 
+    # A first authorization creates the row as pending. An existing row keeps
+    # its durable status: the in-flight attempt is represented by the
+    # OAuthAuthorizationRequest, and starting one must not destroy meaningful
+    # state that survives a cancellation. Someone who reaches
+    # awaiting_resource_selection and then cancels a re-authorization is still
+    # awaiting resource selection.
     connection, _created = IntegrationConnection.objects.get_or_create(
         project=project,
         provider=provider.key,
@@ -87,12 +101,6 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
             "connected_by": user,
         },
     )
-    # A row already in another state moves back to pending while the user is
-    # away at Google. It does not become connected here, and never will:
-    # `connected` requires a verified resource in a later milestone.
-    if connection.status != ConnectionStatus.PENDING_AUTHORIZATION:
-        connection.status = ConnectionStatus.PENDING_AUTHORIZATION
-        connection.save(update_fields=["status", "updated_at"])
 
     state = secrets.token_urlsafe(STATE_BYTES)
     redirect = build_authorization_redirect(
@@ -158,18 +166,27 @@ def _store_credentials(connection: IntegrationConnection, result) -> None:
 
     A token response that omits ``refresh_token`` is normal — Google returns
     one only when it issues a new one — and must never blank a stored one.
+
+    The refresh-token rule is decided *before* anything is written, so a failed
+    authorization leaves no row behind. An IntegrationCredential means "we hold
+    credential material", never "an authorization was attempted".
     """
-    credential, _created = IntegrationCredential.objects.get_or_create(
-        connection=connection
-    )
+    credential = IntegrationCredential.objects.filter(connection=connection).first()
+    stored_refresh_token = credential.refresh_token if credential else ""
 
     if result.refresh_token:
-        credential.refresh_token = result.refresh_token
-    elif not credential.refresh_token:
+        refresh_token = result.refresh_token
+    elif stored_refresh_token:
+        refresh_token = stored_refresh_token
+    else:
         # No new refresh token and none stored: offline access was not granted,
-        # so do not record this as a durable authorization.
+        # so do not record this as a durable authorization — and do not create
+        # an empty row as a side effect of failing.
         raise NoRefreshToken
 
+    if credential is None:
+        credential = IntegrationCredential(connection=connection)
+    credential.refresh_token = refresh_token
     credential.access_token = result.access_token
     expires_at = result.expires_at
     if expires_at is not None and timezone.is_naive(expires_at):

@@ -31,8 +31,11 @@ export function ConnectButton({
   async function connect() {
     setPending(true);
     try {
+      // POST: starting an authorization has side effects on the server, so it
+      // goes through apiFetch's CSRF handling like every other mutation.
       const { authorization_url } = await apiFetch<AuthorizationStart>(
         `/projects/${projectId}/integrations/${provider}/authorize`,
+        { method: "POST" },
       );
       // A full navigation, not a fetch: the user has to see Google's consent
       // screen on Google's own origin.

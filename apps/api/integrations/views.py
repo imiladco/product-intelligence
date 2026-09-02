@@ -34,13 +34,20 @@ class ProjectIntegrationsView(APIView):
 
 
 class IntegrationAuthorizeView(APIView):
-    """GET /api/projects/{project_id}/integrations/{provider}/authorize
+    """POST /api/projects/{project_id}/integrations/{provider}/authorize
 
     Returns the Google consent URL. The browser is sent there by the frontend;
     Next.js never builds an authorization URL or holds a client secret.
+
+    POST, not GET: starting an authorization has real side effects — it creates
+    a connection row on first use, creates a single-use authorization request,
+    and writes an audit event. A state-changing GET would be triggerable by any
+    cross-site navigation and would bypass CSRF entirely. As a POST it goes
+    through SessionAuthentication's CSRF enforcement like every other mutation.
+    A GET is answered with 405 by DRF, so an old link cannot start a flow.
     """
 
-    def get(self, request, project_id, provider):
+    def post(self, request, project_id, provider):
         project = get_project_for_user(request.user, project_id)
         if get_provider(provider) is None:
             raise Http404("Unknown provider.")

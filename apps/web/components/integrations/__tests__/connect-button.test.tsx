@@ -42,8 +42,10 @@ describe("ConnectButton", () => {
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe("/api/projects/7/integrations/ga4/authorize");
-    expect(init.method ?? "GET").toBe("GET");
+    // POST, because starting an authorization changes server state.
+    expect(init.method).toBe("POST");
     expect(init.credentials).toBe("include");
+    expect(init.headers["X-CSRFToken"]).toBeTruthy();
   });
 
   it("uses the provider's own endpoint", async () => {

@@ -238,6 +238,17 @@ disconnected --connect--> pending_authorization
 
 Invariants:
 
+- **Starting an authorization does not change a connection's status.** Only a
+  first authorization creates a row, as `pending_authorization`. An existing
+  row keeps its durable status while the user is away at Google: the in-flight
+  attempt is represented by the `OAuthAuthorizationRequest`, so cancelling at
+  the consent screen leaves the connection exactly where it was rather than
+  stranding it in `pending_authorization`.
+- **An `IntegrationCredential` row means credential material is held**, never
+  that an authorization was attempted. The refresh-token rule is decided before
+  anything is written, so a failed authorization leaves no row. Re-consent is
+  therefore decided from connection state (`reauth_required`, or `error` with
+  `no_refresh_token`), never from the presence of an empty credential row.
 - **Holding a token is never sufficient for `connected`.** `connected` requires
   a successful call against the *selected* resource, recorded in
   `last_successful_check_at`.

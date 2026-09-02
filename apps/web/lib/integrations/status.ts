@@ -8,6 +8,16 @@ interface StatusPresentation {
   variant: BadgeVariant;
   /** True when the state needs the user to do something. */
   needsAttention: boolean;
+  /**
+   * Label for the authorization action, or null when this state offers none.
+   *
+   * Only authorization actions live here. Reconnect and disconnect for a
+   * healthy connection are a later milestone, and a state that already has
+   * what it needs from Google must not invite the user to re-authorize.
+   */
+  actionLabel: string | null;
+  /** Truthful note about what is not possible yet, or null. */
+  note: string | null;
 }
 
 /**
@@ -17,27 +27,67 @@ interface StatusPresentation {
  * strings themselves, so adding or renaming a state is one edit.
  */
 const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
-  not_connected: { label: "Not connected", variant: "outline", needsAttention: false },
-  pending_authorization: { label: "Connecting", variant: "secondary", needsAttention: false },
+  not_connected: {
+    label: "Not connected",
+    variant: "outline",
+    needsAttention: false,
+    actionLabel: "Connect",
+    note: null,
+  },
+  pending_authorization: {
+    label: "Connecting",
+    variant: "secondary",
+    needsAttention: false,
+    // No second Connect: an authorization is already in flight.
+    actionLabel: null,
+    note: "Waiting for Google authorization to finish.",
+  },
   awaiting_resource_selection: {
     label: "Select a property",
     variant: "secondary",
     needsAttention: true,
+    // Google authorization already succeeded. The next step is choosing a
+    // property, so this state must not invite re-authorizing.
+    actionLabel: null,
+    note: "Choosing a property is not available yet.",
   },
-  connected: { label: "Connected", variant: "default", needsAttention: false },
-  error: { label: "Error", variant: "destructive", needsAttention: true },
+  connected: {
+    label: "Connected",
+    variant: "default",
+    needsAttention: false,
+    // Reconnect and disconnect for a healthy connection arrive later.
+    actionLabel: null,
+    note: null,
+  },
+  error: {
+    label: "Error",
+    variant: "destructive",
+    needsAttention: true,
+    actionLabel: "Try again",
+    note: null,
+  },
   reauth_required: {
     label: "Reauthorization required",
     variant: "destructive",
     needsAttention: true,
+    actionLabel: "Reauthorize",
+    note: null,
   },
-  disconnected: { label: "Disconnected", variant: "outline", needsAttention: false },
+  disconnected: {
+    label: "Disconnected",
+    variant: "outline",
+    needsAttention: false,
+    actionLabel: "Connect",
+    note: null,
+  },
 };
 
 const FALLBACK: StatusPresentation = {
   label: "Unknown",
   variant: "outline",
   needsAttention: false,
+  actionLabel: null,
+  note: null,
 };
 
 /** Never throws on an unrecognized status: a backend that learns a new state
