@@ -13,3 +13,6 @@ python-dotenv>=1.0
 # Google's maintained OAuth library. Pulls in google-auth; used so the
 # protocol is not hand-built.
 google-auth-oauthlib>=1.2
+# WSGI server for containers. The Django development server is never used
+# outside local development.
+gunicorn>=23.0
