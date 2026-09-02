@@ -51,9 +51,11 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health || exit 1"]
       interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 40s
+      timeout: 10s
+      retries: 12
+      # Generous: on a single vCPU the entrypoint runs collectstatic and
+      # migrations before gunicorn accepts its first request.
+      start_period: 120s
     # Loopback only: an existing host proxy can reach it, the internet cannot.
     # Harmless when the bundled Caddy is used, which talks over the private
     # network instead.
@@ -73,6 +75,13 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      # busybox wget: the node:alpine image has no curl.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/login || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
     ports:
       - "127.0.0.1:3001:3000"
     networks: [internal]

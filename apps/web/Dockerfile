@@ -6,7 +6,13 @@ RUN npm ci
 
 FROM node:22-alpine AS builder
 WORKDIR /app
-ENV NEXT_TELEMETRY_DISABLED=1
+# Cap the heap: this builds on a 1 vCPU / 2 GiB host that is already running
+# other stacks, and an uncapped Next build is the most likely thing to be
+# OOM-killed there. Override at build time with --build-arg if the host is
+# roomier.
+ARG NODE_BUILD_MEMORY=640
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NODE_OPTIONS=--max-old-space-size=${NODE_BUILD_MEMORY}
 COPY --from=deps /app/node_modules ./node_modules
 COPY apps/web/ ./
 # next.config.ts sets output:"standalone", so the build emits a self-contained
