@@ -26,3 +26,8 @@ next-env.d.ts
 
 # Local data
 /postgres-data/
+
+# Google OAuth client downloads. Narrow on purpose: only Google's own
+# client_secret*.json naming, so unrelated JSON stays tracked.
+client_secret*.json
+*.apps.googleusercontent.com.json
