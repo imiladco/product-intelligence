@@ -1,14 +1,14 @@
 # V1 Build Plan
 
-Status: proposed, awaiting approval
-Last updated: 2026-09-01
+Status: approved. Milestone 1 complete; Milestone 2 in progress.
+Last updated: 2026-09-02
 
 Vertical slices. Each milestone ends with something demonstrable and its own
 tests. No milestone builds infrastructure for a later milestone's benefit.
 
 ---
 
-## Milestone 1 — Foundation: auth, workspace, project
+## Milestone 1 — Foundation: auth, workspace, project — **complete**
 
 **Demo:** sign up on `localhost`, land on `/projects`, create a project with a
 domain, sign out, sign back in, project still there.
@@ -50,7 +50,7 @@ Tests: signup/login/logout, `me`, tenant isolation on every project endpoint
 
 Excluded: Docker production images, Caddy, integrations.
 
-## Milestone 2 — Integrations surface (no Google yet)
+## Milestone 2 — Integrations surface (no Google yet) — **in progress**
 
 **Demo:** the Integrations page lists GA4 and Search Console as *Not connected*,
 rendered from the backend provider catalog.

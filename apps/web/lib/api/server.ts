@@ -1,7 +1,12 @@
 import { cookies } from "next/headers";
 
 import { ApiError } from "./errors";
-import type { ApiErrorBody, Project, Session } from "./types";
+import type {
+  ApiErrorBody,
+  IntegrationEntry,
+  Project,
+  Session,
+} from "./types";
 
 const INTERNAL_API_BASE_URL =
   process.env.INTERNAL_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -51,6 +56,17 @@ export async function getProjects(): Promise<Project[]> {
 export async function getProject(id: string): Promise<Project | null> {
   try {
     return await serverFetch<Project>(`/projects/${id}`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+export async function getProjectIntegrations(
+  projectId: string,
+): Promise<IntegrationEntry[] | null> {
+  try {
+    return await serverFetch<IntegrationEntry[]>(`/projects/${projectId}/integrations`);
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return null;
     throw error;

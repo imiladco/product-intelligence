@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { getProject } from "@/lib/api/server";
 
@@ -47,10 +48,16 @@ export default async function ProjectPage({
         <CardHeader>
           <CardTitle className="text-base">Integrations</CardTitle>
           <CardDescription>
-            Connecting Google Analytics 4 and Search Console arrives in the next
-            milestone.
+            Connect Google Analytics 4 and Google Search Console to this project.
           </CardDescription>
         </CardHeader>
+        <CardContent>
+          <Button asChild variant="outline">
+            <Link href={`/projects/${projectId}/integrations`}>
+              Manage integrations
+            </Link>
+          </Button>
+        </CardContent>
       </Card>
     </div>
   );

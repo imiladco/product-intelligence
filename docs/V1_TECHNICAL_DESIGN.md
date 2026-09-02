@@ -1,7 +1,7 @@
 # V1 Technical Design
 
-Status: proposed, awaiting approval
-Last updated: 2026-09-01
+Status: approved. Milestone 1 complete; Milestone 2 in progress.
+Last updated: 2026-09-02
 
 Stack is locked: Next.js + React + TypeScript + shadcn/ui + Tailwind (frontend),
 Python + Django + DRF (backend), PostgreSQL, monorepo, Docker Compose on a
