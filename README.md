@@ -80,6 +80,7 @@ target Linux / CPython 3.11+, which is what development and production both use.
 
 ```bash
 cd apps/api && python -m pytest tests/     # backend tests
+cd apps/web && npm test                    # frontend component tests
 cd apps/web && npx tsc --noEmit            # type checking
 cd apps/web && npm run lint                # linting
 cd apps/web && npm run build               # production build

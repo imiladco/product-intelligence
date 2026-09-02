@@ -70,6 +70,8 @@ INSTALLED_APPS = [
     "accounts",
     "workspaces",
     "projects",
+    "integrations",
+    "audit",
 ]
 
 MIDDLEWARE = [
