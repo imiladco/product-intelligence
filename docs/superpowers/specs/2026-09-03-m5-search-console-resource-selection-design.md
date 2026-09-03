@@ -1023,15 +1023,16 @@ M3 — already shows a **Choose property** button whose dialog fails with a 404.
 M5 makes the symptom disappear by giving the provider a catalog, but it does
 not fix the cause, and a revert of commit 2 would bring the broken button back.
 
-The minimal fix is a `supports_resource_selection` boolean on the integration
-entry, derived from `provider.resources is not None`, with the card gating on
-`resourceAction === "select" && entry.supports_resource_selection`. That is
-roughly ten lines across the serializer, the service, the type mirror and the
-card. **It is not in the approved M5 scope**, so it is not being implemented
-unasked — it is recorded here, and raised for a decision. Until it is fixed,
-"revert commit 2 alone" means "revert commit 2 and accept a broken button on an
-unconfigured provider", which is a real but cosmetic regression to a state that
-already shipped.
+**Resolved on review, in commit 5.** The entry payload now carries
+`supports_resource_selection`, derived from `provider.resources is not None`,
+and the card requires both a status that calls for the action and a provider
+that can serve it. No provider is named in the component, and the frontend
+keeps no list of what each one supports.
+
+This also completes §24.3: reverting commit 2 alone is now unconditionally
+safe. Search Console returns to `resources=None`, the entry reports
+`supports_resource_selection: false`, and the card offers no action rather
+than a button that 404s.
 
 Reverting **the whole branch** is unconditionally safe and is the recommended
 path if anything larger goes wrong: no schema change, no data rewrite, and GA4
@@ -1085,4 +1086,11 @@ Recorded so the document matches what shipped rather than what was planned.
 Everything else shipped as designed. The invariants in §24 hold: no migration,
 no data rewrite, no credential code touched, no dependency change, no endpoint
 or error code changed.
+
+5. **The card-gating defect was fixed here rather than deferred** (commit 5).
+   §24.3 recorded it and raised it for a decision; the decision was to fix it
+   now. `IntegrationEntry` gained `supports_resource_selection`, which is a
+   provider capability rather than a connection state, and the card requires
+   both. The M2 field-allowlist test was updated deliberately — that guard
+   firing on a new field is it working.
 
