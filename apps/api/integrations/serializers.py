@@ -48,6 +48,10 @@ class IntegrationEntrySerializer(serializers.Serializer):
     description = serializers.CharField(read_only=True)
     status = serializers.CharField(read_only=True)
     connection = IntegrationConnectionSerializer(read_only=True, allow_null=True)
+    # A capability of the provider, not a state of the connection. The UI gates
+    # the resource-selection action on this, so it cannot offer an action the
+    # backend has no endpoint for.
+    supports_resource_selection = serializers.BooleanField(read_only=True)
 
 
 class ResourceSelectionSerializer(serializers.Serializer):

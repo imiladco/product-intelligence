@@ -76,6 +76,13 @@ export interface IntegrationEntry {
   description: string;
   status: IntegrationStatus;
   connection: IntegrationConnection | null;
+  /** Whether this provider can list and verify resources at all.
+   *
+   *  Independent of `status`: a provider with no resource discovery offers no
+   *  picker however healthy its connection is. The backend is the source of
+   *  truth, so the frontend never keeps its own list of what each provider
+   *  supports. */
+  supports_resource_selection: boolean;
 }
 
 /** Response of GET /api/projects/{id}/integrations/{provider}/authorize.

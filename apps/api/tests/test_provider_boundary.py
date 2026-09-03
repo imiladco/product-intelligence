@@ -147,3 +147,67 @@ class TestProviderWithoutACatalog:
             ).status_code
             == 404
         )
+
+
+@pytest.mark.django_db
+class TestCapabilityIsReportedToTheFrontend:
+    """The entry payload says what a provider can do, not just where it is.
+
+    The UI gates the resource-selection action on this, so it has to be true
+    independently of connection status — otherwise a healthy connection to a
+    provider with no catalog offers an action that cannot work.
+    """
+
+    def test_entries_report_whether_the_provider_supports_selection(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        entries = {
+            entry["provider"]: entry
+            for entry in client.get(
+                f"/api/projects/{project.pk}/integrations"
+            ).data
+        }
+
+        assert entries["ga4"]["supports_resource_selection"] is True
+        assert entries["search_console"]["supports_resource_selection"] is True
+
+    def test_a_provider_without_a_catalog_reports_false_even_when_connected(
+        self, monkeypatch, signed_in_client, make_project
+    ):
+        """Capability and status are independent, and this is the proof.
+
+        A connection in the healthiest state there is, on a provider that
+        cannot list resources, must still report that it supports no selection.
+        """
+        from integrations import providers
+        from integrations.models import IntegrationConnection
+        from integrations.status import ConnectionStatus
+
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        IntegrationConnection.objects.create(
+            project=project,
+            provider="ga4",
+            status=ConnectionStatus.CONNECTED,
+            external_resource_id="properties/1",
+            external_resource_label="Something",
+        )
+        catalogless = providers.get_provider("ga4").__class__(
+            key="ga4",
+            display_name="Catalogless",
+            description="A provider with no resource selection.",
+            oauth_scopes=(),
+            resources=None,
+        )
+        monkeypatch.setattr(providers, "CATALOG", (catalogless,))
+        monkeypatch.setattr(providers, "_BY_KEY", {"ga4": catalogless})
+        monkeypatch.setattr("integrations.services.CATALOG", (catalogless,))
+
+        entry = client.get(f"/api/projects/{project.pk}/integrations").data[0]
+
+        assert entry["status"] == "connected"
+        assert entry["supports_resource_selection"] is False
+

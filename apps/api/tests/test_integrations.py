@@ -234,6 +234,7 @@ class TestIntegrationsEndpoint:
             "description",
             "status",
             "connection",
+            "supports_resource_selection",
         }
         assert set(entry["connection"]) == {
             "id",
