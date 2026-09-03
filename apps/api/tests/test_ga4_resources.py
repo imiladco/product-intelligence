@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -18,7 +19,7 @@ from rest_framework.test import APIClient
 
 from audit.models import AuditEvent
 from integrations.google import ga4
-from integrations.google.credentials import EXPIRY_SKEW, access_token_for
+from integrations.google.credentials import EXPIRY_SKEW, _persist, access_token_for
 from integrations.google.errors import (
     CredentialMissing,
     CredentialRefreshFailed,
@@ -546,17 +547,63 @@ class TestCredentialRefresh:
     def test_a_response_without_a_refresh_token_keeps_the_stored_one(
         self, connected_project
     ):
-        """The standing rule: never blank a working refresh token."""
+        """The standing rule: never blank a working refresh token.
+
+        Google returns a refresh token only when it issues a new one, so the
+        common case is a response carrying a fresh access token and expiry and
+        no refresh token at all. The whole refresh must apply, and the stored
+        refresh token must come through it untouched.
+
+        The access-token and expiry assertions are what make this a real
+        regression: without them the test would still pass if the refresh
+        silently did nothing, which is the other way to "preserve" a token.
+        """
         _client, _user, _project, connection = connected_project
         credential = connection.credential
-        credential.access_token_expires_at = None
+        expired_at = timezone.now() - timedelta(minutes=5)
+        credential.access_token_expires_at = expired_at
         credential.save(update_fields=["access_token_expires_at"])
-        stub_refresh(refresh_token=None)
+        assert credential.refresh_token == "refresh-token-1"
 
-        access_token_for(connection)
+        # A response with a new access token and expiry, and no refresh token.
+        stub_refresh(access_token="access-token-2", refresh_token=None)
+        assert "refresh_token" not in json.loads(responses.registered()[0].body)
+
+        returned = access_token_for(connection)
+
+        credential.refresh_from_db()
+        # The refresh happened...
+        assert returned == "access-token-2"
+        assert credential.access_token == "access-token-2"
+        assert credential.access_token_expires_at > timezone.now()
+        assert credential.access_token_expires_at != expired_at
+        # ...and it did not cost the stored refresh token.
+        assert credential.refresh_token == "refresh-token-1"
+
+    def test_persisting_never_blanks_a_stored_refresh_token(self, connected_project):
+        """The guard in _persist, tested without google-auth in the way.
+
+        google-auth already defaults a missing refresh_token to the current one
+        (google/oauth2/_client.py: `response_data.get("refresh_token",
+        refresh_token)`), so the end-to-end test above passes even if our own
+        guard is removed. That makes the guard the second of two layers, and
+        an untested layer is not a layer — this pins it directly, so a library
+        change cannot silently leave nothing standing between an empty value
+        and the stored token.
+        """
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        blank = SimpleNamespace(
+            token="access-token-2",
+            refresh_token="",
+            expiry=timezone.now() + timedelta(hours=1),
+        )
+
+        _persist(credential, blank)
 
         credential.refresh_from_db()
         assert credential.refresh_token == "refresh-token-1"
+        assert credential.access_token == "access-token-2"
 
     @responses.activate
     def test_a_new_refresh_token_replaces_the_stored_one(self, connected_project):
@@ -756,3 +803,129 @@ class TestNoLeakage:
             )
 
         assert "access-token-1" not in caplog.text
+
+
+class TestConnectedComesOnlyFromVerification:
+    """`connected` is a claim about a live check, so only a live check may set it.
+
+    Discovery is a convenience for the human choosing; it is not evidence about
+    any particular property. These tests hold the line at the three places it
+    could erode: discovery writing state, persistence running before
+    verification, and persistence copying from the discovery payload.
+    """
+
+    @responses.activate
+    def test_successful_discovery_never_connects_anything(self, connected_project):
+        client, _user, project, connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[account(properties=[summary("properties/111", "acme")])]
+            )
+        )
+
+        response = client.get(resources_url(project.pk))
+
+        assert response.status_code == 200
+        assert len(response.data["resources"]) == 1
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.external_resource_id == ""
+        assert connection.external_resource_label == ""
+        assert connection.external_resource_meta == {}
+        assert connection.last_health_check_at is None
+        assert connection.last_successful_check_at is None
+
+    @responses.activate
+    def test_selection_verifies_the_exact_property_before_persisting(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        stub_property(property_id="properties/111")
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        # Exactly one outbound call, and it is properties.get on the chosen id.
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url == f"{ADMIN_BASE}/properties/111"
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+
+    @responses.activate
+    def test_nothing_persists_when_verification_never_succeeds(
+        self, connected_project
+    ):
+        """No verified response, no connected state — whatever else happened."""
+        client, _user, project, connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[account(properties=[summary("properties/111", "acme")])]
+            )
+        )
+        client.get(resources_url(project.pk))  # the property was listed...
+        responses.reset()
+        stub_property(property_id="properties/111", status=403)  # ...but not readable
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert response.status_code == 400
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.external_resource_id == ""
+        assert connection.external_resource_meta == {}
+
+    @responses.activate
+    def test_stored_values_come_from_verification_not_from_discovery(
+        self, connected_project
+    ):
+        """The discovery payload disagrees with the verification response.
+
+        Every stored field must follow the verification response. Discovery is
+        a list the user browsed; only the properties.get result is evidence
+        about the property that was actually chosen.
+        """
+        client, _user, project, connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[
+                    account(
+                        display_name="Discovery Account",
+                        account_id="accounts/999",
+                        properties=[
+                            {
+                                "property": "properties/111",
+                                "displayName": "Discovery label",
+                                "propertyType": "PROPERTY_TYPE_SUBPROPERTY",
+                            }
+                        ],
+                    )
+                ]
+            )
+        )
+        listed = client.get(resources_url(project.pk))
+        assert listed.data["resources"][0]["label"] == "Discovery label"
+
+        responses.reset()
+        stub_property(
+            property_id="properties/111",
+            display_name="Verified label",
+            parent="accounts/1",
+        )
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        connection.refresh_from_db()
+        assert connection.external_resource_label == "Verified label"
+        assert connection.external_resource_meta == {
+            "account": "accounts/1",
+            "property_type": "PROPERTY_TYPE_ORDINARY",
+        }
+        # None of the discovery payload's disagreeing values survived.
+        assert "Discovery label" not in str(connection.external_resource_label)
+        assert "accounts/999" not in str(connection.external_resource_meta)
+        assert "SUBPROPERTY" not in str(connection.external_resource_meta)
