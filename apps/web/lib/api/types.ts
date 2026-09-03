@@ -84,14 +84,17 @@ export interface AuthorizationStart {
   authorization_url: string;
 }
 
-/** One selectable external resource — for GA4, a property.
- *  `id` is Google's own immutable identifier and is sent back verbatim; the
- *  browser never builds one. */
+/** One selectable external resource, in provider-neutral terms.
+ *
+ *  `id` is the provider's own identifier and is sent back verbatim; the
+ *  browser never builds or parses one. `resource_type` and `group_label` are
+ *  display-only and may be empty — a provider whose resources have no grouping
+ *  leaves `group_label` blank everywhere, and the list renders flat. */
 export interface DiscoveredResource {
   id: string;
   label: string;
-  account_label: string;
-  property_type: string;
+  group_label: string;
+  resource_type: string;
 }
 
 /** Response of GET /api/projects/{id}/integrations/{provider}/resources.

@@ -84,6 +84,7 @@ export function IntegrationCard({
               <ResourcePickerDialog
                 projectId={projectId}
                 provider={entry.provider}
+                providerName={entry.display_name}
               />
             ) : null}
             {note ? (
