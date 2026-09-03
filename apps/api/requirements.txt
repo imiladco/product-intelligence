@@ -13,6 +13,11 @@ python-dotenv>=1.0
 # Google's maintained OAuth library. Pulls in google-auth; used so the
 # protocol is not hand-built.
 google-auth-oauthlib>=1.2
+# HTTP client for the Google Admin APIs. Already present transitively via
+# google-auth-oauthlib; declared here because integrations/google/ga4.py calls
+# it directly, and a direct import must not rest on another package's
+# dependency choices.
+requests>=2.32
 # WSGI server for containers. The Django development server is never used
 # outside local development.
 gunicorn>=23.0

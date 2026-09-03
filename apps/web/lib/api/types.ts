@@ -83,3 +83,21 @@ export interface IntegrationEntry {
 export interface AuthorizationStart {
   authorization_url: string;
 }
+
+/** One selectable external resource — for GA4, a property.
+ *  `id` is Google's own immutable identifier and is sent back verbatim; the
+ *  browser never builds one. */
+export interface DiscoveredResource {
+  id: string;
+  label: string;
+  account_label: string;
+  property_type: string;
+}
+
+/** Response of GET /api/projects/{id}/integrations/{provider}/resources.
+ *  `truncated` is true when the account has more than the backend will page
+ *  through, so the list is usable but not exhaustive. */
+export interface DiscoveredResources {
+  resources: DiscoveredResource[];
+  truncated: boolean;
+}

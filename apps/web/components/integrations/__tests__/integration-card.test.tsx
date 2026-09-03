@@ -177,9 +177,7 @@ describe("IntegrationCard after OAuth", () => {
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
     // Authorized is not connected: no property is chosen yet.
     expect(screen.getByTestId("status-badge")).not.toHaveTextContent("Connected");
-    expect(
-      screen.getByText("Choosing a property is not available yet."),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
   });
 
   it("offers Reauthorize when authorization has become invalid", () => {
@@ -260,11 +258,11 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    // The one action offered is choosing a property. Authorization already
+    // succeeded, so nothing here suggests doing it again.
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
-    expect(
-      screen.getByText("Choosing a property is not available yet."),
-    ).toBeInTheDocument();
   });
 
   it("offers a restart, not a duplicate Connect, while one is in flight", () => {

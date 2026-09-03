@@ -81,17 +81,26 @@ rotation, credential non-exposure, log redaction).
 
 Re-verify Google OAuth docs before writing this milestone.
 
-## Milestone 4 — GA4 discovery, selection, health
+## Milestone 4 — GA4 discovery, selection, verification
 
 **Demo:** real GA4 properties listed, one selected, status becomes *Connected*
-with last-successful-check timestamp; **Test connection** works.
+with a last-successful-check timestamp from the verifying call itself.
 
-Adds: `providers/google_ga4.py` (`accountSummaries.list`, `properties.get`),
-`resources/`, `resource/`, `health-check/` endpoints, state transitions,
-`ResourcePickerDialog.tsx`, empty-state copy for zero accessible properties.
+Adds: `google/ga4.py` (`accountSummaries.list`, `properties.get`),
+`google/credentials.py` (token refresh), `resources/` and `resource/`
+endpoints, state transitions, `ResourcePickerDialog.tsx`, empty-state copy for
+zero accessible properties.
 
-Tests: discovery pagination, selection persists the immutable `properties/{id}`,
-health 200/403/404/401 mapping, `invalid_grant` → `reauth_required`.
+Selection verification *is* the connection's initial health check: the 200 that
+proves the property is readable stamps the health timestamps, so there is one
+verification path rather than two. Changing an existing selection, the
+on-demand `health-check/` endpoint and the **Test connection** action moved to
+Milestone 6, where a failing check has somewhere to lead. Deliberately no
+provider-neutral resource abstraction yet — see Milestone 5.
+
+Tests: discovery pagination, selection persists the immutable `properties/{id}`
+and Google's own label rather than the request body's, 200/403/404/401 mapping,
+`invalid_grant` → `reauth_required`.
 
 ## Milestone 5 — Search Console discovery, selection, health
 
@@ -102,6 +111,10 @@ Adds: `providers/google_search_console.py` (`sites.list`, `sites.get`),
 `siteUnverifiedUser` filtering. Frontend is reused unchanged — if it is not,
 the provider boundary is wrong and gets fixed here.
 
+Milestone 4 left the GA4 boundary GA4-specific on purpose, reached through one
+explicit provider check. This is where the abstraction is decided, with two
+real implementations to generalize from instead of one.
+
 Tests: both siteUrl forms round-trip, unverified sites excluded, health mapping.
 
 ## Milestone 6 — Reconnect, disconnect, error handling, audit
@@ -111,9 +124,10 @@ shows *Reauthorization required* → **Reconnect** restores *Connected* with the
 prior selection re-verified; **Disconnect** destroys credentials.
 
 Adds: reconnect flow preserving a still-valid selection, disconnect with
-revocation + credential deletion, the full error taxonomy surfaced in the UI,
-audit events on connect/reconnect/disconnect/resource-change, `AuditEvent`
-admin.
+revocation + credential deletion, the on-demand `health-check/` endpoint and
+**Test connection** action (moved here from Milestone 4), changing an already
+selected resource, the full error taxonomy surfaced in the UI, audit events on
+reconnect/disconnect/resource-change, `AuditEvent` admin.
 
 Tests: every transition in the state machine, disconnect leaves no credential
 row, audit rows written with no sensitive metadata.

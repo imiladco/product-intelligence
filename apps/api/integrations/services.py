@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .models import IntegrationConnection
-from .providers import CATALOG, IntegrationProvider
+from .providers import CATALOG, IntegrationProvider, get_provider
 from .status import NOT_CONNECTED
 
 
@@ -45,3 +45,18 @@ def integrations_for_project(project) -> list[IntegrationEntry]:
         for connection in IntegrationConnection.objects.filter(project=project)
     }
     return [_entry(provider, stored.get(provider.key)) for provider in CATALOG]
+
+
+def integration_entry_for_provider(project, provider_key: str) -> IntegrationEntry:
+    """One provider's entry for a project, in the same shape as the list.
+
+    Used after a change, so a client re-renders from the same payload it
+    already knows how to read instead of a second, subtly different one.
+    """
+    provider = get_provider(provider_key)
+    if provider is None:  # pragma: no cover - views validate the key first
+        raise ValueError(f"Unknown provider: {provider_key}")
+    connection = IntegrationConnection.objects.filter(
+        project=project, provider=provider.key
+    ).first()
+    return _entry(provider, connection)
