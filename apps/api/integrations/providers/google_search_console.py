@@ -1,11 +1,8 @@
-"""Google Search Console provider definition.
-
-Milestone 2 is the catalog entry only. OAuth (Milestone 3) and site discovery
-plus health checks (Milestone 5) are added here later.
-"""
+"""Google Search Console provider definition."""
 
 from __future__ import annotations
 
+from ..google import search_console
 from .base import IntegrationProvider, ProviderKey
 
 PROVIDER = IntegrationProvider(
@@ -18,4 +15,5 @@ PROVIDER = IntegrationProvider(
     # Read-only. Verified 2026-09-02 against
     # https://developers.google.com/webmaster-tools/v1/sites/list
     oauth_scopes=("https://www.googleapis.com/auth/webmasters.readonly",),
+    resources=search_console.CATALOG,
 )

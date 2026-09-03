@@ -146,16 +146,6 @@ class TestTenancy:
         client, _user, project, _connection = connected_project
         assert client.get(resources_url(project.pk, "not_a_provider")).status_code == 404
 
-    def test_search_console_has_no_resource_selection_yet(self, connected_project):
-        """A real provider without resource support answers 404, not 500."""
-        client, _user, project, _connection = connected_project
-        IntegrationConnection.objects.create(
-            project=project,
-            provider=ProviderKey.SEARCH_CONSOLE,
-            status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
-        )
-        assert client.get(resources_url(project.pk, "search_console")).status_code == 404
-
     def test_authentication_is_required(self, connected_project):
         # A fresh client on purpose: the signed_in_client fixture is built from
         # api_client, so reusing that fixture here would test the signed-in
