@@ -1053,3 +1053,36 @@ single squashed commit would make "revert the provider but keep the refactor"
 impossible, and would remove the checkpoint at which the refactor is provably
 behaviour-preserving.
 
+---
+
+## 25. Reconciliation — what implementation changed from this design
+
+Recorded so the document matches what shipped rather than what was planned.
+
+1. **An over-length identifier returns `validation_error`, not
+   `invalid_resource_id`.** §7.1 assumed the provider's length cap would answer
+   first. It does not: the serializer's `max_length=255`, inherited from M4,
+   rejects the value before the catalog sees it. Both are 400 with no outbound
+   call, and both bounds are kept — the serializer bounds size, the provider
+   bounds format. A test now records which guard fires, so a later change to
+   either is not mistaken for a regression.
+2. **One M4 test was moved rather than renamed.**
+   `test_search_console_has_no_resource_selection_yet` asserted a 404 whose
+   *premise* — that Search Console has no catalog — is exactly what commit 2
+   changes. Its behaviour (a provider without a catalog answers 404) moved to
+   `test_provider_boundary.py`, tested with a catalog-less provider rather than
+   with a real one that now has a catalog. This is not a §4.3 violation: that
+   rule governs commit 1, which passed with two field-name edits and no changed
+   expectation value.
+3. **`test_provider_boundary.py` gained two guards** not named in §17: the
+   protocol has exactly three methods, and `resource_service.py` contains no
+   provider name. Both make claims this design makes in prose fail the build if
+   they stop being true.
+4. **The picker's secondary line shows `resource_type` where present**, falling
+   back to the identifier, rather than always showing the identifier. §12.3
+   described the type being rendered; this is where it went.
+
+Everything else shipped as designed. The invariants in §24 hold: no migration,
+no data rewrite, no credential code touched, no dependency change, no endpoint
+or error code changed.
+
