@@ -69,11 +69,17 @@ class ResourceSelectionSerializer(serializers.Serializer):
 class DiscoveredResourceSerializer(serializers.Serializer):
     """One selectable resource, as offered to the picker.
 
-    Built from a Ga4Property, never from a Google response dict: the API shape
-    is ours, and does not change because Google adds a field.
+    Built from a RemoteResource, never from a provider response dict: the API
+    shape is ours, and does not change because Google adds a field.
+
+    The field names are provider-neutral because one picker renders every
+    provider: ``group_label`` is a GA4 account or nothing at all, and
+    ``resource_type`` is whatever that provider calls its kinds. Naming them
+    after GA4's vocabulary would make the payload readable for one provider and
+    misleading for the rest.
     """
 
     id = serializers.CharField(read_only=True)
     label = serializers.CharField(read_only=True)
-    account_label = serializers.CharField(read_only=True)
-    property_type = serializers.CharField(read_only=True)
+    group_label = serializers.CharField(read_only=True)
+    resource_type = serializers.CharField(read_only=True)

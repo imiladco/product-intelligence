@@ -196,8 +196,8 @@ class TestDiscovery:
             "properties/222",
             "properties/111",
         ]
-        assert response.data["resources"][0]["account_label"] == "Example Ltd"
-        assert response.data["resources"][0]["property_type"] == "PROPERTY_TYPE_ORDINARY"
+        assert response.data["resources"][0]["group_label"] == "Example Ltd"
+        assert response.data["resources"][0]["resource_type"] == "PROPERTY_TYPE_ORDINARY"
 
     @responses.activate
     def test_sends_the_documented_maximum_page_size(self, connected_project):

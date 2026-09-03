@@ -1,11 +1,9 @@
 """The provider boundary.
 
-Deliberately the smallest thing that works today: a provider is a value object
-describing a supported integration. There is no behaviour on it yet because
-there is nothing real for it to do — OAuth arrives in Milestone 3 and resource
-discovery in Milestones 4 and 5. Methods that only raise or return placeholders
-would be worse than no methods, so the interface grows when the first real
-implementation needs it.
+A provider is a value object describing a supported integration, plus — since
+Milestone 5 — an optional resource catalog. The catalog arrived only once two
+real implementations existed to generalize from; before that it would have been
+a guess about the second one.
 
 No plugin loader, no entry points, no dynamic import.
 """
@@ -15,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from django.db import models
+
+from ..resources import ResourceCatalog
 
 
 class ProviderKey(models.TextChoices):
@@ -35,3 +35,7 @@ class IntegrationProvider:
     #: authorized on its own, so connecting GA4 never asks for Search Console
     #: access and vice versa.
     oauth_scopes: tuple[str, ...]
+    #: How this provider lists and verifies the resource a connection points
+    #: at. None means it has no resource selection, and those endpoints answer
+    #: 404 for it — the honest answer, rather than a half-working feature.
+    resources: ResourceCatalog | None = None
