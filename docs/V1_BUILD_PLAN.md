@@ -112,8 +112,16 @@ Adds: `providers/google_search_console.py` (`sites.list`, `sites.get`),
 the provider boundary is wrong and gets fixed here.
 
 Milestone 4 left the GA4 boundary GA4-specific on purpose, reached through one
-explicit provider check. This is where the abstraction is decided, with two
-real implementations to generalize from instead of one.
+explicit provider check. This is where the abstraction was decided, with two
+real implementations to generalize from instead of one: a ResourceCatalog with
+three methods — normalize, list, verify — one per call site that already
+existed. resource_service names no provider.
+
+Two things are genuinely different from GA4 and are handled at the boundary:
+the identifier is a URL, so it is percent-encoded whole into one path segment;
+and a 200 is not proof of access, because Search Console answers 200 for a site
+the account is merely aware of. Permission is checked against an allowlist of
+siteOwner, siteFullUser and siteRestrictedUser.
 
 Tests: both siteUrl forms round-trip, unverified sites excluded, health mapping.
 
