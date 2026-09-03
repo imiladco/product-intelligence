@@ -962,3 +962,94 @@ Run **first**. The refactor is the risk this milestone carries.
 
 The SQL and log commands are the M4 checklist's, unchanged apart from expecting
 two connected rows instead of one.
+
+---
+
+## 24. Implementation invariants
+
+The things that must still be true when M5 is done. Stated before any code is
+written, so the refactor is measured against a fixed bar rather than against
+whatever it turns out to do.
+
+### 24.1 Existing GA4 connections
+
+| Invariant | How it is guaranteed |
+|---|---|
+| A connected GA4 integration **stays connected** | No code path writes `status` outside `_persist_selection` (verified selection) and `mark_reauth_required` (rejected refresh). The refactor moves call sites; it adds no write. |
+| Existing rows are **untouched** | M5 executes no data-access code at deploy time. There is no backfill, no management command, no migration, no `save()` outside a user-initiated selection. A connected row is read, never written, until its owner selects again. |
+| **No migration** | No model field is added, removed, renamed or altered. `makemigrations --check` must report "No changes detected" — an acceptance criterion (§21) and a staging check (§23). |
+| **No data rewrite** | `external_resource_id`, `external_resource_label` and `external_resource_meta` keep their stored values byte for byte. The `RemoteResource` rename changes the *Python attribute* a value passes through, never the *database key*: GA4's metadata stays `{"account": …, "property_type": …}` because `ga4.py` still builds that dict (§4.4, §4.5). |
+| Verified on staging | §23.2 checks the live `poolino` row against its recorded values **before** any Search Console step. |
+
+The distinction that makes this safe: the refactor renames things in the shared
+layer. It renames nothing that has ever been written to the database.
+
+### 24.2 API response compatibility
+
+**Confirmed: the discovery field renames affect exactly one consumer, and it is
+in this repository.**
+
+- `grep` over the monorepo finds `account_label` and `property_type` in three
+  files only: `apps/api/integrations/serializers.py` (producer),
+  `apps/web/lib/api/types.ts` (the hand-maintained mirror) and
+  `resource-picker-dialog.tsx` (the sole reader). All three change in the same
+  commit.
+- **No external client depends on the old fields.** The endpoint requires an
+  authenticated same-origin session, has existed only since M4 (merged today),
+  is deployed only to staging, is not versioned or published, has no API
+  documentation, no API keys, no third-party integration, and no consumer
+  outside `apps/web`. The scope of the claim is exactly that: no client exists
+  outside this repository that *could* depend on them.
+- **Nothing else in the response changes** — not the route, method, request
+  body, status codes, error codes, `IntegrationEntry` shape, or the selection
+  endpoint's contract. `GET /integrations` is untouched.
+
+### 24.3 Rollback: can commit 2 be reverted alone?
+
+**Yes for the backend, with one frontend caveat that is a pre-existing defect.**
+
+Reverting **commit 2** (the Search Console provider) leaves commits 1, 3 and 4
+in place. GA4 keeps working, because commit 1 is behaviour-preserving by
+construction and was proven green on the GA4 suite before commit 2 existed
+(§4.3). `google_search_console.PROVIDER` returns to `resources=None`, and both
+endpoints answer 404 for it — exactly M4's behaviour.
+
+**The caveat, and it is a defect that already exists on `main` today:** the
+Integrations card renders the property picker from **status alone**
+(`resourceAction === "select"`), with no check that the provider actually
+supports resource selection. So a Search Console connection sitting in
+`awaiting_resource_selection` — which is exactly where staging's has been since
+M3 — already shows a **Choose property** button whose dialog fails with a 404.
+M5 makes the symptom disappear by giving the provider a catalog, but it does
+not fix the cause, and a revert of commit 2 would bring the broken button back.
+
+The minimal fix is a `supports_resource_selection` boolean on the integration
+entry, derived from `provider.resources is not None`, with the card gating on
+`resourceAction === "select" && entry.supports_resource_selection`. That is
+roughly ten lines across the serializer, the service, the type mirror and the
+card. **It is not in the approved M5 scope**, so it is not being implemented
+unasked — it is recorded here, and raised for a decision. Until it is fixed,
+"revert commit 2 alone" means "revert commit 2 and accept a broken button on an
+unconfigured provider", which is a real but cosmetic regression to a state that
+already shipped.
+
+Reverting **the whole branch** is unconditionally safe and is the recommended
+path if anything larger goes wrong: no schema change, no data rewrite, and GA4
+returns to its M4 behaviour exactly.
+
+### 24.4 Commit sequence
+
+Four commits, in this order, each independently green:
+
+| # | Contents | Gate before moving on |
+|---|---|---|
+| 1 | `resources.py`, `ResourceCatalog` extraction, `ga4.py` returns `RemoteResource`, `resource_service.py` dispatches through the provider, serializer renames. **No Search Console code whatsoever.** | The full M4 GA4 suite passes with symbol renames only and no changed expectation values (§4.3). This is the moment the refactor is judged. |
+| 2 | `google/search_console.py`, the provider catalog wiring, `test_search_console_resources.py`, `test_provider_boundary.py`. Backend only. | New provider tests and the whole backend suite green. |
+| 3 | The neutral picker: `providerName` prop, conditional grouping, `types.ts` renames, card wiring, frontend tests. | `vitest`, `tsc`, `eslint`, `next build` green. |
+| 4 | `docs/V1_BUILD_PLAN.md` tick, design-document reconciliation, any test cleanup. | Everything green; no production code in this commit. |
+
+Splitting this way is not bookkeeping: it is what makes §24.3 possible. A
+single squashed commit would make "revert the provider but keep the refactor"
+impossible, and would remove the checkpoint at which the refactor is provably
+behaviour-preserving.
+
