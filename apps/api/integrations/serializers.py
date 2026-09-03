@@ -48,3 +48,32 @@ class IntegrationEntrySerializer(serializers.Serializer):
     description = serializers.CharField(read_only=True)
     status = serializers.CharField(read_only=True)
     connection = IntegrationConnectionSerializer(read_only=True, allow_null=True)
+
+
+class ResourceSelectionSerializer(serializers.Serializer):
+    """The body of a resource selection: an identifier, and nothing else.
+
+    Only ``resource_id`` is declared, so a request carrying a label, a status,
+    or any other field simply has nowhere for it to land. That is the point: a
+    connection's stored label comes from Google's verification response, never
+    from the browser, and the shortest way to guarantee it is to make the value
+    unreadable rather than to remember to ignore it.
+
+    Format is checked in the provider boundary that owns it, not here — this
+    only bounds the size of what reaches it.
+    """
+
+    resource_id = serializers.CharField(max_length=255, allow_blank=False, trim_whitespace=True)
+
+
+class DiscoveredResourceSerializer(serializers.Serializer):
+    """One selectable resource, as offered to the picker.
+
+    Built from a Ga4Property, never from a Google response dict: the API shape
+    is ours, and does not change because Google adds a field.
+    """
+
+    id = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    account_label = serializers.CharField(read_only=True)
+    property_type = serializers.CharField(read_only=True)

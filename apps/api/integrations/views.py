@@ -10,11 +10,18 @@ from rest_framework.views import APIView
 
 from projects.selectors import get_project_for_user
 
-from .google.errors import OAuthError
+from common.errors import error_response
+
+from .google.errors import GoogleApiError, OAuthError
 from .oauth_service import complete_authorization, start_authorization
 from .providers import get_provider
-from .serializers import IntegrationEntrySerializer
-from .services import integrations_for_project
+from .resource_service import discover_resources, select_resource
+from .serializers import (
+    DiscoveredResourceSerializer,
+    IntegrationEntrySerializer,
+    ResourceSelectionSerializer,
+)
+from .services import integrations_for_project, integration_entry_for_provider
 
 logger = logging.getLogger(__name__)
 
@@ -104,3 +111,82 @@ class GoogleOAuthCallbackView(APIView):
         """
         base = settings.APP_URL.rstrip("/")
         return HttpResponseRedirect(f"{base}/projects?{urlencode({'oauth_error': error_code})}")
+
+
+class GoogleApiErrorMixin:
+    """Turns a Google boundary error into the project's error envelope.
+
+    Every one of these carries its own code, message and status, so the mapping
+    is one lookup rather than a chain of except clauses in each view. The
+    exception's own text is what the user sees; Google's is never in it.
+    """
+
+    def handle_exception(self, exc):
+        if isinstance(exc, GoogleApiError):
+            if exc.http_status == 404:
+                raise Http404(exc.message) from exc
+            return error_response(
+                exc.code, exc.message, http_status=exc.http_status
+            )
+        return super().handle_exception(exc)
+
+
+class IntegrationResourcesView(GoogleApiErrorMixin, APIView):
+    """GET /api/projects/{project_id}/integrations/{provider}/resources
+
+    The external resources the connection's Google account can actually read —
+    for GA4, its properties. Read-only, and it creates nothing: a provider
+    nobody has authorized answers with a conflict rather than a fresh row.
+
+    Throttled separately from the rest of the API: every call spends quota on
+    Google's side, not ours.
+    """
+
+    throttle_scope = "integrations"
+
+    def get(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        discovered = discover_resources(project=project, provider_key=provider)
+        return Response(
+            {
+                "resources": DiscoveredResourceSerializer(
+                    discovered.resources, many=True
+                ).data,
+                "truncated": discovered.truncated,
+            }
+        )
+
+
+class IntegrationResourceSelectionView(GoogleApiErrorMixin, APIView):
+    """POST /api/projects/{project_id}/integrations/{provider}/resource
+
+    Selects the resource this integration will use. The body carries an
+    identifier and nothing else: the backend verifies that exact resource
+    against Google and stores the label Google returns, so posting an arbitrary
+    identifier — or a flattering label — cannot make a connection connected.
+
+    Returns the same integration entry the page already renders, so the client
+    re-renders from one authoritative payload instead of patching local state.
+    """
+
+    throttle_scope = "integrations"
+
+    def post(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        serializer = ResourceSelectionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        select_resource(
+            user=request.user,
+            project=project,
+            provider_key=provider,
+            resource_id=serializer.validated_data["resource_id"],
+        )
+        entry = integration_entry_for_provider(project, provider)
+        return Response(IntegrationEntrySerializer(entry).data)

@@ -1,0 +1,758 @@
+"""GA4 property discovery, selection, and the credential refresh they need.
+
+No test contacts Google. Every outbound call is stubbed with `responses`, and
+several tests assert that *no* call was made at all — a guard that only works
+because rejection happens before the request is built.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import timedelta
+
+import pytest
+import requests
+import responses
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from audit.models import AuditEvent
+from integrations.google import ga4
+from integrations.google.credentials import EXPIRY_SKEW, access_token_for
+from integrations.google.errors import (
+    CredentialMissing,
+    CredentialRefreshFailed,
+    ResourceUnavailable,
+)
+from integrations.google.oauth import TOKEN_URI
+from integrations.models import IntegrationConnection, IntegrationCredential
+from integrations.providers import ProviderKey
+from integrations.status import ConnectionStatus
+from projects.models import Project
+from tests.conftest import PASSWORD
+from workspaces.models import Membership
+from workspaces.services import create_initial_workspace
+
+pytestmark = pytest.mark.django_db
+
+ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
+SUMMARIES_URL = f"{ADMIN_BASE}/accountSummaries"
+GA4_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+
+
+@pytest.fixture(autouse=True)
+def google_settings(settings):
+    settings.GOOGLE_CLIENT_ID = "test-client-id.apps.googleusercontent.com"
+    settings.GOOGLE_CLIENT_SECRET = "test-client-secret"
+    settings.GA4_ADMIN_BASE_URL = ADMIN_BASE
+    return settings
+
+
+def resources_url(project_id, provider="ga4") -> str:
+    return f"/api/projects/{project_id}/integrations/{provider}/resources"
+
+
+def selection_url(project_id, provider="ga4") -> str:
+    return f"/api/projects/{project_id}/integrations/{provider}/resource"
+
+
+@pytest.fixture
+def connected_project(signed_in_client, make_project):
+    """A project whose GA4 integration is authorized and awaiting a property."""
+    client, user, workspace = signed_in_client
+    project = make_project(workspace)
+    connection = IntegrationConnection.objects.create(
+        project=project,
+        provider=ProviderKey.GA4,
+        status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        granted_scopes=[GA4_SCOPE],
+        connected_by=user,
+    )
+    IntegrationCredential.objects.create(
+        connection=connection,
+        access_token="access-token-1",
+        refresh_token="refresh-token-1",
+        access_token_expires_at=timezone.now() + timedelta(hours=1),
+    )
+    return client, user, project, connection
+
+
+def summaries_body(*, accounts, next_page_token=None):
+    body = {"accountSummaries": accounts}
+    if next_page_token:
+        body["nextPageToken"] = next_page_token
+    return body
+
+
+def account(display_name="Example Ltd", account_id="accounts/1", properties=()):
+    return {
+        "account": account_id,
+        "displayName": display_name,
+        "propertySummaries": list(properties),
+    }
+
+
+def summary(property_id="properties/111", display_name="example.com"):
+    return {
+        "property": property_id,
+        "displayName": display_name,
+        "propertyType": "PROPERTY_TYPE_ORDINARY",
+    }
+
+
+def stub_summaries(*pages):
+    for page in pages:
+        responses.add(responses.GET, SUMMARIES_URL, json=page, status=200)
+
+
+def stub_property(
+    property_id="properties/111",
+    display_name="example.com",
+    status=200,
+    parent="accounts/1",
+):
+    body = (
+        {
+            "name": property_id,
+            "displayName": display_name,
+            "propertyType": "PROPERTY_TYPE_ORDINARY",
+            "parent": parent,
+        }
+        if status == 200
+        else {"error": {"message": "some Google detail that must not leak"}}
+    )
+    responses.add(responses.GET, f"{ADMIN_BASE}/{property_id}", json=body, status=status)
+
+
+# --- Tenancy ----------------------------------------------------------------
+
+
+class TestTenancy:
+    def test_other_workspace_project_is_not_found(
+        self, signed_in_client, make_user_with_workspace, make_project
+    ):
+        client, _user, _workspace = signed_in_client
+        _other_user, other_workspace = make_user_with_workspace(email="other@example.com")
+        foreign = make_project(other_workspace)
+
+        assert client.get(resources_url(foreign.pk)).status_code == 404
+        response = client.post(
+            selection_url(foreign.pk), {"resource_id": "properties/111"}, format="json"
+        )
+        assert response.status_code == 404
+
+    def test_unknown_provider_is_not_found(self, connected_project):
+        client, _user, project, _connection = connected_project
+        assert client.get(resources_url(project.pk, "not_a_provider")).status_code == 404
+
+    def test_search_console_has_no_resource_selection_yet(self, connected_project):
+        """A real provider without resource support answers 404, not 500."""
+        client, _user, project, _connection = connected_project
+        IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.SEARCH_CONSOLE,
+            status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        )
+        assert client.get(resources_url(project.pk, "search_console")).status_code == 404
+
+    def test_authentication_is_required(self, connected_project):
+        # A fresh client on purpose: the signed_in_client fixture is built from
+        # api_client, so reusing that fixture here would test the signed-in
+        # client a second time rather than an anonymous one.
+        _client, _user, project, _connection = connected_project
+        anonymous = APIClient(enforce_csrf_checks=True)
+
+        # 403, not 401: session auth sends no WWW-Authenticate challenge, which
+        # is what DRF keys 401 off. Matches every other endpoint in the suite.
+        assert anonymous.get(resources_url(project.pk)).status_code == 403
+
+
+# --- Discovery --------------------------------------------------------------
+
+
+class TestDiscovery:
+    @responses.activate
+    def test_lists_properties_grouped_by_account(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[
+                    account(
+                        properties=[
+                            summary("properties/111", "b-site"),
+                            summary("properties/222", "a-site"),
+                        ]
+                    )
+                ]
+            )
+        )
+
+        response = client.get(resources_url(project.pk))
+
+        assert response.status_code == 200
+        assert response.data["truncated"] is False
+        assert [item["id"] for item in response.data["resources"]] == [
+            "properties/222",
+            "properties/111",
+        ]
+        assert response.data["resources"][0]["account_label"] == "Example Ltd"
+        assert response.data["resources"][0]["property_type"] == "PROPERTY_TYPE_ORDINARY"
+
+    @responses.activate
+    def test_sends_the_documented_maximum_page_size(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_summaries(summaries_body(accounts=[]))
+
+        client.get(resources_url(project.pk))
+
+        assert "pageSize=200" in responses.calls[0].request.url
+
+    @responses.activate
+    def test_follows_next_page_token(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[account(properties=[summary("properties/111", "one")])],
+                next_page_token="page-2",
+            ),
+            summaries_body(
+                accounts=[account(properties=[summary("properties/222", "two")])]
+            ),
+        )
+
+        response = client.get(resources_url(project.pk))
+
+        assert len(responses.calls) == 2
+        assert "pageToken=page-2" in responses.calls[1].request.url
+        assert len(response.data["resources"]) == 2
+        assert response.data["truncated"] is False
+
+    @responses.activate
+    def test_stops_at_the_page_cap_and_reports_truncation(self, connected_project):
+        client, _user, project, _connection = connected_project
+        for index in range(ga4.MAX_PAGES + 2):
+            responses.add(
+                responses.GET,
+                SUMMARIES_URL,
+                json=summaries_body(
+                    accounts=[account(properties=[summary(f"properties/{index}")])],
+                    next_page_token=f"page-{index}",
+                ),
+                status=200,
+            )
+
+        response = client.get(resources_url(project.pk))
+
+        assert len(responses.calls) == ga4.MAX_PAGES
+        assert response.data["truncated"] is True
+
+    @responses.activate
+    def test_no_properties_is_an_empty_list_not_an_error(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_summaries(summaries_body(accounts=[account(properties=[])]))
+
+        response = client.get(resources_url(project.pk))
+
+        assert response.status_code == 200
+        assert response.data["resources"] == []
+
+    @responses.activate
+    def test_malformed_summaries_are_skipped_not_fatal(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_summaries(
+            summaries_body(
+                accounts=[
+                    account(
+                        properties=[
+                            {"displayName": "no identifier"},
+                            {"property": "not-a-property-name", "displayName": "bad id"},
+                            summary("properties/111", "good"),
+                        ]
+                    )
+                ]
+            )
+        )
+
+        response = client.get(resources_url(project.pk))
+
+        assert [item["id"] for item in response.data["resources"]] == ["properties/111"]
+
+    @responses.activate
+    def test_google_failure_is_a_service_error_not_a_state_change(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        responses.add(responses.GET, SUMMARIES_URL, json={}, status=503)
+
+        response = client.get(resources_url(project.pk))
+
+        assert response.status_code == 503
+        assert response.data["error"]["code"] == "resource_unavailable"
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+
+
+# --- Selection and verification ---------------------------------------------
+
+
+class TestSelection:
+    @responses.activate
+    def test_verified_selection_connects_the_integration(self, connected_project):
+        client, _user, project, connection = connected_project
+        stub_property(display_name="Google's own name")
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == "properties/111"
+        assert connection.external_resource_label == "Google's own name"
+        assert connection.last_successful_check_at is not None
+        assert connection.last_health_check_at is not None
+        assert response.data["status"] == "connected"
+
+    @responses.activate
+    def test_a_label_in_the_request_body_has_no_effect(self, connected_project):
+        """The browser is not a source of truth for what a property is called."""
+        client, _user, project, connection = connected_project
+        stub_property(display_name="Google's own name")
+
+        client.post(
+            selection_url(project.pk),
+            {
+                "resource_id": "properties/111",
+                "external_resource_label": "Attacker's label",
+                "label": "Attacker's label",
+                "status": "connected",
+            },
+            format="json",
+        )
+
+        connection.refresh_from_db()
+        assert connection.external_resource_label == "Google's own name"
+
+    @responses.activate
+    def test_forbidden_and_missing_are_indistinguishable(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_property(status=403)
+        forbidden = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        responses.reset()
+        stub_property(property_id="properties/222", status=404)
+        missing = client.post(
+            selection_url(project.pk), {"resource_id": "properties/222"}, format="json"
+        )
+
+        assert forbidden.status_code == missing.status_code == 400
+        assert forbidden.data["error"] == missing.data["error"]
+        assert forbidden.data["error"]["code"] == "resource_not_accessible"
+
+    @responses.activate
+    def test_failed_verification_changes_nothing(self, connected_project):
+        client, _user, project, connection = connected_project
+        stub_property(status=403)
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.external_resource_id == ""
+        assert connection.last_successful_check_at is None
+        assert connection.last_health_check_at is None
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "resource_id",
+        [
+            "properties/../../accounts/1",
+            "https://analyticsadmin.googleapis.com/v1beta/properties/111",
+            "properties/111?alt=media",
+            "accounts/111",
+            "properties/",
+            "properties/abc",
+        ],
+    )
+    def test_malformed_identifiers_never_reach_google(
+        self, connected_project, resource_id
+    ):
+        client, _user, project, _connection = connected_project
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": resource_id}, format="json"
+        )
+
+        assert response.status_code == 400
+        assert response.data["error"]["code"] == "invalid_resource_id"
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_selection_requires_an_authorized_connection(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.PENDING_AUTHORIZATION,
+        )
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_missing"
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_reauth_required_says_so_rather_than_not_authorized(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        connection.status = ConnectionStatus.REAUTH_REQUIRED
+        connection.save(update_fields=["status"])
+
+        response = client.get(resources_url(project.pk))
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_refresh_failed"
+
+
+# --- The reductions this milestone agreed to ---------------------------------
+
+
+class TestScopeReductions:
+    @responses.activate
+    def test_reselecting_the_same_property_is_idempotent(self, connected_project):
+        """A retried or double-clicked confirm must not become an error."""
+        client, _user, project, connection = connected_project
+        stub_property()
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+        connection.refresh_from_db()
+        first_check = connection.last_successful_check_at
+
+        stub_property()
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == "properties/111"
+        assert connection.last_successful_check_at >= first_check
+
+    @responses.activate
+    def test_changing_to_a_different_property_is_refused(self, connected_project):
+        client, _user, project, connection = connected_project
+        stub_property()
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+        connection.refresh_from_db()
+        before = (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+        )
+        responses.reset()
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "resource_change_not_supported"
+        assert len(responses.calls) == 0
+        connection.refresh_from_db()
+        assert (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+        ) == before
+
+    def test_there_is_no_health_check_endpoint_in_this_milestone(
+        self, connected_project
+    ):
+        client, _user, project, _connection = connected_project
+
+        response = client.post(
+            f"/api/projects/{project.pk}/integrations/ga4/health-check", format="json"
+        )
+
+        assert response.status_code == 404
+
+
+# --- Credential refresh ------------------------------------------------------
+
+
+def stub_refresh(*, access_token="access-token-2", refresh_token=None, status=200):
+    body = {"access_token": access_token, "expires_in": 3599, "token_type": "Bearer"}
+    if refresh_token is not None:
+        body["refresh_token"] = refresh_token
+    if status != 200:
+        body = {"error": "invalid_grant", "error_description": "Token has been revoked."}
+    responses.add(responses.POST, TOKEN_URI, json=body, status=status)
+
+
+class TestCredentialRefresh:
+    @responses.activate
+    def test_a_valid_token_is_used_as_is(self, connected_project):
+        _client, _user, _project, connection = connected_project
+
+        token = access_token_for(connection)
+
+        assert token == "access-token-1"
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_an_expired_token_is_refreshed_and_persisted(self, connected_project):
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = timezone.now() + EXPIRY_SKEW / 2
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh()
+
+        token = access_token_for(connection)
+
+        assert token == "access-token-2"
+        credential.refresh_from_db()
+        assert credential.access_token == "access-token-2"
+        assert credential.access_token_expires_at > timezone.now()
+
+    @responses.activate
+    def test_an_unknown_expiry_is_treated_as_expired(self, connected_project):
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = None
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh()
+
+        assert access_token_for(connection) == "access-token-2"
+
+    @responses.activate
+    def test_a_response_without_a_refresh_token_keeps_the_stored_one(
+        self, connected_project
+    ):
+        """The standing rule: never blank a working refresh token."""
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = None
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh(refresh_token=None)
+
+        access_token_for(connection)
+
+        credential.refresh_from_db()
+        assert credential.refresh_token == "refresh-token-1"
+
+    @responses.activate
+    def test_a_new_refresh_token_replaces_the_stored_one(self, connected_project):
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = None
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh(refresh_token="refresh-token-2")
+
+        access_token_for(connection)
+
+        credential.refresh_from_db()
+        assert credential.refresh_token == "refresh-token-2"
+
+    @responses.activate
+    def test_invalid_grant_requires_reauthorization(self, connected_project):
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = None
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh(status=400)
+
+        with pytest.raises(CredentialRefreshFailed):
+            access_token_for(connection)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.last_error_code == "credential_refresh_failed"
+
+    @responses.activate
+    def test_a_transport_failure_does_not_change_state(self, connected_project):
+        _client, _user, _project, connection = connected_project
+        credential = connection.credential
+        credential.access_token_expires_at = None
+        credential.save(update_fields=["access_token_expires_at"])
+        responses.add(
+            responses.POST, TOKEN_URI, body=requests.ConnectionError("boom")
+        )
+
+        with pytest.raises(ResourceUnavailable):
+            access_token_for(connection)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+
+    def test_a_connection_without_a_credential_is_missing_not_broken(
+        self, signed_in_client, make_project
+    ):
+        _client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        )
+
+        with pytest.raises(CredentialMissing):
+            access_token_for(connection)
+
+    @responses.activate
+    def test_a_rejected_token_during_verification_requires_reauthorization(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        stub_property(status=401)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_refresh_failed"
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+
+
+# --- Stored state, audit, and leakage ---------------------------------------
+
+
+class TestStoredState:
+    @responses.activate
+    def test_metadata_is_minimal_and_carries_no_timestamp(self, connected_project):
+        client, _user, project, connection = connected_project
+        stub_property()
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        connection.refresh_from_db()
+        assert connection.external_resource_meta == {
+            "account": "accounts/1",
+            "property_type": "PROPERTY_TYPE_ORDINARY",
+        }
+
+    @responses.activate
+    def test_selection_does_not_reassign_connected_by(self, connected_project):
+        """connected_by records who authorized. Selecting is not authorizing."""
+        client, user, project, connection = connected_project
+        other = type(user).objects.create_user(
+            email="colleague@example.com", password=PASSWORD
+        )
+        Membership.objects.create(
+            workspace=project.workspace, user=other, role=Membership.Role.MEMBER
+        )
+        connection.connected_by = other
+        connection.save(update_fields=["connected_by"])
+        stub_property()
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        connection.refresh_from_db()
+        assert connection.connected_by == other
+
+    @responses.activate
+    def test_one_audit_event_records_the_whole_transition(self, connected_project):
+        client, user, project, _connection = connected_project
+        stub_property(display_name="Google's own name")
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        events = list(AuditEvent.objects.filter(project=project))
+        assert len(events) == 1
+        event = events[0]
+        assert event.action == AuditEvent.Action.INTEGRATION_RESOURCE_SELECTED
+        assert event.actor == user
+        assert event.workspace == project.workspace
+        assert event.metadata == {
+            "provider": "ga4",
+            "resource_id": "properties/111",
+            "resource_label": "Google's own name",
+            "status": "connected",
+            "previous_status": "awaiting_resource_selection",
+        }
+
+    @responses.activate
+    def test_a_rejected_selection_writes_no_audit_event(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_property(status=403)
+
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        assert not AuditEvent.objects.filter(project=project).exists()
+
+
+class TestNoLeakage:
+    @responses.activate
+    def test_no_credential_material_in_a_successful_response(self, connected_project):
+        client, _user, project, _connection = connected_project
+        stub_property()
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+
+        body = json.dumps(response.data)
+        assert "access-token-1" not in body
+        assert "refresh-token-1" not in body
+        assert "test-client-secret" not in body
+        assert "external_resource_meta" not in body
+        assert "granted_scopes" not in body
+
+    @responses.activate
+    def test_googles_error_text_never_reaches_the_response_or_the_log(
+        self, connected_project, caplog
+    ):
+        client, _user, project, _connection = connected_project
+        stub_property(status=403)
+
+        with caplog.at_level("DEBUG"):
+            response = client.post(
+                selection_url(project.pk),
+                {"resource_id": "properties/111"},
+                format="json",
+            )
+
+        leak = "some Google detail that must not leak"
+        assert leak not in json.dumps(response.data)
+        assert leak not in caplog.text
+
+    @responses.activate
+    def test_the_access_token_is_never_logged(self, connected_project, caplog):
+        client, _user, project, _connection = connected_project
+        stub_property()
+
+        with caplog.at_level("DEBUG"):
+            client.post(
+                selection_url(project.pk),
+                {"resource_id": "properties/111"},
+                format="json",
+            )
+
+        assert "access-token-1" not in caplog.text

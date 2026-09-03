@@ -196,6 +196,10 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_THROTTLE_RATES": {
         "auth": os.environ.get("THROTTLE_AUTH_RATE", "20/min"),
+        # Integration endpoints call Google on every request, against a quota
+        # that is not ours to spend. Rate-limited separately from auth because
+        # the two protect different things.
+        "integrations": os.environ.get("THROTTLE_INTEGRATIONS_RATE", "30/min"),
     },
     "UNAUTHENTICATED_USER": "django.contrib.auth.models.AnonymousUser",
 }
@@ -263,3 +267,15 @@ GOOGLE_OAUTH_REDIRECT_URI = os.environ.get(
 
 # How long an in-flight authorization request stays valid.
 OAUTH_STATE_TTL_SECONDS = int(os.environ.get("OAUTH_STATE_TTL_SECONDS", "600"))
+
+# --- Google APIs -------------------------------------------------------------
+# Base URL for the Google Analytics Admin API. Configuration, not a constant in
+# the calling code, so a test or a future API version does not need a patch of
+# module internals.
+GA4_ADMIN_BASE_URL = os.environ.get(
+    "GA4_ADMIN_BASE_URL", "https://analyticsadmin.googleapis.com/v1beta"
+)
+
+# Connect+read timeout for every outbound Google API call. A request that hangs
+# holds a Gunicorn worker, and there is only one on the staging VPS.
+GOOGLE_API_TIMEOUT_SECONDS = float(os.environ.get("GOOGLE_API_TIMEOUT_SECONDS", "10"))
