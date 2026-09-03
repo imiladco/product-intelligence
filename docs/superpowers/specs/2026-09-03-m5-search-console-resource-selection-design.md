@@ -1,6 +1,15 @@
 # Milestone 5 — Search Console site discovery, selection, verification
 
-Design draft. 2026-09-03. Not implemented; not approved.
+Design draft. 2026-09-03. Revised after review; not implemented; not approved.
+
+**Revision — what the review asked for and where it lives:** a concrete
+refactor migration strategy with the final interfaces written out (§4.1–§4.4);
+the shared resource contract stated field by field, with a leak audit (§4.5);
+explicit accept/reject rules per `permissionLevel`, each with its reason (§7.3);
+the provider-neutral UI model and component API defined before any component
+changes (§12); exact endpoints and payloads with a compatibility statement
+(§11); audit, credential and token-leakage confirmations (§14, §15); and the
+M5 staging acceptance checklist (§23).
 
 Does for Search Console what Milestone 4 did for GA4: discover the sites the
 granted Google account can actually use, let the user pick one, verify that
@@ -183,8 +192,179 @@ existing tests, which is exactly the safety net that makes doing it now cheaper
 than doing it later with a third provider in the way.
 
 **Explicitly still not built:** a plugin loader, entry points, dynamic import,
-per-provider settings, or any capability flag beyond `resources is None`. The
-protocol has three methods because three call sites exist.
+per-provider settings, capability flags, a registry decorator, or any method
+beyond the three below. The protocol has three methods because three call sites
+exist. A fourth method is added when a fourth call site exists in two
+implementations, not before.
+
+---
+
+## 4.1 The final interfaces, in full
+
+Written out here so the refactor is reviewable before a line is changed.
+
+`integrations/resources.py` — new, and the only new shared module:
+
+```python
+@dataclass(frozen=True)
+class RemoteResource:
+    """One selectable external resource, in provider-neutral terms."""
+    id: str
+    label: str
+    resource_type: str = ""
+    group_label: str = ""
+    metadata: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResourceListing:
+    resources: tuple[RemoteResource, ...]
+    truncated: bool = False
+
+
+class ResourceCatalog(Protocol):
+    """What a provider must do to support resource selection.
+
+    Three methods, one per call site that exists in resource_service today.
+    Implementations are stateless modules or simple objects; none touches the
+    database, and none may return a provider response object.
+    """
+
+    def normalize_resource_id(self, resource_id: str) -> str:
+        """The canonical form of a client-supplied identifier.
+
+        Raises InvalidResourceId if it is not a well-formed identifier for this
+        provider. Returns the value to use from then on — for both providers
+        today that is the input unchanged, but the call site is the one place a
+        provider could trim or case-fold, and having it means no caller ever
+        needs to know whether one does.
+        """
+
+    def list_resources(self, access_token: str) -> ResourceListing: ...
+
+    def verify_resource(self, access_token: str, resource_id: str) -> RemoteResource:
+        """Prove this credential can use this exact resource, or raise.
+
+        Raises ResourceNotAccessible when the provider says no — including a
+        provider that answers 200 while withholding permission (§7.3).
+        """
+```
+
+`integrations/providers/base.py` — one added field, defaulted so nothing else
+changes:
+
+```python
+@dataclass(frozen=True)
+class IntegrationProvider:
+    key: str
+    display_name: str
+    description: str
+    oauth_scopes: tuple[str, ...]
+    #: None means this provider has no resource selection; the endpoints 404.
+    resources: ResourceCatalog | None = None
+```
+
+`resource_service.py` — the dispatch, replacing `SUPPORTED_RESOURCE_PROVIDERS`:
+
+```python
+def _catalog(provider_key: str) -> ResourceCatalog:
+    provider = get_provider(provider_key)
+    if provider is None or provider.resources is None:
+        raise ResourceSelectionUnsupported
+    return provider.resources
+```
+
+After this, `resource_service.py` contains no provider name, no `import ga4`,
+and no branch on `provider_key`.
+
+## 4.2 Exact M4 files that change, and how
+
+| File | Change | Risk |
+|---|---|---|
+| `google/ga4.py` | `Ga4Property` → returns shared `RemoteResource`; `property_type`/`account_id`/`account_label` fold into the shared fields per §4.5; `as_metadata()` becomes the `metadata` field, built identically; `is_valid_property_id` → `normalize_resource_id` (same regex, now raising instead of returning False); module gains a `CATALOG` object exposing the three methods. **No change to any URL, parameter, page size, sort order, status mapping or stored value.** | Medium — most of the diff |
+| `providers/google_ga4.py` | `resources=ga4.CATALOG` | None |
+| `providers/google_search_console.py` | `resources=search_console.CATALOG` | None |
+| `providers/base.py` | one optional field | None |
+| `resource_service.py` | four `ga4.*` call sites → `catalog.*`; `SUPPORTED_RESOURCE_PROVIDERS` → `_catalog()`; `DiscoveredResources` → the shared `ResourceListing` | Medium — security-ordered code |
+| `serializers.py` | `account_label` → `group_label`, `property_type` → `resource_type` | Low |
+| `tests/test_ga4_resources.py` | **renames only** (§4.3) | This is the control |
+| `apps/web/lib/api/types.ts` | two field renames | Low |
+
+Nothing else in M4 is opened. `google/credentials.py`, `google/errors.py`,
+`models.py`, `views.py`, `urls.py`, `audit/` and every deployment file are
+untouched.
+
+## 4.3 How the M4 acceptance tests are preserved
+
+The rule for this milestone: **`tests/test_ga4_resources.py` may change only
+where a symbol was renamed.** Concretely, the permitted edits are
+
+* `Ga4Property` → `RemoteResource` in the one place a test constructs one,
+* `property_type` → `resource_type` and `account_label` → `group_label` in
+  response assertions,
+* `ga4.is_valid_property_id` → the catalog's `normalize_resource_id` in the
+  one test that calls it directly.
+
+Every assertion value stays as it is. Specifically these must pass **unedited**,
+because they are the M4 acceptance criteria this refactor could silently break:
+
+- `test_a_label_in_the_request_body_has_no_effect`
+- `test_forbidden_and_missing_are_indistinguishable`
+- `test_malformed_identifiers_never_reach_google` (all six parameters)
+- `test_metadata_is_minimal_and_carries_no_timestamp`
+- `test_selection_does_not_reassign_connected_by`
+- `test_one_audit_event_records_the_whole_transition`
+- `test_persisting_never_blanks_a_stored_refresh_token`
+- the whole `TestConnectedComesOnlyFromVerification` class
+- the whole `TestNoLeakage` class
+
+If any of those needs a changed **value** rather than a changed **name**, the
+refactor altered behaviour and is wrong — stop and bring it back to review
+rather than updating the expectation. That is the entire safety argument for
+Option A, so it is a rule, not a hope.
+
+Sequencing that makes it enforceable: the refactor is **commit 1**, containing
+no Search Console code at all, and the GA4 suite runs green at that commit
+before `search_console.py` is written. A refactor validated only after a second
+provider exists cannot tell which change broke what.
+
+## 4.4 GA4 behaviours that must remain byte-for-byte identical
+
+Asserted by the unedited tests above, and re-checked by hand in review:
+
+| Behaviour | Value that must not move |
+|---|---|
+| Discovery request | `GET {base}/accountSummaries`, `pageSize=200`, `pageToken` on later pages |
+| Page cap | `MAX_PAGES = 10`, then `truncated: true` |
+| Sort order | `(group_label, label, id)` — the same tuple, under the new field names |
+| Identifier format | `^properties/[0-9]{1,32}$`, unchanged |
+| Verification request | `GET {base}/properties/{id}`, no query parameters |
+| Status mapping | 401 → `CredentialRefreshFailed`; 403/404 → `ResourceNotAccessible`; 429/5xx → `ResourceUnavailable`; other → `GoogleApiError` |
+| Stored id | Google's `name` when well-formed, else the requested id |
+| Stored label | `displayName`, falling back to the id |
+| Stored metadata | exactly `{"account": …, "property_type": …}` — see §4.5 for how that survives a neutral field name |
+| Timeout | `GOOGLE_API_TIMEOUT_SECONDS` |
+| Health writes | both timestamps on success; neither on failure |
+
+## 4.5 GA4 concepts must not leak into the shared layer
+
+The review named `account`, `property_type` and `account_display_name`. Here is
+where each one ends up.
+
+| GA4 concept | Shared layer? | Where it lives |
+|---|---|---|
+| `property_type` (`PROPERTY_TYPE_ORDINARY`) | **No** | A *value* of the neutral `resource_type` field. Search Console puts `"Domain property"` there. The shared layer knows a resource has a type; only `ga4.py` knows what GA4's types are called |
+| `account` (`accounts/123`) | **No** | Inside `metadata`, an opaque `Mapping[str, str]` the shared layer never reads or names |
+| `account_display_name` | **No** | Not stored at all — dropped in M4 because `properties.get` does not return it. Nothing reintroduces it |
+| Account grouping | **No** | The neutral `group_label`. GA4 fills it with an account name; Search Console leaves it `""` |
+| `Ga4Property` type | **No** | Deleted; `RemoteResource` replaces it |
+| `accountSummaries`, `properties/`, page size, the GA4 base URL | **No** | Confined to `google/ga4.py`, as in M4 |
+
+The test that keeps this honest: a grep-style assertion in the shared test
+module that the strings `properties/`, `accountSummaries`, `analyticsadmin`,
+`sc-domain`, `webmasters` and `siteEntry` appear in **no** file under
+`integrations/` other than `google/ga4.py` and `google/search_console.py`. A
+leak becomes a failing test rather than a review catch.
 
 ---
 
@@ -236,9 +416,9 @@ user something that is not the identifier they will see in Google's own UI.
 
 ---
 
-## 7. Selection, encoding, and the unverified rule
+## 7. Selection, encoding, and the permission rule
 
-### Identifier validation, before any outbound call
+## 7.1 Identifier validation, before any outbound call
 
 Two documented forms, and nothing else:
 
@@ -250,7 +430,7 @@ Two documented forms, and nothing else:
 Plus a hard length cap of 255, matching the column that stores it. Anything
 else is `invalid_resource_id` with no request made — the M4 rule, unchanged.
 
-### Path encoding
+## 7.2 Path encoding
 
 `sites.get` takes the identifier as a **path parameter**, so it is percent-
 encoded whole, into one segment:
@@ -266,26 +446,47 @@ characters are unquoted on the way through, so `%2F` survives. That is
 behaviour this design depends on, so a test asserts the outbound URL contains
 `%2F` and no bare slash after `/sites/` rather than trusting it (§17).
 
-### The unverified rule — the security point of this milestone
+## 7.3 The permission rule — the security point of this milestone
 
 `sites.get` returns **200** for a site the account is merely aware of but not
 verified for, with `permissionLevel: "siteUnverifiedUser"`. A 200 is therefore
 **not** sufficient evidence here, which is a genuine difference from GA4 where
-any 200 means readable.
+any 200 means readable. The body decides.
 
-So verification checks the body:
+The criterion is not "how much power does this level have" but **"can this
+level read the data this integration exists to read"** — Search Console's
+Performance report, via `webmasters.readonly`, which is the only scope we hold.
+
+| `permissionLevel` | Decision | Why |
+|---|---|---|
+| `siteOwner` | **Accept** | Verified ownership; full read access to Performance data. The strongest possible answer to "can this credential use this site". |
+| `siteFullUser` | **Accept** | Verified delegated access with full view rights on all reports. Reads exactly what an owner reads; the differences are administrative, and this integration administers nothing. |
+| `siteRestrictedUser` | **Accept** | Verified user with, in Google's words, "simple view rights on most data". The permissions table grants Performance to owners, full users **and** restricted users alike — the restrictions are on editing (Change of Address, property settings), never on reading the report we need. Rejecting it would lock out a real and common case — agencies and contractors are routinely granted restricted access — while protecting nothing, since a restricted user can already read this data in the UI and through the API. Verified 2026-09-03 against Google's [user permissions documentation](https://support.google.com/webmasters/answer/7687615). |
+| `siteUnverifiedUser` | **Reject** | Not verified for the site. Google returns 200 because the *account* knows the site exists, not because it may read it. Accepting this is precisely the hole: any client could post a guessed site URL and reach `connected` on a property from which it can read nothing. |
+| missing / empty / unrecognized | **Reject** | Absence of a permission signal is not permission. An unrecognized future value is rejected for the same reason: the safe reading of "I do not know what this means" is "not proven". A new Google level that should be accepted is a one-line, deliberate change with a test — never something that starts working silently. |
+
+So the check is an allowlist, never a denylist:
 
 ```python
-if payload.get("permissionLevel") in ("", None, "siteUnverifiedUser"):
+ACCEPTED_PERMISSION_LEVELS = frozenset(
+    {"siteOwner", "siteFullUser", "siteRestrictedUser"}
+)
+
+if payload.get("permissionLevel") not in ACCEPTED_PERMISSION_LEVELS:
     raise ResourceNotAccessible
 ```
 
-Missing is treated as unverified: absence of the signal is not permission.
-Without this, a client could post any site URL — including one it merely
-guessed — and reach `connected` on a property it cannot read a single row from.
-Filtering the *list* is not enough, because M4 established that the list is a
-convenience and the verification call is the authority; the authority has to
-carry the check.
+An allowlist is the whole point: a denylist that names only `siteUnverifiedUser`
+would accept any value Google adds later, sight unseen.
+
+Filtering the *list* is not enough on its own, because M4 established that the
+list is a convenience and the verification call is the authority — so the
+authority carries the check. The list filters too, for a different reason: not
+security, but not offering the user a choice that is going to be refused.
+
+Rejection is deliberately indistinguishable from 403/404: the same
+`resource_not_accessible` code and the same message. Telling a caller "this
+exists but you are unverified" is the same existence oracle M4 closed.
 
 Everything else follows M4 exactly: 403/404 collapse into one
 `resource_not_accessible`; 401 means the credential is done and the connection
@@ -340,49 +541,155 @@ still Milestone 6.
 
 ## 11. API contracts
 
-The same two endpoints, now answering for both providers. The only change is
-vocabulary in the discovery payload:
+### 11.1 The exact endpoints — both already exist
+
+M5 adds **no endpoint**. The two M4 routes simply start answering for a second
+provider, because `{provider}` was always a path variable:
+
+```
+GET  /api/projects/{project_id}/integrations/{provider}/resources
+POST /api/projects/{project_id}/integrations/{provider}/resource
+```
+
+`{provider}` ∈ `ga4` | `search_console`. No new route, no version prefix, no
+per-provider path.
+
+### 11.2 Discovery response
 
 ```json
 {
   "resources": [
-    { "id": "sc-domain:example.com", "label": "sc-domain:example.com",
-      "group_label": "", "resource_type": "Domain property" }
+    { "id": "sc-domain:example.com",
+      "label": "sc-domain:example.com",
+      "resource_type": "Domain property",
+      "group_label": "" },
+    { "id": "https://shop.example.com/",
+      "label": "https://shop.example.com/",
+      "resource_type": "URL-prefix property",
+      "group_label": "" }
   ],
   "truncated": false
 }
 ```
 
-`account_label` → `group_label` and `property_type` → `resource_type`: one
-rename, done once, rather than a payload whose field names only make sense for
-one of the two providers using it. This is a pre-release API with a
-hand-maintained TypeScript mirror and no external consumers, so the rename
-costs one edit on each side.
+The same endpoint for GA4, unchanged in shape, only in field names:
 
-`POST …/resource` is unchanged: `{"resource_id": …}`, nothing else readable.
+```json
+{
+  "resources": [
+    { "id": "properties/549483499",
+      "label": "poolino",
+      "resource_type": "PROPERTY_TYPE_ORDINARY",
+      "group_label": "Acme Ltd" }
+  ],
+  "truncated": false
+}
+```
+
+### 11.3 Selection request and response
+
+```
+POST /api/projects/7/integrations/search_console/resource
+{ "resource_id": "sc-domain:example.com" }
+```
+
+Response 200 is the provider's `IntegrationEntry`, exactly the shape the
+Integrations page already renders — unchanged from M4, for both providers.
+Errors are unchanged: 400 `invalid_resource_id` / `resource_not_accessible`,
+409 `credential_missing` / `credential_refresh_failed` /
+`resource_change_not_supported`, 503 `resource_unavailable`, 404 for an unknown
+project, provider, or a provider with no catalog.
+
+### 11.4 Compatibility statement
+
+| Question | Answer |
+|---|---|
+| Does any endpoint break an M4 client? | **No route, method, request body, status code or error code changes.** The one breaking-shaped change is two field renames in the discovery response — `account_label` → `group_label`, `property_type` → `resource_type` — consumed by exactly one client, `resource-picker-dialog.tsx`, in this repository, updated in the same commit. |
+| Is that rename safe? | The API is pre-release, unversioned, has no external consumers, and its TypeScript types are a hand-maintained mirror in the same monorepo. The alternative — keeping GA4 field names in a payload that serves both providers — is a permanent cost to avoid a one-commit one. |
+| Does the **stored** shape change? | No. `external_resource_id`, `external_resource_label` and `external_resource_meta` keep their meanings and, for GA4, their exact values (§4.4). |
+| Migration required? | **No.** No model field is added, removed, altered or renamed; `makemigrations --check` must stay clean, and that is an acceptance criterion (§21). |
+| New dependency? | **None**, and no justification is therefore needed. `requests` is already direct, `responses` already stubs it, no frontend package is added, and both lock files must come back byte-identical. |
 
 ---
 
-## 12. Frontend
+## 12. Frontend — the provider-neutral UI model
 
-The build plan's test is that the picker is reused unchanged. It is **almost**
-true, and the parts that are not are exactly where GA4 vocabulary leaked in.
+Defined before the component is touched, as the review asked.
 
-- `resource-picker-dialog.tsx` takes a `providerName` prop (the entry's
-  `display_name`, which the card already has). The empty state becomes "No
-  properties are available to this Google account in {providerName}." Both
-  Google products call these "properties", so every other string stands.
-- Grouping becomes conditional: when every `group_label` is empty — always, for
-  Search Console — the list renders flat, with no legend. The current code
-  would render a spurious "Other" heading.
-- `resource_type` is rendered beside the label where present, so a user sees
-  "Domain property" / "URL-prefix property" and can tell two similar entries
-  apart.
-- `status.ts` needs **no change**: "Select a property" is already accurate for
-  both, and `resourceAction` is provider-independent.
-- `DiscoveredResource` in `types.ts` follows the two renames.
+### 12.1 What the UI is allowed to know
 
-No new component, no new shadcn primitive, no second dialog.
+The picker knows it is choosing **one resource from a list, for some provider**.
+That is the whole model. It is given everything else.
+
+| The UI may know | The UI must never know |
+|---|---|
+| There is a list of resources, each with an id and a label | That GA4 exists, or Search Console |
+| A resource *may* have a type and a group, both optional strings | What any type or group value means, or that GA4 has accounts |
+| The provider has a display name, supplied to it | Any provider key, `properties/`, `sc-domain:`, or any identifier syntax |
+| The list may be truncated | Why, or which providers can truncate |
+
+Three rules follow, and they are the acceptance test for "provider-neutral":
+
+1. **No GA4 terminology.** The strings "Analytics", "GA4", "account" and
+   "property type" do not appear in the component. This is asserted by a test,
+   not by review (§17).
+2. **No provider-specific empty state.** The empty state is composed from the
+   `providerName` it was given: *"No properties are available to this Google
+   account in {providerName}."* — plus the same neutral guidance about asking
+   for access or connecting a different account.
+3. **No grouping assumption.** Grouping is driven by data, not by provider:
+   if **every** resource has an empty `group_label`, the list renders flat with
+   no legend; otherwise it renders grouped. Neither branch names a provider.
+   (Today's code would render a spurious "Other" heading for Search Console.)
+
+"Property" survives as the user-facing noun because both Google products use it
+— GA4 has properties, Search Console has Domain and URL-prefix properties. It
+is the products' shared word, not GA4 vocabulary.
+
+### 12.2 Proposed component API
+
+```ts
+interface ResourcePickerDialogProps {
+  /** Route parameters. The component builds no identifier of its own. */
+  projectId: number | string;
+  provider: string;
+
+  /** Human name of the provider, for copy only — never compared or branched on.
+   *  Supplied by the card from entry.display_name. */
+  providerName: string;
+
+  /** Optional trigger label; defaults to "Choose property". */
+  triggerLabel?: string;
+}
+```
+
+One added prop — `providerName` — and it is the only difference from M4's
+component signature. The card supplies it from data it already holds:
+
+```tsx
+{resourceAction === "select" ? (
+  <ResourcePickerDialog
+    projectId={projectId}
+    provider={entry.provider}
+    providerName={entry.display_name}
+  />
+) : null}
+```
+
+`entry.provider` continues to be passed straight through into the request path
+and never inspected. `providerName` is interpolated into copy and never
+compared. Neither is used in a conditional anywhere in the component — that is
+what makes the neutrality claim checkable rather than aspirational.
+
+### 12.3 What does not change
+
+`status.ts` needs no edit: "Select a property" is already accurate for both
+providers, and `resourceAction` is provider-independent. No new component, no
+new shadcn primitive, no second dialog, no route changes. `types.ts` follows
+the two field renames. `resource_type` is rendered beside the label when
+present, so "Domain property" and "URL-prefix property" distinguish two similar
+entries — one conditional on a value being non-empty, not on which provider
+supplied it.
 
 ---
 
@@ -401,35 +708,27 @@ section records that it was checked rather than assumed.
 
 ---
 
-## 14. Audit
+## 14. Audit — confirmations
 
-Unchanged. One `INTEGRATION_RESOURCE_SELECTED` per successful selection,
-carrying `{provider, resource_id, resource_label, status, previous_status}` —
-`provider` is what distinguishes the two. No new action, no allowlist change.
+| Question | Confirmation |
+|---|---|
+| Same `INTEGRATION_RESOURCE_SELECTED` event reused? | **Yes.** The identical `record_event` call in `_persist_selection`, unchanged, for both providers. `provider` in the metadata is what distinguishes them. |
+| Any new audit action? | **No.** `AuditEvent.Action` gains nothing. `INTEGRATION_CONNECTED` stays declared-but-unwritten, as decided in M4. |
+| Any metadata allowlist change? | **No.** The five keys written are `provider`, `resource_id`, `resource_label`, `status`, `previous_status` — all already in `ALLOWED_METADATA_KEYS`. |
+| How many rows per selection? | Exactly one, asserted by test, as in M4. None on a rejected selection. |
+| Anything new in a row? | The values of `resource_id` and `resource_label` are now a site URL rather than `properties/N`. Both keys were already allowlisted and the value is non-sensitive — a site the user administers, not credential material. A note, not a change. |
 
-One thing to watch: `resource_id` and `resource_label` are now a **URL**. They
-are already allowlisted and already non-sensitive — a site the user
-administers, not credential material — so this is a note, not a change.
+## 15. Security — confirmations
 
----
-
-## 15. Tenancy and security
-
-Every M4 guarantee carries over unchanged: the project is resolved through
-`get_project_for_user` first, the connection is looked up by
-`(project, provider)` from the resolved project so no id is ever accepted from
-a client, tokens live in local variables, `external_resource_meta` stays
-unserialized, CSRF applies to the POST.
-
-Two additions specific to this provider:
-
-- **Percent-encoding is a security control, not just correctness.** The
-  identifier is attacker-influenced text going into a URL path. It is validated
-  against the two documented forms first and encoded with `safe=""` second, so
-  neither a traversal segment nor an injected query string can change which
-  resource is addressed.
-- **`siteUnverifiedUser` is an authorization decision** and is enforced on the
-  verification response, not merely by filtering the list (§7).
+| Question | Confirmation |
+|---|---|
+| Credential handling changes? | **None.** `google/credentials.py` is not in the modified-files list. No change to refresh, storage, encryption, `MultiFernet`, expiry handling, or the never-blank-a-refresh-token rule. M5 calls `access_token_for()` and nothing more. |
+| New OAuth scope? | **No.** `webmasters.readonly` is what the provider has requested since M2 and what M3 already obtains. Read-only, and the minimum. |
+| New token leakage path? | **No.** The one new outbound-call site (`search_console.py`) reuses M4's rules: the bearer token is a local variable, only status codes are logged and never bodies, and no Google error text enters an exception, a response or a log. Asserted by the same `TestNoLeakage` pattern for the new provider (§17). |
+| New data stored? | One metadata key, `permission_level`. Non-sensitive, provider-issued, and the reason the site was accepted. `external_resource_meta` remains unserialized. |
+| Tenancy? | Unchanged. Project resolved via `get_project_for_user` first; connection found by `(project, provider)` from the resolved project, so no client-supplied id is ever trusted; cross-tenant is 404. |
+| New attack surface? | Two, both handled: the identifier is attacker-influenced text entering a URL **path**, validated against the two documented forms and then encoded with `safe=""` so no traversal segment or injected query string can redirect the call (§7.2); and a 200 response that withholds permission, refused by allowlist (§7.3). |
+| Existence oracle? | Closed the same way as M4: unverified, forbidden and missing all return one `resource_not_accessible` code and message. |
 
 ---
 
@@ -456,10 +755,12 @@ absence of a paging loop).
 the `:` is encoded; both round-trip to the right stored value. This is the test
 that catches a `requests` re-quoting change.
 
-**The unverified rule** — `sites.get` returning 200 with
-`permissionLevel: "siteUnverifiedUser"` leaves the connection untouched and
-returns `resource_not_accessible`; a missing `permissionLevel` does the same;
-`siteOwner`, `siteFullUser` and `siteRestrictedUser` all succeed.
+**The permission rule (§7.3)** — parametrized over every level: `siteOwner`,
+`siteFullUser` and `siteRestrictedUser` each reach `connected`;
+`siteUnverifiedUser`, a missing key, an empty string and an invented future
+value (`siteSomethingNew`) each leave the connection untouched and return
+`resource_not_accessible` — the allowlist, asserted as an allowlist. Unverified
+rejection is byte-identical in code and message to the 403 and 404 responses.
 
 **Identifier validation** — `javascript:`, a bare hostname, a scheme-less
 value, `sc-domain:` with a path, traversal segments, a 300-character URL: all
@@ -478,9 +779,18 @@ unchanged apart from the two field renames. That suite is the safety net for
 Option A, and if it needs edits beyond renames, the refactor changed behaviour
 and is wrong.
 
-**Frontend** — the picker renders flat with no legend when `group_label` is
-empty; grouped when it is not; the empty state names the provider; the same
-dialog drives both providers in the card tests.
+**Frontend** — the picker renders flat with no legend when every
+`group_label` is empty, grouped when they are not, with neither branch keyed to
+a provider; the empty state names the provider it was given; the same dialog
+drives both providers in the card tests. Plus the neutrality assertion: the
+component source contains none of "Analytics", "GA4", "account", "ga4" or
+"sc-domain" (§12.1).
+
+**Leak containment (§4.5)** — a test asserts that `properties/`,
+`accountSummaries`, `analyticsadmin`, `sc-domain`, `webmasters` and `siteEntry`
+appear in no file under `integrations/` except `google/ga4.py` and
+`google/search_console.py`. A provider concept reaching shared code becomes a
+failing test rather than something review has to catch.
 
 **Mutation checks before hand-off** — drop the `siteUnverifiedUser` check in
 verification; change `quote(..., safe="")` to the default; return
@@ -490,8 +800,13 @@ verification; change `quote(..., safe="")` to the default; return
 
 ## 18. Files likely to change
 
+Delivered as **two commits**: commit 1 is the §4 refactor with no Search
+Console code, and the GA4 suite must be green at that commit before commit 2
+adds the provider (§4.3).
+
 New: `integrations/resources.py`, `integrations/google/search_console.py`,
-`apps/api/tests/test_search_console_resources.py`.
+`apps/api/tests/test_search_console_resources.py`,
+`apps/api/tests/test_provider_boundary.py` (the §4.5 containment assertions).
 
 Modified: `integrations/google/ga4.py` (return type), `integrations/providers/`
 (all three files), `integrations/resource_service.py` (dispatch),
@@ -535,11 +850,19 @@ do not, something unintended was added and it stops for review.
 6. GA4 and Search Console connect independently; neither touches the other.
 7. The picker component serves both providers with no per-provider branch
    beyond the props described in §12.
-8. The entire M4 test suite passes with only the two field renames.
-9. No token, refresh token or Google error string in any response, log line or
-   audit row.
-10. `pytest`, `vitest`, `tsc`, `eslint`, `next build` green; no new migration;
-    locks unchanged.
+8. The entire M4 test suite passes with **only** symbol renames, no changed
+   expectation values (§4.3), and it is green at the refactor commit before any
+   Search Console code exists.
+9. `siteRestrictedUser` connects; `siteUnverifiedUser`, a missing level and an
+   unrecognized level all refuse, indistinguishably from 403 and 404.
+10. The picker component contains no provider name, provider key or Analytics
+   terminology, and branches on data rather than on provider.
+11. No endpoint, method, status code or error code changed from M4; the only
+   response change is the two documented field renames.
+12. No token, refresh token or Google error string in any response, log line
+    or audit row; no credential-handling code changed at all.
+13. `pytest`, `vitest`, `tsc`, `eslint`, `next build` green; `makemigrations
+    --check` clean; both lock files byte-identical.
 
 ---
 
@@ -559,3 +882,83 @@ connection** — all of which now have two providers to work across, and all of
 which go through the `ResourceCatalog` this milestone extracts. If M6 needs a
 fourth method on it, that is a fair extension: it will have two implementations
 to satisfy, which is the standard this milestone was held to.
+
+---
+
+## 23. Staging acceptance checklist
+
+Written before implementation so the bar is fixed in advance, and shaped like
+the M4 checklist that worked. Run on `staging.arkav.lol` after deploying the
+merged branch; the Search Console connection is already sitting in
+`awaiting_resource_selection` from M3.
+
+### 23.1 Preconditions
+
+- The staging clone is on merged `main`, both containers healthy.
+- **No `.env` change** — M5 introduces no setting.
+- The Google account has at least one verified Search Console property, and
+  ideally an unverified one, so the exclusion can be observed rather than
+  assumed.
+
+### 23.2 Regression: M4 must be untouched
+
+Run **first**. The refactor is the risk this milestone carries.
+
+1. The GA4 card still reads **Connected** with `poolino`.
+2. Its stored row is unchanged: `external_resource_id = properties/549483499`,
+   label `poolino`, metadata exactly
+   `{"account": "accounts/404306605", "property_type": "PROPERTY_TYPE_ORDINARY"}`,
+   both timestamps as they were, `connected_by_id` unchanged.
+3. No new audit row was written by the deployment.
+
+### 23.3 Search Console discovery
+
+4. The Search Console card reads **Select a property** with a working
+   **Choose property** button.
+5. The dialog lists the account's verified sites, **flat, with no group
+   heading** — the neutral-grouping rule, visible.
+6. Each entry shows "Domain property" or "URL-prefix property" correctly for
+   its identifier form.
+7. Any site the account is **not** verified for does **not** appear.
+8. The empty state, if it appears, names Search Console and not Analytics.
+
+### 23.4 Selection and verification
+
+9. Selecting a site moves the card to **Connected** with the site identifier
+   and a fresh "Last successful access".
+10. If both identifier forms are available, verify one of each; `https://…/`
+    round-trips with its scheme and trailing slash intact.
+11. The API container log shows the outbound path percent-encoded — a
+    `%3A%2F%2F` and no bare slash after `/sites/`.
+
+### 23.5 The negative case — the security check
+
+12. With the picker closed, post an identifier for a site the account is **not**
+    verified for, directly:
+    ```bash
+    curl -sS -X POST https://staging.arkav.lol/api/projects/<id>/integrations/search_console/resource \
+      -H 'Content-Type: application/json' -H "X-CSRFToken: $CSRF" -b cookies.txt \
+      -d '{"resource_id":"sc-domain:some-site-you-are-not-verified-for.example"}'
+    ```
+    Expect **400 `resource_not_accessible`**, and the connection unchanged.
+13. Post a malformed identifier (`javascript:alert(1)`, `sc-domain:../../x`) —
+    expect 400 `invalid_resource_id` with no outbound call in the log.
+
+### 23.6 Database, encryption, audit, logs
+
+14. Connection row: `status = connected`, identifier and label identical to
+    each other and to what Google returned, metadata exactly
+    `{"permission_level": "siteOwner"|"siteFullUser"|"siteRestrictedUser"}` —
+    one key, no timestamp, no raw response.
+15. `connected_by_id` unchanged by the selection.
+16. Credentials still Fernet-encrypted for **both** connections; no plaintext
+    `ya29.` or `1//` anywhere in the database.
+17. Exactly **one** new `integration.resource_selected` row, `provider =
+    search_console`, metadata keys exactly the allowlisted five.
+18. Log leak check over the session returns **0** for `ya29.`, `1//`,
+    `client_secret`, `"access_token"`, `"refresh_token"`.
+19. The two connections are independent: GA4's row is byte-identical to
+    step 2 after all of the above.
+
+The SQL and log commands are the M4 checklist's, unchanged apart from expecting
+two connected rows instead of one.
