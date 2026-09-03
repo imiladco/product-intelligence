@@ -1,5 +1,5 @@
-import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import { IntegrationCard } from "@/components/integrations/integration-card";
 import type { IntegrationConnection, IntegrationEntry } from "@/lib/api/types";
@@ -35,7 +35,7 @@ function entry(overrides: Partial<IntegrationEntry> = {}): IntegrationEntry {
 describe("IntegrationCard", () => {
   describe("not connected", () => {
     it("shows the provider identity, description and status", () => {
-      render(<IntegrationCard entry={entry()} />);
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       expect(screen.getByText("Google Analytics 4")).toBeInTheDocument();
       expect(screen.getByText("Connect a GA4 property.")).toBeInTheDocument();
@@ -43,28 +43,24 @@ describe("IntegrationCard", () => {
     });
 
     it("shows no resource or health detail", () => {
-      render(<IntegrationCard entry={entry()} />);
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       expect(screen.queryByText("Selected property")).not.toBeInTheDocument();
       expect(screen.queryByText("Last successful access")).not.toBeInTheDocument();
     });
 
-    it("offers a Connect action that is disabled until OAuth exists", () => {
-      // Milestone 2 must never let a click produce a connected state.
-      render(<IntegrationCard entry={entry()} />);
+    it("offers an enabled Connect action", () => {
+      render(<IntegrationCard projectId={1} entry={entry()} />);
 
       const connect = screen.getByRole("button", { name: "Connect" });
-      expect(connect).toBeDisabled();
-      expect(
-        screen.getByText("Connecting Google accounts is not available yet."),
-      ).toBeInTheDocument();
+      expect(connect).toBeEnabled();
     });
   });
 
   describe("connected", () => {
     it("shows the selected resource and last successful access", () => {
       render(
-        <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+        <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
       );
 
       expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
@@ -76,6 +72,7 @@ describe("IntegrationCard", () => {
     it("reads Never when a check has not happened yet", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "awaiting_resource_selection",
             connection: connection({
@@ -98,6 +95,7 @@ describe("IntegrationCard", () => {
     it("shows the error message alongside the last time it worked", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "error",
             connection: connection({
@@ -121,6 +119,7 @@ describe("IntegrationCard", () => {
     it("shows the reauthorization state", () => {
       render(
         <IntegrationCard
+          projectId={1}
           entry={entry({
             status: "reauth_required",
             connection: connection({ status: "reauth_required" }),
@@ -135,7 +134,7 @@ describe("IntegrationCard", () => {
 
     it("renders no alert when there is no error", () => {
       render(
-        <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+        <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
       );
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
@@ -143,7 +142,7 @@ describe("IntegrationCard", () => {
 
   it("never shows a credential-shaped value", () => {
     const { container } = render(
-      <IntegrationCard entry={entry({ status: "connected", connection: connection() })} />,
+      <IntegrationCard projectId={1} entry={entry({ status: "connected", connection: connection() })} />,
     );
     const text = container.textContent ?? "";
     for (const forbidden of ["token", "secret", "refresh"]) {
@@ -152,8 +151,186 @@ describe("IntegrationCard", () => {
   });
 
   it("is identified by its provider", () => {
-    render(<IntegrationCard entry={entry({ provider: "search_console" })} />);
+    render(<IntegrationCard projectId={1} entry={entry({ provider: "search_console" })} />);
     const card = screen.getByTestId("integration-card-search_console");
     expect(within(card).getByTestId("status-badge")).toBeInTheDocument();
+  });
+});
+
+describe("IntegrationCard after OAuth", () => {
+  it("renders Select a property for awaiting_resource_selection", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({
+            status: "awaiting_resource_selection",
+            external_resource_label: "",
+            last_health_check_at: null,
+            last_successful_check_at: null,
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
+    // Authorized is not connected: no property is chosen yet.
+    expect(screen.getByTestId("status-badge")).not.toHaveTextContent("Connected");
+    expect(
+      screen.getByText("Choosing a property is not available yet."),
+    ).toBeInTheDocument();
+  });
+
+  it("offers Reauthorize when authorization has become invalid", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "reauth_required",
+          connection: connection({ status: "reauth_required" }),
+        })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Reauthorize" })).toBeEnabled();
+  });
+
+  it("keeps failure states useful", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "scope_not_granted",
+            last_error_message:
+              "The required read-only permission was not granted. Please connect again.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Error");
+    expect(screen.getByRole("alert")).toHaveTextContent("read-only permission was not granted");
+    // A truthful retry of the authorization is offered.
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+  });
+});
+
+describe("IntegrationCard action semantics", () => {
+  /** Full reconnect/disconnect UX is a later milestone. A state that already
+   *  has what it needs from Google must not invite re-authorizing. */
+  function statusesOffering(name: string) {
+    return (["not_connected", "pending_authorization", "awaiting_resource_selection",
+      "connected", "error", "reauth_required", "disconnected"] as const).filter(
+      (status) => {
+        const { unmount } = render(
+          <IntegrationCard
+            projectId={1}
+            entry={entry({
+              status,
+              connection: status === "not_connected" ? null : connection({ status }),
+            })}
+          />,
+        );
+        const found = screen.queryByRole("button", { name }) !== null;
+        unmount();
+        return found;
+      },
+    );
+  }
+
+  it("offers Connect only where nothing is authorized", () => {
+    expect(statusesOffering("Connect")).toEqual(["not_connected", "disconnected"]);
+  });
+
+  it("never offers a generic Reconnect", () => {
+    expect(statusesOffering("Reconnect")).toEqual([]);
+  });
+
+  it("does not invite re-authorizing after a successful authorization", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({ status: "awaiting_resource_selection" }),
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
+    expect(
+      screen.getByText("Choosing a property is not available yet."),
+    ).toBeInTheDocument();
+  });
+
+  it("offers a restart, not a duplicate Connect, while one is in flight", () => {
+    // An abandoned flow never reaches the callback, so without this the user
+    // would be stuck in pending_authorization permanently.
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "pending_authorization",
+          connection: connection({ status: "pending_authorization" }),
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Restart authorization" }),
+    ).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Connect" })).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Waiting for Google. If that window was closed, start again."),
+    ).toBeInTheDocument();
+  });
+
+  it("posts to the same authorize endpoint when restarting", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ authorization_url: "https://accounts.google.com/x" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const assign = vi.fn();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...window.location, assign },
+    });
+    document.cookie = "pi_csrftoken=test-csrf";
+
+    render(
+      <IntegrationCard
+        projectId={9}
+        entry={entry({
+          provider: "search_console",
+          status: "pending_authorization",
+          connection: connection({ status: "pending_authorization" }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Restart authorization" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/projects/9/integrations/search_console/authorize");
+    expect(init.method).toBe("POST");
+    vi.unstubAllGlobals();
+  });
+
+  it("adds no reconnect or disconnect action to a connected integration", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status: "connected", connection: connection() })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
   });
 });

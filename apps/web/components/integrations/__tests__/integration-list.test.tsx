@@ -33,7 +33,7 @@ function IntegrationList({ entries }: { entries: IntegrationEntry[] }) {
     <ul>
       {entries.map((entry) => (
         <li key={entry.provider}>
-          <IntegrationCard entry={entry} />
+          <IntegrationCard projectId={1} entry={entry} />
         </li>
       ))}
     </ul>

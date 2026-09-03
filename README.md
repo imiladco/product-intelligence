@@ -39,6 +39,17 @@ cd apps/web && npm install && npm run dev
 Open <http://localhost:3000> and create an account. A workspace is created for
 you automatically; then create a project.
 
+### Google OAuth (Milestone 3)
+
+Connecting a provider needs a **development** Google Cloud OAuth client. Set
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `CREDENTIAL_ENCRYPTION_KEYS` in
+`.env` — see `.env.example` for how to generate the encryption key. The
+authorized redirect URI on the Google client must match
+`GOOGLE_OAUTH_REDIRECT_URI` exactly; locally that is
+`http://localhost:3000/api/integrations/oauth/google/callback`.
+
+Without those values the app runs normally; only **Connect** fails.
+
 Django admin is at <http://127.0.0.1:8000/admin/> — create a superuser with
 `python manage.py createsuperuser`. V1 has no invitation UI, so additional
 workspace members are added there.

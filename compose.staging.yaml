@@ -1,0 +1,117 @@
+# Staging for the Milestone 3 Google OAuth round-trip.
+#
+# Deliberately NOT compose.yaml: that name is reserved for the real production
+# stack in Milestone 7. This file is the minimum needed to run the M3 branch on
+# a public HTTPS hostname, and nothing more.
+#
+#   docker compose -f compose.staging.yaml --env-file .env up -d --build
+#
+# The reverse proxy is optional, so this works both on a clean VPS and on a
+# server that already terminates TLS:
+#
+#   --profile caddy   → Caddy owns :80/:443 and obtains its own certificate
+#   (no profile)      → an existing proxy owns :80/:443; this publishes the two
+#                       app ports on loopback only for it to proxy to
+#
+# Postgres is never published. It is reachable only on the private network.
+
+name: product-intelligence-staging
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [internal]
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DJANGO_STATIC_ROOT: /srv/static
+    volumes:
+      # Shared with the proxy, which serves /static/ so Django does not have to.
+      - static:/srv/static
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      # Generous: on a single vCPU the entrypoint runs collectstatic and
+      # migrations before gunicorn accepts its first request.
+      start_period: 120s
+    # Loopback only: an existing host proxy can reach it, the internet cannot.
+    # Harmless when the bundled Caddy is used, which talks over the private
+    # network instead.
+    ports:
+      - "127.0.0.1:8001:8000"
+    networks: [internal]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Server-side rendering talks to the API over the private network.
+      INTERNAL_API_BASE_URL: http://api:8000
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # busybox wget: the node:alpine image has no curl.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/login || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    ports:
+      - "127.0.0.1:3001:3000"
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [caddy]
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - static:/srv/static:ro
+    depends_on:
+      - web
+      - api
+    networks: [internal]
+
+volumes:
+  pgdata_staging:
+  caddy_data:
+  caddy_config:
+  static:
+
+networks:
+  internal:
+    driver: bridge

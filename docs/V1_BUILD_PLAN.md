@@ -1,6 +1,6 @@
 # V1 Build Plan
 
-Status: approved. Milestone 1 complete; Milestone 2 in progress.
+Status: approved. Milestones 1–2 complete; Milestone 3 in progress.
 Last updated: 2026-09-02
 
 Vertical slices. Each milestone ends with something demonstrable and its own
@@ -50,7 +50,7 @@ Tests: signup/login/logout, `me`, tenant isolation on every project endpoint
 
 Excluded: Docker production images, Caddy, integrations.
 
-## Milestone 2 — Integrations surface (no Google yet) — **in progress**
+## Milestone 2 — Integrations surface (no Google yet) — **complete**
 
 **Demo:** the Integrations page lists GA4 and Search Console as *Not connected*,
 rendered from the backend provider catalog.
@@ -64,7 +64,7 @@ with stored rows; `audit` app + `record_event()`;
 Tests: catalog shape, tenant isolation on the integrations endpoints, status
 badge rendering for every state.
 
-## Milestone 3 — Google OAuth
+## Milestone 3 — Google OAuth — **in progress**
 
 **Demo:** click **Connect** on GA4, complete a real Google consent screen with a
 development client, return to the Integrations page showing *Select a property*;

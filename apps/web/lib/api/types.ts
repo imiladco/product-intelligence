@@ -77,3 +77,9 @@ export interface IntegrationEntry {
   status: IntegrationStatus;
   connection: IntegrationConnection | null;
 }
+
+/** Response of GET /api/projects/{id}/integrations/{provider}/authorize.
+ *  Django builds the URL; the frontend only follows it. */
+export interface AuthorizationStart {
+  authorization_url: string;
+}

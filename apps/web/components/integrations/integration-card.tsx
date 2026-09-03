@@ -1,7 +1,8 @@
+import { ConnectButton } from "@/components/integrations/connect-button";
 import { StatusBadge } from "@/components/integrations/status-badge";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
+import { statusPresentation } from "@/lib/integrations/status";
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Never";
@@ -19,8 +20,15 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function IntegrationCard({ entry }: { entry: IntegrationEntry }) {
+export function IntegrationCard({
+  entry,
+  projectId,
+}: {
+  entry: IntegrationEntry;
+  projectId: number | string;
+}) {
   const { connection } = entry;
+  const { actionLabel, note } = statusPresentation(entry.status);
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -58,18 +66,24 @@ export function IntegrationCard({ entry }: { entry: IntegrationEntry }) {
           </p>
         ) : null}
 
-        <div className="flex items-center gap-3">
-          {/* Connecting requires Google OAuth, which arrives in the next
-              milestone. The action is shown so the page reads as the real
-              product, but it is disabled: nothing here may produce a
-              connected state without a real authorization. */}
-          <Button disabled title="Available in the next milestone">
-            Connect
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            Connecting Google accounts is not available yet.
-          </span>
-        </div>
+        {/* Which action a state offers comes from the status mapping, so the
+            card never invents one. A state that already has what it needs from
+            Google offers no authorization action at all. */}
+        {actionLabel || note ? (
+          <div className="flex items-center gap-3">
+            {actionLabel ? (
+              <ConnectButton
+                projectId={projectId}
+                provider={entry.provider}
+                label={actionLabel}
+                variant={entry.status === "not_connected" ? "default" : "outline"}
+              />
+            ) : null}
+            {note ? (
+              <span className="text-xs text-muted-foreground">{note}</span>
+            ) : null}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

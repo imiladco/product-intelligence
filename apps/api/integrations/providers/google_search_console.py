@@ -15,4 +15,7 @@ PROVIDER = IntegrationProvider(
         "Connect a Search Console property to bring this project's search "
         "impressions, clicks and queries into the platform."
     ),
+    # Read-only. Verified 2026-09-02 against
+    # https://developers.google.com/webmaster-tools/v1/sites/list
+    oauth_scopes=("https://www.googleapis.com/auth/webmasters.readonly",),
 )

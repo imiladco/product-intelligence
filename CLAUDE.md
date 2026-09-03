@@ -51,7 +51,13 @@ and get approval first.
 - **Never commit secrets.** `.env` is ignored; `.env.example` holds names and
   placeholders only. Never generate a real production secret into the repo.
 - OAuth `state` is single-use, hashed at rest, expiring, and bound to
-  user + project + provider. Always validate it.
+  user + project + provider. Always validate it, and re-check membership at
+  callback time — authorized at the start of a flow is not authorized at the
+  end.
+- Never infer that a requested scope was granted. Verify the required scope
+  against what the token response actually granted.
+- Audit metadata goes through the allowlist in `audit.services`; never widen it
+  to carry credential material. Workspace is derived from project there.
 - Use minimum read-only Google scopes: `analytics.readonly`,
   `webmasters.readonly`.
 - Never overwrite a stored refresh token with a null or empty value. A token

@@ -39,7 +39,7 @@ export default async function IntegrationsPage({
       <ul className="space-y-4">
         {integrations.map((entry) => (
           <li key={entry.provider}>
-            <IntegrationCard entry={entry} />
+            <IntegrationCard entry={entry} projectId={projectId} />
           </li>
         ))}
       </ul>

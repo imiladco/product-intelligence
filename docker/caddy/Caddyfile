@@ -1,0 +1,34 @@
+# Staging reverse proxy.
+#
+# Caddy obtains and renews the certificate itself over HTTP-01, so port 80 must
+# reach this container and DNS must already point at the host. It also
+# redirects HTTP to HTTPS and sets X-Forwarded-Proto, which Django requires:
+# with DEBUG=false it only sets secure cookies when it can see the request
+# arrived over HTTPS.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# Django admin and DRF assets, written by collectstatic into the shared
+	# volume. Serving them here means the API never serves static files.
+	handle_path /static/* {
+		root * /srv/static
+		file_server
+	}
+
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle /admin/* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}

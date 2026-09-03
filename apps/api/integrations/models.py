@@ -3,7 +3,9 @@ from __future__ import annotations
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.db import models
+from django.utils import timezone
 
+from common.fields import EncryptedTextField
 from projects.models import Project
 
 from .providers import ProviderKey
@@ -70,3 +72,87 @@ class IntegrationConnection(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_provider_display()} for {self.project} ({self.status})"
+
+
+class IntegrationCredential(models.Model):
+    """OAuth credential material for one connection.
+
+    A separate table from IntegrationConnection on purpose: the connection
+    serializer physically cannot reach these fields, and any query that lists
+    connections does not load them. Tokens are encrypted at rest.
+
+    Deliberately absent: the Google client secret (environment configuration,
+    the same for every row), the authorization code (single-use, discarded
+    after exchange), the OAuth state (only its hash is stored, elsewhere), and
+    the token URI (a constant).
+    """
+
+    connection = models.OneToOneField(
+        IntegrationConnection, on_delete=models.CASCADE, related_name="credential"
+    )
+    access_token = EncryptedTextField(blank=True, default="")
+    refresh_token = EncryptedTextField(blank=True, default="")
+    access_token_expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:  # pragma: no cover - admin/debug convenience
+        return f"Credential for {self.connection_id}"
+
+    @property
+    def has_refresh_token(self) -> bool:
+        return bool(self.refresh_token)
+
+
+class OAuthAuthorizationRequest(models.Model):
+    """One in-flight authorization attempt.
+
+    The OAuth ``state`` is never stored: only its SHA-256 hash is, so a
+    database read cannot forge a callback. The row binds the callback to a
+    single user, project and provider, and is single-use — the callback
+    consumes it under a row lock so two concurrent callbacks cannot both
+    succeed.
+
+    ``consumed_at`` means "this request can no longer complete an
+    authorization". It is set in two situations, which need no distinction
+    because the effect is identical:
+
+    * a callback used it (successfully or not), or
+    * a newer attempt for the same user + project + provider superseded it.
+
+    Superseding reuses this field rather than adding a status column: the
+    question every code path asks is only ever "is this still usable?", and a
+    second field could disagree with the first. The row itself is kept, so the
+    history of attempts survives.
+    """
+
+    state_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="oauth_authorization_requests"
+    )
+    provider = models.CharField(max_length=32, choices=ProviderKey.choices)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="oauth_authorization_requests",
+    )
+    # PKCE verifier. google-auth-oauthlib generates one by default for this
+    # flow; it must survive the redirect to Google and back, and it is secret
+    # until used, so it is encrypted like any other credential material.
+    code_verifier = EncryptedTextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self) -> str:  # pragma: no cover - admin/debug convenience
+        return f"{self.provider} authorization for project {self.project_id}"
+
+    @property
+    def is_consumed(self) -> bool:
+        return self.consumed_at is not None
+
+    def is_expired(self, now=None) -> bool:
+        return (now or timezone.now()) >= self.expires_at

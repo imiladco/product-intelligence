@@ -110,8 +110,13 @@ class TestIntegrationConnectionModel:
         assert connection.connected_by is None
 
     def test_model_has_no_credential_fields(self):
-        """Credentials live in a separate table added in Milestone 3."""
-        field_names = {field.name for field in IntegrationConnection._meta.get_fields()}
+        """Credentials live in their own table, never as columns here.
+
+        Only concrete local fields are checked: the ``credential`` reverse
+        accessor to IntegrationCredential is the separation working, not a
+        token stored on this model.
+        """
+        field_names = {field.name for field in IntegrationConnection._meta.local_fields}
         forbidden = {
             "access_token",
             "refresh_token",
@@ -313,3 +318,52 @@ class TestMergeService:
         assert [entry.provider for entry in entries] == ["ga4", "search_console"]
         assert entries[0].connection is None
         assert entries[1].connection is not None
+
+
+class TestCredentialNonExposure:
+    """No token may reach an API response, a serializer, or the admin."""
+
+    @pytest.fixture
+    def connected(self, signed_in_client, make_project):
+        from integrations.models import IntegrationCredential
+
+        _client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        )
+        IntegrationCredential.objects.create(
+            connection=connection,
+            access_token="ya29.SECRET-ACCESS",
+            refresh_token="1//SECRET-REFRESH",
+        )
+        return project
+
+    def test_connection_model_still_has_no_token_field(self):
+        field_names = {field.name for field in IntegrationConnection._meta.get_fields()}
+        assert "access_token" not in field_names
+        assert "refresh_token" not in field_names
+
+    def test_integrations_response_contains_no_token(self, signed_in_client, connected):
+        """Regression: the serializer must never learn to reach the credential."""
+        client, _user, _workspace = signed_in_client
+        response = client.get(integrations_url(connected.id))
+        body = response.content.decode()
+        for secret in ("ya29.SECRET-ACCESS", "1//SECRET-REFRESH", "access_token", "refresh_token"):
+            assert secret not in body
+
+    def test_credential_is_reachable_only_through_the_reverse_relation(self, connected):
+        connection = IntegrationConnection.objects.get(project=connected)
+        assert connection.credential.access_token == "ya29.SECRET-ACCESS"
+        # But it is not a field on the connection itself.
+        with pytest.raises(Exception):
+            IntegrationConnection.objects.values("access_token").first()
+
+    def test_credential_is_not_registered_in_the_admin(self):
+        from django.contrib import admin
+
+        from integrations.models import IntegrationCredential
+
+        assert IntegrationCredential not in admin.site._registry

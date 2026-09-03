@@ -26,8 +26,12 @@ class ProviderKey(models.TextChoices):
 
 @dataclass(frozen=True)
 class IntegrationProvider:
-    """Product metadata for one supported integration."""
+    """Product metadata and the OAuth scopes for one supported integration."""
 
     key: str
     display_name: str
     description: str
+    #: The minimum read-only scopes this provider needs. Each provider is
+    #: authorized on its own, so connecting GA4 never asks for Search Console
+    #: access and vice versa.
+    oauth_scopes: tuple[str, ...]
