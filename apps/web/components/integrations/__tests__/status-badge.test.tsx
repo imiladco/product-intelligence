@@ -52,11 +52,32 @@ describe("StatusBadge", () => {
     ]);
   });
 
+  it("offers the property picker in exactly one state", () => {
+    // Choosing a property is only meaningful once Google has authorized and
+    // before anything is selected. Changing an existing selection is a later
+    // milestone, so connected offers nothing here.
+    const selectable = ALL_STATUSES.filter(
+      (status) => statusPresentation(status).resourceAction === "select",
+    );
+    expect(selectable).toEqual(["awaiting_resource_selection"]);
+    expect(statusPresentation("connected").resourceAction).toBeNull();
+  });
+
+  it("keeps the authorization and resource actions separate", () => {
+    // A state must never offer both: re-authorizing and choosing a property
+    // answer different problems, and offering both makes neither clear.
+    for (const status of ALL_STATUSES) {
+      const { actionLabel, resourceAction } = statusPresentation(status);
+      expect(actionLabel !== null && resourceAction !== null).toBe(false);
+    }
+  });
+
   it("falls back rather than breaking on an unrecognized status", () => {
     // A backend that learns a new state must not blank the page for users on
     // an older frontend build.
     const unknown = "some_future_status" as IntegrationStatus;
     render(<StatusBadge status={unknown} />);
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Unknown");
+    expect(statusPresentation(unknown).resourceAction).toBeNull();
   });
 });

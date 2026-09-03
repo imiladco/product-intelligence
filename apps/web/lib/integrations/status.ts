@@ -16,6 +16,17 @@ interface StatusPresentation {
    * what it needs from Google must not invite the user to re-authorize.
    */
   actionLabel: string | null;
+  /**
+   * Whether this state offers a resource action, and which one.
+   *
+   * A separate channel from `actionLabel` on purpose: that one is for
+   * authorization, and the two are not interchangeable — a connection can need
+   * a property chosen without needing to be authorized again.
+   *
+   * Only "select" exists today. Changing an existing selection arrives with
+   * reconnect and disconnect, so a connected integration offers nothing here.
+   */
+  resourceAction: "select" | null;
   /** Truthful note about what is not possible yet, or null. */
   note: string | null;
 }
@@ -32,6 +43,7 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     variant: "outline",
     needsAttention: false,
     actionLabel: "Connect",
+    resourceAction: null,
     note: null,
   },
   pending_authorization: {
@@ -44,6 +56,7 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     // so the action restarts the attempt. Not "Reconnect": nothing has
     // successfully connected yet.
     actionLabel: "Restart authorization",
+    resourceAction: null,
     note: "Waiting for Google. If that window was closed, start again.",
   },
   awaiting_resource_selection: {
@@ -53,14 +66,17 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     // Google authorization already succeeded. The next step is choosing a
     // property, so this state must not invite re-authorizing.
     actionLabel: null,
-    note: "Choosing a property is not available yet.",
+    resourceAction: "select",
+    note: null,
   },
   connected: {
     label: "Connected",
     variant: "default",
     needsAttention: false,
-    // Reconnect and disconnect for a healthy connection arrive later.
+    // Reconnect, disconnect and changing the selected property for a healthy
+    // connection all arrive later. A connected card offers no action at all.
     actionLabel: null,
+    resourceAction: null,
     note: null,
   },
   error: {
@@ -68,6 +84,7 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     variant: "destructive",
     needsAttention: true,
     actionLabel: "Try again",
+    resourceAction: null,
     note: null,
   },
   reauth_required: {
@@ -75,6 +92,7 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     variant: "destructive",
     needsAttention: true,
     actionLabel: "Reauthorize",
+    resourceAction: null,
     note: null,
   },
   disconnected: {
@@ -82,6 +100,7 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     variant: "outline",
     needsAttention: false,
     actionLabel: "Connect",
+    resourceAction: null,
     note: null,
   },
 };
@@ -91,6 +110,7 @@ const FALLBACK: StatusPresentation = {
   variant: "outline",
   needsAttention: false,
   actionLabel: null,
+  resourceAction: null,
   note: null,
 };
 

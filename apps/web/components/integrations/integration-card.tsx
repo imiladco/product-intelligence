@@ -1,4 +1,5 @@
 import { ConnectButton } from "@/components/integrations/connect-button";
+import { ResourcePickerDialog } from "@/components/integrations/resource-picker-dialog";
 import { StatusBadge } from "@/components/integrations/status-badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
@@ -28,7 +29,7 @@ export function IntegrationCard({
   projectId: number | string;
 }) {
   const { connection } = entry;
-  const { actionLabel, note } = statusPresentation(entry.status);
+  const { actionLabel, resourceAction, note } = statusPresentation(entry.status);
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -69,7 +70,7 @@ export function IntegrationCard({
         {/* Which action a state offers comes from the status mapping, so the
             card never invents one. A state that already has what it needs from
             Google offers no authorization action at all. */}
-        {actionLabel || note ? (
+        {actionLabel || resourceAction || note ? (
           <div className="flex items-center gap-3">
             {actionLabel ? (
               <ConnectButton
@@ -77,6 +78,12 @@ export function IntegrationCard({
                 provider={entry.provider}
                 label={actionLabel}
                 variant={entry.status === "not_connected" ? "default" : "outline"}
+              />
+            ) : null}
+            {resourceAction === "select" ? (
+              <ResourcePickerDialog
+                projectId={projectId}
+                provider={entry.provider}
               />
             ) : null}
             {note ? (

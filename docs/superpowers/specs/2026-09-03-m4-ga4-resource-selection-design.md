@@ -1,6 +1,7 @@
 # Milestone 4 — GA4 property discovery, selection, verification
 
-Design draft. 2026-09-03. Approved with reductions on review; not implemented.
+Design. 2026-09-03. Approved with reductions, then implemented — the final
+adjustments below are reflected in the text.
 
 Takes a GA4 connection from `awaiting_resource_selection` to `connected` by
 discovering the properties the granted Google account can actually read,
@@ -20,6 +21,25 @@ persisting it. Search Console is Milestone 5.
 5. **No generic `ResourceCatalog` abstraction.** M4 implements a GA4-specific
    boundary; the abstraction question is revisited in M5, when there is a
    second real implementation to generalize from.
+
+**Final adjustments before implementation:**
+
+6. **`external_resource_meta` is minimal**: stable identifiers and display
+   metadata only, no raw Google response object, and no timestamp that a health
+   field already records. `verified_at` is gone — `last_successful_check_at`
+   says the same thing, and two records of one fact can disagree.
+   `account_display_name` is gone too: `properties.get` does not return it, so
+   storing it would mean inventing a value the verification response never
+   carried. Stored shape is `{"account": "accounts/{id}", "property_type": …}`.
+7. **No `INTEGRATION_CONNECTED` event.** Inspection of the existing convention
+   settled it: M3 writes exactly one event per user-meaningful outcome, and
+   `INTEGRATION_AUTHORIZED` already carries the resulting status rather than
+   pairing with a separate state event. `INTEGRATION_RESOURCE_SELECTED` carries
+   `status` and `previous_status` and is the whole record of the transition.
+8. **`connected_by` is not written by a selection.** Its existing meaning is
+   "who completed the authorization", set in `oauth_service`. Selecting a
+   property is not authorizing, so reassigning it would quietly redefine an
+   existing field. No schema change, as predicted.
 
 Everything else in this design stands as approved.
 
@@ -331,20 +351,21 @@ On a verified selection, inside one `transaction.atomic()` holding
 ```
 external_resource_id     = property.id            # "properties/123456"
 external_resource_label  = property.label         # from Google
-external_resource_meta   = {"property_type": …, "account": …,
-                            "account_display_name": …, "verified_at": iso8601}
+external_resource_meta   = {"account": …, "property_type": …}
 status                   = connected
 last_health_check_at     = now
 last_successful_check_at = now
 last_error_code          = ""
 last_error_message       = ""
-connected_by             = request.user
 ```
+
+`connected_by` is deliberately **not** written: it records who completed the
+authorization, and a selection is not an authorization.
 
 Single `save(update_fields=[…])`; nothing is written on any failure path, so a
 rejected selection cannot half-apply. `external_resource_meta` holds only
-Google-issued metadata — never a token, never a scope, never anything the audit
-allowlist would refuse.
+Google-issued metadata, and only two keys of it — never a raw response object,
+never a token, never a scope, never a timestamp the health fields already own.
 
 ---
 
@@ -352,7 +373,7 @@ allowlist would refuse.
 
 | From | Event | To | Notes |
 |---|---|---|---|
-| `awaiting_resource_selection` | verification 200 | `connected` | `INTEGRATION_RESOURCE_SELECTED` + `INTEGRATION_CONNECTED`; both health timestamps stamped |
+| `awaiting_resource_selection` | verification 200 | `connected` | One `INTEGRATION_RESOURCE_SELECTED` event; both health timestamps stamped |
 | `awaiting_resource_selection` | 403/404 on the chosen property | *unchanged* | 400 `resource_not_accessible`. Picking the wrong thing is a user input error, not a broken connection |
 | `connected` | same `resource_id` re-submitted, verification 200 | `connected` | Idempotent; timestamps refreshed |
 | `connected` | different `resource_id` submitted | *unchanged* | **409** `resource_change_not_supported` — out of M4 scope (§7) |
@@ -485,9 +506,12 @@ never forwarded, logged, or stored — the M3 rule, unchanged.
 ## 14. Audit
 
 - `INTEGRATION_RESOURCE_SELECTED` — `{provider, resource_id, resource_label,
-  previous_status}`. Every key already allowlisted.
-- `INTEGRATION_CONNECTED` — on the first entry into `connected`, `{provider,
-  status, previous_status}`.
+  status, previous_status}`. Every key already allowlisted. **One row per
+  successful selection, and no second one.** The existing convention is one
+  event per user-meaningful outcome, carrying the resulting status; a paired
+  `INTEGRATION_CONNECTED` would say the same thing twice and give a reader two
+  places to look for one fact. That choice stays declared-but-unwritten, as
+  `audit/models.py` intends.
 - Failed *selections* write no audit row: a mis-click is not a security event,
   and writing one per rejected id turns the audit log into a spam target.
 - Credential refresh failure writes no new action either; `reauth_required`
@@ -626,7 +650,8 @@ comes back here for approval before any migration is written.
 1. A GA4 connection in `awaiting_resource_selection` lists the real properties
    the granted account can read, across multiple pages.
 2. Selecting one yields `connected` with Google's own property name and both
-   health timestamps stamped by that same verification call.
+   health timestamps stamped by that same verification call, one audit row, and
+   `connected_by` unchanged.
 3. `POST …/resource` with an id the credential cannot read leaves the
    connection exactly as it was and returns `resource_not_accessible`, with 403
    and 404 indistinguishable.
