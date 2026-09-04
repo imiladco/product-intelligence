@@ -86,9 +86,14 @@ def _needs_forced_consent(connection: IntegrationConnection | None) -> bool:
         # Nothing stored means nothing to preserve.
         return True
 
-    # Redundant with the credential check below, because disconnect deletes the
-    # credential row and a dead grant is still stored. Kept deliberately, so a
-    # future change to *how* those states clear credentials cannot silently
+    # REAUTH_REQUIRED is semantically necessary, not defensive: the credential
+    # row may still be there, holding a refresh token we already know is dead.
+    # The credential check below would see a non-empty token and wrongly say
+    # "preservable".
+    #
+    # DISCONNECTED is the genuinely redundant one — disconnect deletes the
+    # credential row, so the check below would catch it too. Kept deliberately,
+    # so a future change to how disconnect clears credentials cannot silently
     # remove forced consent.
     if connection.status in (
         ConnectionStatus.REAUTH_REQUIRED,
