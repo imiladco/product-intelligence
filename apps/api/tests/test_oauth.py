@@ -17,6 +17,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from audit.models import AuditEvent
+from integrations.google.errors import NoRefreshToken
 from integrations.google.oauth import TOKEN_URI
 from integrations.models import (
     IntegrationConnection,
@@ -1415,3 +1416,168 @@ class TestCallbackGenerationFence:
 
         assert response.status_code == 302
         assert "authorized=1" in response.url
+
+
+class TestCallbackFailurePathsAreGenerationFenced:
+    """A superseded callback may not write failure state either (§9.4.2).
+
+    Stage 3 fences the success path, but every failure path also mutates the
+    connection — and each did so through the stale object read before the token
+    exchange. A newer authorization that completed while R1 was at Google would
+    be overwritten with R1's error, or in the denial case have its connection
+    deleted outright.
+    """
+
+    def _advance_generation(self, project):
+        connection = IntegrationConnection.objects.get(project=project)
+        connection.lifecycle_generation += 1
+        connection.save(update_fields=["lifecycle_generation", "updated_at"])
+        return connection
+
+    def _assert_untouched_and_no_failure_audit(self, project, before):
+        connection = IntegrationConnection.objects.get(project=project)
+        assert connection.status == before.status
+        assert connection.last_error_code == ""
+        assert connection.last_error_message == ""
+        assert connection.lifecycle_generation == before.lifecycle_generation
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZATION_FAILED
+        ).exists()
+
+    @responses.activate
+    def test_stale_token_exchange_failure_does_not_overwrite_newer_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def newer_intent_then_fail(request):
+            self._advance_generation(project)
+            return (400, {}, json.dumps({"error": "invalid_grant"}))
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=newer_intent_then_fail,
+            content_type="application/json",
+        )
+        before = self._advance_generation(project)
+        before.lifecycle_generation += 1  # the stub will advance it once more
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+
+    @responses.activate
+    def test_stale_scope_not_granted_does_not_overwrite_newer_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def newer_intent_then_wrong_scope(request):
+            self._advance_generation(project)
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "access_token": "access-token-1",
+                        "expires_in": 3599,
+                        "refresh_token": "refresh-token-1",
+                        "scope": GSC_SCOPE,  # not the scope GA4 requires
+                        "token_type": "Bearer",
+                    }
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=newer_intent_then_wrong_scope,
+            content_type="application/json",
+        )
+        before = self._advance_generation(project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+        assert not IntegrationCredential.objects.exists()
+
+    def test_stale_denial_does_not_delete_newer_authorization_connection(
+        self, monkeypatch, signed_in_client, make_project
+    ):
+        """The sharpest case: a stale denial would delete a live connection.
+
+        Denial makes no outbound call, so the window is between consuming the
+        request and writing the failure. A newer intent landing there is
+        reproduced by advancing the generation immediately after consumption.
+        """
+        from integrations import oauth_service
+
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        real_consume = oauth_service._consume_request
+
+        def consume_then_newer_intent(**kwargs):
+            request = real_consume(**kwargs)
+            self._advance_generation(project)
+            return request
+
+        monkeypatch.setattr(oauth_service, "_consume_request", consume_then_newer_intent)
+
+        before = IntegrationConnection.objects.get(project=project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "error": "access_denied"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        # The newer attempt's connection survives — this is the deletion the
+        # unfenced denial path would have performed.
+        assert IntegrationConnection.objects.filter(project=project).exists()
+        self._assert_untouched_and_no_failure_audit(project, before)
+
+    @responses.activate
+    def test_no_refresh_token_failure_is_generation_fenced(
+        self, monkeypatch, signed_in_client, make_project
+    ):
+        """The window after stage 3 rolls back and before the error is written.
+
+        The advance has to happen *outside* stage 3's transaction to be a
+        faithful simulation: a concurrent bump commits independently, whereas
+        one made inside that transaction is undone by the same rollback that
+        raises NoRefreshToken. So the whole of stage 3 is replaced here, which
+        is exactly the state the failure finalizer inherits.
+        """
+        from integrations import oauth_service
+
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+
+        def rolled_back_then_newer_intent(*, request, result, user):
+            # Stage 3 rolled back (nothing written), and a newer intent lands
+            # before the error state is persisted.
+            self._advance_generation(project)
+            raise NoRefreshToken
+
+        monkeypatch.setattr(
+            oauth_service, "_finalize_credentials", rolled_back_then_newer_intent
+        )
+
+        before = IntegrationConnection.objects.get(project=project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+        assert not IntegrationCredential.objects.exists()

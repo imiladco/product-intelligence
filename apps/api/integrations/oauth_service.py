@@ -264,6 +264,73 @@ def _record_failure(request, error_code: str) -> None:
     )
 
 
+def _locked_current_connection(request) -> IntegrationConnection:
+    """The connection this attempt is still entitled to write, locked.
+
+    Raises InvalidState when the connection is gone, or when a newer intent —
+    an explicit disconnect, or a newer authorization — has advanced the
+    generation past the one this attempt was started against. Every callback
+    path that mutates or deletes the connection goes through here, so a
+    superseded attempt cannot write *anything*: not success, and not failure.
+
+    Takes the existing-only lock, so no callback path can recreate a connection
+    that has been deleted.
+    """
+    try:
+        connection = locked_existing_connection(request.project, request.provider)
+    except IntegrationConnection.DoesNotExist as exc:
+        raise InvalidState from exc
+
+    if connection.lifecycle_generation != request.connection_generation:
+        raise InvalidState
+
+    return connection
+
+
+def _finalize_failure(*, request, exc_class) -> None:
+    """Record a failed authorization — only if this attempt is still current.
+
+    The failure paths used to write through the connection object read before
+    the token exchange. A newer authorization completing while the user was at
+    Google would then be overwritten with this attempt's error, which is the
+    same stale-write the success path is fenced against.
+    """
+    with transaction.atomic():
+        connection = _locked_current_connection(request)
+
+        connection.status = ConnectionStatus.ERROR
+        connection.last_error_code = exc_class.code
+        connection.last_error_message = exc_class.message
+        connection.save(
+            update_fields=[
+                "status",
+                "last_error_code",
+                "last_error_message",
+                "updated_at",
+            ]
+        )
+        _record_failure(request, exc_class.code)
+
+
+def _finalize_denial(*, request) -> None:
+    """The user declined, or Google refused.
+
+    Not an error state on the connection: nothing was ever authorized, so a
+    first authorization's row is removed and an existing integration keeps
+    everything it had. Backing out of a consent screen must never damage a
+    working integration.
+
+    Fenced like every other path, and for the sharpest reason: unfenced, a
+    stale denial would *delete* the connection belonging to a newer attempt.
+    """
+    with transaction.atomic():
+        connection = _locked_current_connection(request)
+
+        if not IntegrationCredential.objects.filter(connection=connection).exists():
+            connection.delete()
+        _record_failure(request, AuthorizationDenied.code)
+
+
 def _finalize_credentials(*, request, result, user) -> str:
     """Stage 3: persist credentials, under the lock, if still the current intent.
 
@@ -278,15 +345,9 @@ def _finalize_credentials(*, request, result, user) -> str:
     connection has been deleted fails here rather than recreating it.
     """
     with transaction.atomic():
-        try:
-            connection = locked_existing_connection(request.project, request.provider)
-        except IntegrationConnection.DoesNotExist as exc:
-            raise InvalidState from exc
-
-        if connection.lifecycle_generation != request.connection_generation:
-            # A disconnect or a newer attempt superseded this one. Write
-            # nothing: no credential, no status, no scopes, no audit event.
-            raise InvalidState
+        # Superseded -> InvalidState, and nothing is written: no credential, no
+        # status, no scopes, no audit event.
+        connection = _locked_current_connection(request)
 
         previous_status = connection.status
 
@@ -340,35 +401,12 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
         _record_failure(request, ProviderMismatch.code)
         raise ProviderMismatch
 
-    try:
-        connection = IntegrationConnection.objects.get(
-            project=request.project, provider=request.provider
-        )
-    except IntegrationConnection.DoesNotExist as exc:
-        # The integration was deleted while the user was at Google. Nothing to
-        # authorize, and nothing here may create it.
-        raise InvalidState from exc
-
-    def fail(exc_class) -> None:
-        connection.status = ConnectionStatus.ERROR
-        connection.last_error_code = exc_class.code
-        connection.last_error_message = exc_class.message
-        connection.save(
-            update_fields=["status", "last_error_code", "last_error_message", "updated_at"]
-        )
-        _record_failure(request, exc_class.code)
-
     if error:
-        # The user declined, or Google refused. Not an error state on the
-        # connection: nothing was ever authorized, so the row returns to
-        # "not connected" by being removed if it has no credential.
-        if not IntegrationCredential.objects.filter(connection=connection).exists():
-            connection.delete()
-        _record_failure(request, AuthorizationDenied.code)
+        _finalize_denial(request=request)
         raise AuthorizationDenied
 
     if not code:
-        fail(InvalidState)
+        _finalize_failure(request=request, exc_class=InvalidState)
         raise InvalidState
 
     try:
@@ -378,14 +416,14 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
             code_verifier=request.code_verifier,
         )
     except Exception as exc:
-        fail(type(exc))
+        _finalize_failure(request=request, exc_class=type(exc))
         raise
 
     # Granular consent means the user can untick a scope. Verify what was
     # actually granted rather than assuming the request was honoured.
     missing = set(provider.oauth_scopes) - set(result.granted_scopes)
     if missing:
-        fail(ScopeNotGranted)
+        _finalize_failure(request=request, exc_class=ScopeNotGranted)
         raise ScopeNotGranted
 
     # Stage 3. The transaction rolls back cleanly on NoRefreshToken, so the
@@ -394,7 +432,7 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
     try:
         _finalize_credentials(request=request, result=result, user=user)
     except NoRefreshToken:
-        fail(NoRefreshToken)
+        _finalize_failure(request=request, exc_class=NoRefreshToken)
         raise
 
     return request
