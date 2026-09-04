@@ -29,7 +29,6 @@ from .google.credentials import access_token_for, mark_reauth_required
 from .google.errors import (
     CredentialMissing,
     CredentialRefreshFailed,
-    ResourceChangeNotSupported,
     ResourceSelectionUnsupported,
 )
 from .models import IntegrationConnection
@@ -39,8 +38,16 @@ from .status import ConnectionStatus
 
 #: The states in which a connection holds a credential worth using. Anything
 #: else has nothing to reach Google with, and says so rather than trying.
+#:
+#: ``ERROR`` is included: a connection whose property was deleted sits there
+#: holding a perfectly good credential, and repointing it at another property
+#: is precisely the repair (§6).
 USABLE_STATUSES = frozenset(
-    {ConnectionStatus.AWAITING_RESOURCE_SELECTION, ConnectionStatus.CONNECTED}
+    {
+        ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        ConnectionStatus.CONNECTED,
+        ConnectionStatus.ERROR,
+    }
 )
 
 
@@ -91,6 +98,14 @@ def select_resource(
 ) -> IntegrationConnection:
     """Verify a resource against the provider and, only then, store it.
 
+    Selecting and *changing* a selection are one operation (§6). What makes
+    changing safe is not a guard but the order: the identifier is normalized
+    before any outbound call, the resource is verified against the provider
+    before anything is written, the label and metadata come from that
+    verification rather than the body, and the write happens once under the row
+    lock. Nothing is written on any failure path, so a failed change leaves the
+    previous selection exactly as it was.
+
     The verifying call is also the connection's first health check: the same
     success that proves the resource is usable is what stamps the health
     timestamps, so there is no second code path that could disagree with it.
@@ -102,15 +117,6 @@ def select_resource(
     resource_id = catalog.normalize_resource_id(resource_id)
 
     connection = _usable_connection(project, provider_key)
-
-    # Changing an existing selection is a later milestone. Re-submitting the
-    # same one is not a change, so a retried or double-submitted request stays
-    # harmless instead of becoming an error the user has to interpret.
-    if (
-        connection.status == ConnectionStatus.CONNECTED
-        and connection.external_resource_id != resource_id
-    ):
-        raise ResourceChangeNotSupported
 
     access_token = access_token_for(connection)
 
@@ -150,15 +156,6 @@ def _persist_selection(*, connection, selected, user, fence) -> IntegrationConne
             return locked
 
         previous_status = locked.status
-
-        # Re-checked under the lock: two concurrent selections must not slip a
-        # change past the guard above by racing it.
-        if (
-            previous_status == ConnectionStatus.CONNECTED
-            and locked.external_resource_id
-            and locked.external_resource_id != selected.id
-        ):
-            raise ResourceChangeNotSupported
 
         now = timezone.now()
         locked.external_resource_id = selected.id

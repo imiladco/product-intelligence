@@ -444,7 +444,35 @@ class TestScopeReductions:
         assert connection.last_successful_check_at >= first_check
 
     @responses.activate
-    def test_changing_to_a_different_property_is_refused(self, connected_project):
+    def test_changing_to_a_different_property_replaces_the_selection(
+        self, connected_project
+    ):
+        """Replaces the M4 test that pinned the 409 this milestone lifts (§6)."""
+        client, _user, project, connection = connected_project
+        stub_property()
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+        responses.reset()
+        stub_property(property_id="properties/999", display_name="Second property")
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        # Id, label and metadata move together: a half-applied change would
+        # leave a connection claiming one property under another one's name.
+        assert connection.external_resource_id == "properties/999"
+        assert connection.external_resource_label == "Second property"
+        assert connection.status == ConnectionStatus.CONNECTED
+
+    @responses.activate
+    def test_a_failed_change_leaves_the_previous_selection_intact(
+        self, connected_project
+    ):
+        """Nothing is written on any failure path, so the old selection stands."""
         client, _user, project, connection = connected_project
         stub_property()
         client.post(
@@ -454,25 +482,48 @@ class TestScopeReductions:
         before = (
             connection.external_resource_id,
             connection.external_resource_label,
+            dict(connection.external_resource_meta),
             connection.last_health_check_at,
             connection.last_successful_check_at,
         )
         responses.reset()
+        stub_property(property_id="properties/999", status=403)
 
         response = client.post(
             selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
         )
 
-        assert response.status_code == 409
-        assert response.data["error"]["code"] == "resource_change_not_supported"
-        assert len(responses.calls) == 0
+        assert response.status_code == 400
         connection.refresh_from_db()
         assert (
             connection.external_resource_id,
             connection.external_resource_label,
+            connection.external_resource_meta,
             connection.last_health_check_at,
             connection.last_successful_check_at,
         ) == before
+
+    @responses.activate
+    def test_a_connection_in_error_can_be_repointed(self, connected_project):
+        """A deleted property leaves `error`; repointing is the repair (§6)."""
+        client, _user, project, connection = connected_project
+        connection.status = ConnectionStatus.ERROR
+        connection.external_resource_id = "properties/111"
+        connection.last_error_code = "resource_not_accessible"
+        connection.save(
+            update_fields=["status", "external_resource_id", "last_error_code"]
+        )
+        stub_property(property_id="properties/999", display_name="Second property")
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == "properties/999"
+        assert connection.last_error_code == ""
 
 
 # --- Credential refresh ------------------------------------------------------

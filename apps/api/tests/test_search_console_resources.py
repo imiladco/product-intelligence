@@ -483,21 +483,55 @@ class TestParityWithGa4:
         assert len(responses.calls) == 0
 
     @responses.activate
-    def test_changing_to_a_different_site_is_refused(self, authorized_project):
+    def test_changing_to_a_different_site_replaces_the_selection(
+        self, authorized_project
+    ):
+        """Replaces the M5 test that pinned the 409 this milestone lifts (§6)."""
         client, _user, project, connection = authorized_project
         stub_site(DOMAIN_SITE)
         client.post(selection_url(project.pk), {"resource_id": DOMAIN_SITE}, format="json")
         responses.reset()
+        stub_site(PREFIX_SITE)
 
         response = client.post(
             selection_url(project.pk), {"resource_id": PREFIX_SITE}, format="json"
         )
 
-        assert response.status_code == 409
-        assert response.data["error"]["code"] == "resource_change_not_supported"
-        assert len(responses.calls) == 0
+        assert response.status_code == 200
         connection.refresh_from_db()
-        assert connection.external_resource_id == DOMAIN_SITE
+        assert connection.external_resource_id == PREFIX_SITE
+        assert connection.external_resource_label == PREFIX_SITE
+        assert connection.status == ConnectionStatus.CONNECTED
+
+    @responses.activate
+    def test_a_failed_change_leaves_the_previous_site_intact(self, authorized_project):
+        client, _user, project, connection = authorized_project
+        stub_site(DOMAIN_SITE)
+        client.post(selection_url(project.pk), {"resource_id": DOMAIN_SITE}, format="json")
+        connection.refresh_from_db()
+        before = (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+        )
+        responses.reset()
+        stub_site(PREFIX_SITE, status=403)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": PREFIX_SITE}, format="json"
+        )
+
+        assert response.status_code == 400
+        connection.refresh_from_db()
+        assert (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            connection.external_resource_meta,
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+        ) == before
 
     @responses.activate
     def test_selection_does_not_reassign_connected_by(self, authorized_project):
