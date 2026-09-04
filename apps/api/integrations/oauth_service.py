@@ -36,7 +36,11 @@ from .google.errors import (
     ScopeNotGranted,
 )
 from .google.oauth import build_authorization_redirect, exchange_code
-from .concurrency import advance_generation, locked_or_create_connection_for_authorization
+from .concurrency import (
+    advance_generation,
+    locked_existing_connection,
+    locked_or_create_connection_for_authorization,
+)
 from .models import IntegrationConnection, IntegrationCredential, OAuthAuthorizationRequest
 from .providers import get_provider
 from .status import ConnectionStatus
@@ -260,6 +264,61 @@ def _record_failure(request, error_code: str) -> None:
     )
 
 
+def _finalize_credentials(*, request, result, user) -> str:
+    """Stage 3: persist credentials, under the lock, if still the current intent.
+
+    Returns the connection's ``previous_status`` — read from the re-read row
+    **before** anything is mutated, because this function is what sets
+    ``awaiting_resource_selection``. Reading it afterwards would make every
+    authorization look like it came from that state (§8.1).
+
+    Raises InvalidState, writing nothing at all, when the connection was
+    superseded while the user was at Google: an explicit disconnect, or a newer
+    authorization attempt. Takes the **existing-only** lock, so a callback whose
+    connection has been deleted fails here rather than recreating it.
+    """
+    with transaction.atomic():
+        try:
+            connection = locked_existing_connection(request.project, request.provider)
+        except IntegrationConnection.DoesNotExist as exc:
+            raise InvalidState from exc
+
+        if connection.lifecycle_generation != request.connection_generation:
+            # A disconnect or a newer attempt superseded this one. Write
+            # nothing: no credential, no status, no scopes, no audit event.
+            raise InvalidState
+
+        previous_status = connection.status
+
+        _store_credentials(connection, result)
+
+        connection.status = ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        connection.granted_scopes = list(result.granted_scopes)
+        connection.connected_by = user
+        connection.last_error_code = ""
+        connection.last_error_message = ""
+        connection.save(
+            update_fields=[
+                "status",
+                "granted_scopes",
+                "connected_by",
+                "last_error_code",
+                "last_error_message",
+                "updated_at",
+            ]
+        )
+
+        record_event(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED,
+            actor=user,
+            project=request.project,
+            provider=request.provider,
+            metadata={"provider": request.provider, "status": connection.status},
+        )
+
+    return previous_status
+
+
 def complete_authorization(*, user, state: str, code: str, error: str = "") -> OAuthAuthorizationRequest:
     """Finish an authorization and return the consumed request.
 
@@ -281,9 +340,14 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
         _record_failure(request, ProviderMismatch.code)
         raise ProviderMismatch
 
-    connection = IntegrationConnection.objects.get(
-        project=request.project, provider=request.provider
-    )
+    try:
+        connection = IntegrationConnection.objects.get(
+            project=request.project, provider=request.provider
+        )
+    except IntegrationConnection.DoesNotExist as exc:
+        # The integration was deleted while the user was at Google. Nothing to
+        # authorize, and nothing here may create it.
+        raise InvalidState from exc
 
     def fail(exc_class) -> None:
         connection.status = ConnectionStatus.ERROR
@@ -324,33 +388,13 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
         fail(ScopeNotGranted)
         raise ScopeNotGranted
 
+    # Stage 3. The transaction rolls back cleanly on NoRefreshToken, so the
+    # error status below is written outside it and survives — the same reason
+    # M3 kept the consumption transaction narrow.
     try:
-        _store_credentials(connection, result)
+        _finalize_credentials(request=request, result=result, user=user)
     except NoRefreshToken:
         fail(NoRefreshToken)
         raise
 
-    connection.status = ConnectionStatus.AWAITING_RESOURCE_SELECTION
-    connection.granted_scopes = list(result.granted_scopes)
-    connection.connected_by = user
-    connection.last_error_code = ""
-    connection.last_error_message = ""
-    connection.save(
-        update_fields=[
-            "status",
-            "granted_scopes",
-            "connected_by",
-            "last_error_code",
-            "last_error_message",
-            "updated_at",
-        ]
-    )
-
-    record_event(
-        action=AuditEvent.Action.INTEGRATION_AUTHORIZED,
-        actor=user,
-        project=request.project,
-        provider=request.provider,
-        metadata={"provider": request.provider, "status": connection.status},
-    )
     return request

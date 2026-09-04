@@ -1288,3 +1288,130 @@ class TestForcedConsentIsKeyedOnCapability:
         self._credential(connection)
 
         assert self._prompt(client, project) is None
+
+
+class TestCallbackGenerationFence:
+    """Stage 3 refuses to persist for a superseded authorization (§9.4.2).
+
+    The callback consumes its request *before* the token exchange, so from that
+    moment consume-on-disconnect can no longer see it. The generation is what
+    covers the remaining window: at the instant of writing, is this attempt
+    still the user's current intent?
+    """
+
+    @responses.activate
+    def test_callback_proceeds_when_generation_matches(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "authorized=1" in response.url
+        connection = IntegrationConnection.objects.get(project=project)
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert IntegrationCredential.objects.filter(connection=connection).exists()
+
+    @responses.activate
+    def test_callback_is_discarded_when_generation_advanced(
+        self, signed_in_client, make_project
+    ):
+        """A newer intent landed while the user was at Google."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        connection = IntegrationConnection.objects.get(project=project)
+        before = IntegrationConnection.objects.get(pk=connection.pk)
+        # Something expressed a newer intent for this integration.
+        connection.lifecycle_generation += 1
+        connection.save(update_fields=["lifecycle_generation", "updated_at"])
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+
+        connection.refresh_from_db()
+        assert not IntegrationCredential.objects.filter(connection=connection).exists()
+        assert connection.status == before.status
+        assert connection.granted_scopes == before.granted_scopes
+        assert not AuditEvent.objects.filter(
+            action__in=[
+                AuditEvent.Action.INTEGRATION_AUTHORIZED,
+                AuditEvent.Action.INTEGRATION_RECONNECTED,
+            ]
+        ).exists()
+
+    @responses.activate
+    def test_callback_does_not_recreate_a_deleted_connection(
+        self, signed_in_client, make_project
+    ):
+        """Finalization takes the existing-only lock; it never creates."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        IntegrationConnection.objects.filter(project=project).delete()
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        assert not IntegrationConnection.objects.filter(project=project).exists()
+        assert not IntegrationCredential.objects.exists()
+        assert not AuditEvent.objects.filter(
+            action__in=[
+                AuditEvent.Action.INTEGRATION_AUTHORIZED,
+                AuditEvent.Action.INTEGRATION_RECONNECTED,
+            ]
+        ).exists()
+
+    @responses.activate
+    def test_no_database_lock_is_held_across_the_token_exchange(
+        self, signed_in_client, make_project
+    ):
+        """Stage 2 is a network call of unbounded duration.
+
+        Holding a row lock across it would block every other operation on the
+        integration for as long as Google takes. The stub writes to the same
+        connection mid-exchange; if a lock were held, this would deadlock or
+        block rather than complete.
+        """
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def write_during_exchange(request):
+            IntegrationConnection.objects.filter(project=project).update(
+                last_error_message="written during the exchange"
+            )
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "access_token": "access-token-1",
+                        "expires_in": 3599,
+                        "refresh_token": "refresh-token-1",
+                        "scope": GA4_SCOPE,
+                        "token_type": "Bearer",
+                    }
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=write_during_exchange,
+            content_type="application/json",
+        )
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "authorized=1" in response.url
