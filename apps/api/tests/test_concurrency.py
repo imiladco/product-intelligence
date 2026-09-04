@@ -20,7 +20,17 @@ from integrations.concurrency import (
     locked_existing_connection,
     locked_or_create_connection_for_authorization,
 )
-from integrations.models import IntegrationConnection, OAuthAuthorizationRequest
+from datetime import timedelta
+
+from django.utils import timezone
+
+from audit.models import AuditEvent
+from integrations.models import (
+    IntegrationConnection,
+    IntegrationCredential,
+    OAuthAuthorizationRequest,
+)
+from integrations.providers import get_provider
 from integrations.oauth_service import start_authorization
 from integrations.providers import ProviderKey
 from integrations.status import ConnectionStatus
@@ -313,3 +323,105 @@ def test_two_first_authorizations_race(django_db_setup, django_db_blocker):
             IntegrationConnection.objects.all().delete()
             Project.objects.all().delete()
             User.objects.all().delete()
+
+
+class TestSelectionFence:
+    """A selection result may only be applied to the state it was computed from.
+
+    Design §9.3. Captured after any refresh has committed and before the
+    provider call; compared under the write lock. A mismatch discards
+    everything, including timestamps — a stale result has no claim on any field.
+    """
+
+    def _authorized(self, project, user):
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+            granted_scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+            connected_by=user,
+        )
+        IntegrationCredential.objects.create(
+            connection=connection,
+            access_token="access-token-1",
+            refresh_token="refresh-token-1",
+            access_token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        return connection
+
+    def test_stale_selection_result_is_discarded(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        from integrations import resource_service
+        from integrations.resources import RemoteResource
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = self._authorized(project, user)
+
+        def mutate_then_return(access_token, resource_id):
+            # Something else writes to the connection mid-flight.
+            IntegrationConnection.objects.filter(pk=connection.pk).update(
+                external_resource_id="properties/999",
+                external_resource_label="Newer",
+            )
+            return RemoteResource(id=resource_id, label="Stale", metadata={})
+
+        monkeypatch.setattr(
+            resource_service, "_verify", mutate_then_return, raising=False
+        )
+        catalog = get_provider(ProviderKey.GA4).resources
+        monkeypatch.setattr(catalog, "verify_resource", mutate_then_return)
+
+        resource_service.select_resource(
+            user=user,
+            project=project,
+            provider_key=ProviderKey.GA4,
+            resource_id="properties/111",
+        )
+
+        connection.refresh_from_db()
+        # The newer state survives; the stale result wrote nothing.
+        assert connection.external_resource_id == "properties/999"
+        assert connection.external_resource_label == "Newer"
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+
+    def test_a_discarded_selection_writes_nothing_at_all(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        """Not even a timestamp. 'Discard but still stamp' is the tempting bug."""
+        from integrations import resource_service
+        from integrations.resources import RemoteResource
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = self._authorized(project, user)
+
+        def mutate_then_return(access_token, resource_id):
+            # Written the way production writes: save() with updated_at in
+            # update_fields, so auto_now fires. queryset.update() would bypass
+            # it, which no service path does.
+            newer = IntegrationConnection.objects.get(pk=connection.pk)
+            newer.last_error_message = "newer write"
+            newer.save(update_fields=["last_error_message", "updated_at"])
+            return RemoteResource(id=resource_id, label="Stale", metadata={})
+
+        catalog = get_provider(ProviderKey.GA4).resources
+        monkeypatch.setattr(catalog, "verify_resource", mutate_then_return)
+
+        resource_service.select_resource(
+            user=user,
+            project=project,
+            provider_key=ProviderKey.GA4,
+            resource_id="properties/111",
+        )
+
+        connection.refresh_from_db()
+        assert connection.external_resource_id == ""
+        assert connection.external_resource_label == ""
+        assert connection.external_resource_meta == {}
+        assert connection.last_health_check_at is None
+        assert connection.last_successful_check_at is None
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_RESOURCE_SELECTED
+        ).exists()

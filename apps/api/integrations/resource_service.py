@@ -24,6 +24,7 @@ from django.utils import timezone
 from audit.models import AuditEvent
 from audit.services import record_event
 
+from .concurrency import Fence, locked_existing_connection
 from .google.credentials import access_token_for, mark_reauth_required
 from .google.errors import (
     CredentialMissing,
@@ -112,6 +113,13 @@ def select_resource(
         raise ResourceChangeNotSupported
 
     access_token = access_token_for(connection)
+
+    # Captured after any refresh has committed and immediately before the
+    # provider call, so the result can be checked against the state it was
+    # actually computed from (§9.3).
+    connection.refresh_from_db()
+    fence = Fence.capture(connection)
+
     try:
         selected = catalog.verify_resource(access_token, resource_id)
     except CredentialRefreshFailed:
@@ -119,10 +127,12 @@ def select_resource(
         mark_reauth_required(connection)
         raise
 
-    return _persist_selection(connection=connection, selected=selected, user=user)
+    return _persist_selection(
+        connection=connection, selected=selected, user=user, fence=fence
+    )
 
 
-def _persist_selection(*, connection, selected, user) -> IntegrationConnection:
+def _persist_selection(*, connection, selected, user, fence) -> IntegrationConnection:
     """Write the verified selection, or nothing at all.
 
     Everything lands in one save inside one transaction, so a connection is
@@ -130,7 +140,15 @@ def _persist_selection(*, connection, selected, user) -> IntegrationConnection:
     it.
     """
     with transaction.atomic():
-        locked = IntegrationConnection.objects.select_for_update().get(pk=connection.pk)
+        locked = locked_existing_connection(connection.project, connection.provider)
+
+        if not fence.matches(locked):
+            # The world moved while the provider was answering: this result
+            # describes a state that no longer exists. Discard it entirely —
+            # not even a timestamp, since a stale result has no claim on any
+            # field — and report what the connection actually is now.
+            return locked
+
         previous_status = locked.status
 
         # Re-checked under the lock: two concurrent selections must not slip a
