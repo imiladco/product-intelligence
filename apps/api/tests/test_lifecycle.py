@@ -460,3 +460,256 @@ class TestDisconnect:
             ).status_code
             == 404
         )
+
+
+# --- Reconnect terminal behaviour (§5.1.1) -----------------------------------
+
+CALLBACK = "/api/integrations/oauth/google/callback"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+@pytest.fixture(autouse=True)
+def oauth_settings(settings):
+    settings.GOOGLE_OAUTH_REDIRECT_URI = (
+        "http://localhost:3000/api/integrations/oauth/google/callback"
+    )
+    return settings
+
+
+def stub_token(*, scope=GA4_SCOPE, refresh_token="refresh-token-2"):
+    body = {
+        "access_token": "access-token-2",
+        "expires_in": 3599,
+        "scope": scope,
+        "token_type": "Bearer",
+    }
+    if refresh_token is not None:
+        body["refresh_token"] = refresh_token
+    responses.add(responses.POST, TOKEN_URI, json=body)
+
+
+def start_flow(client, project, provider="ga4") -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    response = client.post(
+        f"/api/projects/{project.pk}/integrations/{provider}/authorize",
+        {},
+        format="json",
+    )
+    assert response.status_code == 200, response.data
+    url = response.data["authorization_url"]
+    return parse_qs(urlparse(url).query)["state"][0]
+
+
+class TestReconnectTerminalState:
+    """§5.1.1. A reconnect ends where the stored selection actually stands.
+
+    M3 ended every callback in `awaiting_resource_selection`, which threw away
+    a selection the user had made and still wanted. The selection is now
+    re-verified with the new credential, and the four outcome classes are told
+    apart rather than collapsed.
+    """
+
+    @responses.activate
+    def test_a_still_valid_selection_returns_straight_to_connected(self, connected):
+        client, _user, project, connection = connected
+        connection.status = ConnectionStatus.REAUTH_REQUIRED
+        connection.last_error_code = "credential_refresh_failed"
+        connection.save(update_fields=["status", "last_error_code"])
+        before_success = connection.last_successful_check_at
+        state = start_flow(client, project)
+        stub_token()
+        stub_property()
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == GA4_RESOURCE
+        assert connection.last_error_code == ""
+        assert connection.last_successful_check_at > before_success
+
+    @responses.activate
+    def test_success_leaves_selection_fields_unchanged(self, connected):
+        client, _user, project, connection = connected
+        before = (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+        )
+        state = start_flow(client, project)
+        stub_token()
+        stub_property(display_name="A DIFFERENT NAME")
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            connection.external_resource_meta,
+        ) == before
+        assert connection.status == ConnectionStatus.CONNECTED
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [403, 404])
+    def test_an_inaccessible_resource_is_retained_for_re_picking(
+        self, connected, status
+    ):
+        client, _user, project, connection = connected
+        before_success = connection.last_successful_check_at
+        state = start_flow(client, project)
+        stub_token()
+        stub_property(status=status)
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        # Retained (§5.2): the card can say what stopped working.
+        assert connection.external_resource_id == GA4_RESOURCE
+        assert connection.external_resource_label == "poolino"
+        assert connection.last_error_code == "resource_not_accessible"
+        assert connection.last_successful_check_at == before_success
+
+    @responses.activate
+    def test_a_credential_rejected_after_the_exchange_is_reauth_required(
+        self, connected
+    ):
+        """Access revoked between the token exchange and the verify."""
+        client, _user, project, connection = connected
+        state = start_flow(client, project)
+        stub_token()
+        stub_property(status=401)
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.external_resource_id == GA4_RESOURCE
+        assert connection.last_error_code == "credential_refresh_failed"
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [429, 503])
+    def test_a_transient_failure_never_claims_the_resource_is_gone(
+        self, connected, status
+    ):
+        client, _user, project, connection = connected
+        state = start_flow(client, project)
+        stub_token()
+        stub_property(status=status)
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.external_resource_id == GA4_RESOURCE
+        # The transient class, so the card offers Test connection rather than
+        # sending the user to re-pick a property that is probably fine.
+        assert connection.last_error_code == "resource_unavailable"
+
+    @responses.activate
+    def test_with_nothing_selected_it_still_awaits_selection(
+        self, signed_in_client, make_project
+    ):
+        """M3 behaviour, intact: there is no selection to preserve."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection = IntegrationConnection.objects.get(project=project)
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.last_error_code == ""
+        # No verification call is possible with nothing selected.
+        assert all("analyticsadmin" not in c.request.url for c in responses.calls)
+
+
+class TestReconnectCancellation:
+    """§5.4. Backing out of a consent screen damages nothing."""
+
+    @responses.activate
+    def test_denial_on_an_existing_integration_changes_nothing(self, connected):
+        client, _user, project, connection = connected
+        before = (
+            connection.status,
+            connection.external_resource_id,
+            connection.external_resource_label,
+        )
+        credential_before = connection.credential.refresh_token
+        state = start_flow(client, project)
+
+        client.get(CALLBACK, {"state": state, "error": "access_denied"})
+
+        connection.refresh_from_db()
+        assert (
+            connection.status,
+            connection.external_resource_id,
+            connection.external_resource_label,
+        ) == before
+        assert connection.credential.refresh_token == credential_before
+        assert connection.last_error_code != "access_denied"
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZATION_FAILED
+        ).exists()
+
+    @responses.activate
+    def test_denial_of_a_first_authorization_removes_the_row(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        client.get(CALLBACK, {"state": state, "error": "access_denied"})
+
+        assert not IntegrationConnection.objects.filter(project=project).exists()
+
+    @responses.activate
+    def test_a_withheld_scope_is_still_an_error(self, connected):
+        """Denial means 'I did not do this'; a missing scope is different."""
+        client, _user, project, connection = connected
+        state = start_flow(client, project)
+        stub_token(scope="https://www.googleapis.com/auth/userinfo.email")
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.ERROR
+        assert connection.last_error_code == "scope_not_granted"
+
+
+class TestReconnectStageFiveDiscard:
+    """§9.4.2 stage 5: credentials committed do not license a terminal write."""
+
+    @responses.activate
+    def test_a_disconnect_between_persistence_and_verification_discards_it(
+        self, connected, monkeypatch
+    ):
+        from integrations import lifecycle_service
+        from integrations.providers import get_provider
+
+        client, user, project, connection = connected
+        state = start_flow(client, project)
+        stub_token()
+
+        catalog = get_provider(ProviderKey.GA4).resources
+        original = catalog.verify_resource
+
+        def disconnect_then_verify(access_token, resource_id):
+            lifecycle_service.disconnect(
+                user=user, project=project, provider_key=ProviderKey.GA4
+            )
+            return original(access_token, resource_id)
+
+        stub_property()
+        monkeypatch.setattr(catalog, "verify_resource", disconnect_then_verify)
+
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+        connection.refresh_from_db()
+        # The disconnect stands; the callback wrote no terminal state over it.
+        assert connection.status == ConnectionStatus.DISCONNECTED
+        assert connection.last_error_code == ""

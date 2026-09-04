@@ -37,13 +37,16 @@ from .google.errors import (
 )
 from .google.oauth import build_authorization_redirect, exchange_code
 from .concurrency import (
+    Fence,
     advance_generation,
     locked_existing_connection,
     locked_or_create_connection_for_authorization,
 )
 from .models import IntegrationConnection, IntegrationCredential, OAuthAuthorizationRequest
+from .lifecycle_service import apply_verification_outcome
 from .providers import get_provider
 from .status import ConnectionStatus
+from .verification import VerificationContext, verify
 
 logger = logging.getLogger(__name__)
 
@@ -435,4 +438,65 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
         _finalize_failure(request=request, exc_class=NoRefreshToken)
         raise
 
+    # Stages 4 and 5. Outside every transaction: the verification is a network
+    # call, and holding the row lock across it would block the integration for
+    # as long as Google takes.
+    _finalize_stored_resource(request=request, provider=provider, result=result)
+
     return request
+
+
+def _finalize_stored_resource(*, request, provider, result) -> None:
+    """Stages 4 and 5: re-verify the remembered selection, and record where it stands.
+
+    A reconnect that ended in ``awaiting_resource_selection`` regardless would
+    throw away a selection the user made and still wants (§5.1). So the stored
+    resource is checked with the credential that was just issued, and the
+    outcome decides the terminal state — *when still valid* being answered by a
+    live call rather than assumed.
+
+    With nothing selected there is nothing to preserve, and M3's terminal state
+    stands unchanged.
+
+    The verdict goes through the same two functions the health check uses, so
+    the two paths cannot drift; only the context differs. It carries the
+    generation as well as the snapshot, because credentials committed at stage 3
+    do not license a terminal write later (§9.4.2): a disconnect or a newer
+    authorization arriving in between discards this result entirely.
+    """
+    catalog = provider.resources
+    if catalog is None:
+        return
+
+    try:
+        connection = IntegrationConnection.objects.get(
+            project=request.project, provider=request.provider
+        )
+    except IntegrationConnection.DoesNotExist:
+        return
+
+    if not connection.external_resource_id:
+        return
+
+    # Captured after stage 3 has committed and before the outbound call, so the
+    # result is compared against the state it was actually computed from.
+    fence = Fence.capture(connection)
+
+    outcome = verify(
+        catalog=catalog,
+        access_token=result.access_token,
+        resource_id=connection.external_resource_id,
+    )
+
+    try:
+        apply_verification_outcome(
+            connection=connection,
+            outcome=outcome,
+            fence=fence,
+            context=VerificationContext.RECONNECT,
+            expected_generation=request.connection_generation,
+        )
+    except IntegrationConnection.DoesNotExist:
+        # The connection was removed while the provider was answering. Nothing
+        # to write to, which is the correct end of a discarded stage 5.
+        return
