@@ -21,6 +21,7 @@ from integrations.models import (
 )
 from integrations.providers import ProviderKey
 from integrations.status import ConnectionStatus
+from integrations.verification import VerificationContext, VerificationResult
 
 pytestmark = pytest.mark.django_db
 
@@ -713,3 +714,172 @@ class TestReconnectStageFiveDiscard:
         # The disconnect stands; the callback wrote no terminal state over it.
         assert connection.status == ConnectionStatus.DISCONNECTED
         assert connection.last_error_code == ""
+
+
+class TestLifecycleLeakage:
+    """Nothing the lifecycle touches may carry credential material outward."""
+
+    @responses.activate
+    def test_no_credential_material_in_a_health_check_response(self, connected):
+        import json
+
+        client, _user, project, _connection = connected
+        stub_property()
+
+        response = client.post(health_check_url(project.pk), {}, format="json")
+
+        body = json.dumps(response.data)
+        for forbidden in (
+            "access-token-1",
+            "refresh-token-1",
+            "test-client-secret",
+            "external_resource_meta",
+            "granted_scopes",
+        ):
+            assert forbidden not in body
+
+    @responses.activate
+    def test_no_credential_material_in_a_disconnect_response(self, connected):
+        import json
+
+        client, _user, project, _connection = connected
+
+        response = client.post(disconnect_url(project.pk), {}, format="json")
+
+        body = json.dumps(response.data)
+        for forbidden in ("access-token-1", "refresh-token-1", "external_resource_meta"):
+            assert forbidden not in body
+
+    @responses.activate
+    def test_googles_error_text_reaches_neither_response_nor_log(
+        self, connected, caplog
+    ):
+        import json
+
+        client, _user, project, connection = connected
+        stub_property(status=403)
+
+        with caplog.at_level("DEBUG"):
+            response = client.post(health_check_url(project.pk), {}, format="json")
+
+        leak = "google detail that must not leak"
+        assert leak not in json.dumps(response.data)
+        assert leak not in caplog.text
+        connection.refresh_from_db()
+        # Not stored either: the recorded message is our own.
+        assert leak not in connection.last_error_message
+
+    @responses.activate
+    def test_the_access_token_is_never_logged_during_a_check(self, connected, caplog):
+        client, _user, project, _connection = connected
+        stub_property()
+
+        with caplog.at_level("DEBUG"):
+            client.post(health_check_url(project.pk), {}, format="json")
+
+        assert "access-token-1" not in caplog.text
+        assert "refresh-token-1" not in caplog.text
+
+    @responses.activate
+    def test_no_revoke_request_is_ever_made(self, connected):
+        """§0. The grant belongs to the user's Google account, not to us."""
+        client, _user, project, connection = connected
+        responses.add(responses.POST, "https://oauth2.googleapis.com/revoke", json={})
+        responses.add(responses.GET, "https://oauth2.googleapis.com/revoke", json={})
+        stub_property()
+
+        client.post(health_check_url(project.pk), {}, format="json")
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        assert all("revoke" not in call.request.url for call in responses.calls)
+
+
+class TestLifecycleAuditing:
+    """One event per user-meaningful outcome, and none for a mere check."""
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [200, 401, 403, 503])
+    def test_a_health_check_writes_no_audit_event(self, connected, status):
+        """Including one that transitions the connection.
+
+        A check is an observation. Recording one as an event would fill the log
+        with rows nobody took an action to produce.
+        """
+        client, _user, project, _connection = connected
+        stub_property(status=status)
+        before = AuditEvent.objects.count()
+
+        client.post(health_check_url(project.pk), {}, format="json")
+
+        assert AuditEvent.objects.count() == before
+
+    def test_every_written_key_is_on_the_allowlist(self, connected):
+        from audit.services import ALLOWED_METADATA_KEYS
+
+        client, _user, project, _connection = connected
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        for event in AuditEvent.objects.all():
+            assert set(event.metadata) <= ALLOWED_METADATA_KEYS
+
+    def test_a_disconnect_event_carries_no_credential_material(self, connected):
+        import json
+
+        client, _user, project, _connection = connected
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        event = AuditEvent.objects.get(
+            action=AuditEvent.Action.INTEGRATION_DISCONNECTED
+        )
+        body = json.dumps(event.metadata)
+        for forbidden in ("access-token-1", "refresh-token-1", "token", "secret"):
+            assert forbidden not in body
+
+
+class TestVerificationOutcomeNeverWritesSelectionFields:
+    """§T07. Structural, not a matter of care: the fields are not in the save."""
+
+    @pytest.mark.parametrize("context", list(VerificationContext))
+    @pytest.mark.parametrize("result", list(VerificationResult))
+    def test_no_context_and_no_result_moves_the_selection(
+        self, connected, context, result
+    ):
+        from integrations.concurrency import Fence
+        from integrations.lifecycle_service import apply_verification_outcome
+        from integrations.resources import RemoteResource
+        from integrations.verification import VerificationOutcome
+
+        _client, _user, _project, connection = connected
+        before = (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+        )
+        outcome = VerificationOutcome(
+            result=result,
+            # Even on success, and even when the provider returned something
+            # different from what is stored.
+            resource=(
+                RemoteResource(id="properties/999", label="Something else")
+                if result is VerificationResult.SUCCESS
+                else None
+            ),
+            error_code="" if result is VerificationResult.SUCCESS else "some_code",
+            error_message="" if result is VerificationResult.SUCCESS else "Some message",
+        )
+
+        apply_verification_outcome(
+            connection=connection,
+            outcome=outcome,
+            fence=Fence.capture(connection),
+            context=context,
+        )
+
+        connection.refresh_from_db()
+        assert (
+            connection.external_resource_id,
+            connection.external_resource_label,
+            connection.external_resource_meta,
+        ) == before
