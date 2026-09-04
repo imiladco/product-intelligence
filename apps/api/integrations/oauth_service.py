@@ -36,6 +36,7 @@ from .google.errors import (
     ScopeNotGranted,
 )
 from .google.oauth import build_authorization_redirect, exchange_code
+from .concurrency import advance_generation, locked_or_create_connection_for_authorization
 from .models import IntegrationConnection, IntegrationCredential, OAuthAuthorizationRequest
 from .providers import get_provider
 from .status import ConnectionStatus
@@ -93,14 +94,16 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
     # state that survives a cancellation. Someone who reaches
     # awaiting_resource_selection and then cancels a re-authorization is still
     # awaiting resource selection.
-    connection, _created = IntegrationConnection.objects.get_or_create(
-        project=project,
-        provider=provider.key,
-        defaults={
-            "status": ConnectionStatus.PENDING_AUTHORIZATION,
-            "connected_by": user,
-        },
+    #
+    # This is the only place in the codebase allowed to create a connection.
+    connection = locked_or_create_connection_for_authorization(
+        project, provider.key, user=user
     )
+
+    # A new attempt supersedes any older one. Advanced on every invocation, not
+    # only when a durable field changes: the counter tracks expressions of
+    # intent, and a start that changes no status is still one.
+    generation = advance_generation(connection)
 
     # Supersede any attempt still outstanding for this exact tuple. Without
     # this, abandoning a flow (closing the Google tab, losing connectivity)
@@ -132,6 +135,7 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
         provider=provider.key,
         user=user,
         code_verifier=redirect.code_verifier,
+        connection_generation=generation,
         expires_at=timezone.now()
         + timedelta(seconds=settings.OAUTH_STATE_TTL_SECONDS),
     )
