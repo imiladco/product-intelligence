@@ -1,6 +1,14 @@
 # Milestone 6 — Integration lifecycle: health, reconnect, disconnect, change
 
-Design draft. 2026-09-04. Not implemented; not approved.
+Design draft. 2026-09-04. Revised after review; not implemented; not approved.
+
+**Revision — what the review asked for and where it lives:** a stale-result
+fence, designed and tested against three named races (§9); a recovery model
+keyed on `status` **and** `last_error_code` rather than status alone, with the
+full action matrix (§7.1); a staging checklist that treats grant revocation as
+the destructive, terminal step it is (§17); the §0 terminology corrected to
+Google's *combined authorization for the user and API project*; and an explicit
+rule for which audit event an authorization writes after a disconnect (§8.1).
 
 M4 and M5 got both providers *to* `connected`. M6 is everything that happens
 afterwards: proving a connection still works, repairing it when it does not,
@@ -26,14 +34,19 @@ Verified against current Google documentation on 2026-09-04:
   Google's web-server guide states the new access token "will also cover any
   scopes to which the user previously granted the application access"
   ([web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server)).
-  Scopes accumulate onto **one grant per (client, Google account)**.
 
 Put together: a user who connected GA4 and Search Console with the same Google
-account has **one** Google grant. Revoking on disconnect of one provider would
-break the other — and not only in that project. The same Google account may
-have been used to connect integrations in **other projects and other
-workspaces**. A single disconnect could silently take down connections
-belonging to tenants the acting user cannot even see.
+account holds **one combined authorization for that user and this API project**
+— not merely one grant for one OAuth client. Google's documentation is explicit
+that a combined authorization can span grants obtained through *different
+clients under the same API project*, so the blast radius is wider than a single
+client id would suggest, and wider than this system can see.
+
+Revoking on disconnect of one provider would therefore break the other — and
+not only in that project. The same Google account may have been used to connect
+integrations in **other projects and other workspaces**. A single disconnect
+could silently take down connections belonging to tenants the acting user
+cannot even see.
 
 Worse, we cannot detect the overlap: `google_account_email` is **empty on every
 row** (M4 finding 8 — the granted scopes are `analytics.readonly` and
@@ -293,45 +306,95 @@ repointing it is precisely the repair.
 
 ## 7. Frontend
 
-### 7.1 The action model
+### 7.1 The recovery model
 
-`status.ts` gains two booleans beside the two existing channels, rather than
-overloading either:
+Status alone is not enough. `error` is reached by causes whose repairs have
+nothing to do with each other: a deleted GA4 property and a declined OAuth scope
+both land there, and offering "Try again" — an *authorization* action — for the
+first is simply wrong. The credential is healthy; re-running consent fixes
+nothing and teaches the user that the button does not work.
+
+So recovery is keyed on **`status` + `last_error_code`**, both of which are
+already provider-neutral (M5 §13 checked this: the codes say `resource`,
+`credential`, `scope`, never `property` or `site`).
+
+Error codes are grouped into four **recovery classes**, and the class picks the
+primary action:
+
+| Class | Codes | Primary action | Why |
+|---|---|---|---|
+| `credential` | `credential_refresh_failed`, `no_refresh_token` | **Reconnect** | The grant is gone; only re-authorizing helps |
+| `authorization` | `scope_not_granted`, `token_exchange_failed`, `invalid_state`, `access_denied`, `provider_mismatch`, `oauth_error` | **Try again** | The authorization itself failed or was declined |
+| `resource` | `resource_not_accessible`, `resource_missing` | **Change property** | The credential is fine; what it points at is not |
+| `transient` | `resource_unavailable`, `google_api_error` | **Test connection** | Nothing is broken; the last attempt did not land |
+
+### 7.2 The action matrix
+
+| Status | `last_error_code` | Primary | Also offered | Badge |
+|---|---|---|---|---|
+| `not_connected` | — | Connect | — | Not connected |
+| `pending_authorization` | — | Restart authorization | — | Connecting |
+| `awaiting_resource_selection` | *(none)* | Select property | Disconnect | Select a property |
+| `awaiting_resource_selection` | `resource` class | Select property | Disconnect | Select a property + error note |
+| `connected` | *(none)* | Test connection | Change property, Disconnect | Connected |
+| `connected` | `transient` class | Test connection | Change property, Disconnect | Connected + **muted note** |
+| `error` | `resource` class | **Change property** | Test connection, Disconnect | Error |
+| `error` | `authorization` class | **Try again** | Disconnect | Error |
+| `error` | `credential` class | **Reconnect** | Disconnect | Error |
+| `error` | unknown / empty | Try again | Disconnect | Error |
+| `reauth_required` | any | **Reconnect** | Disconnect | Reauthorization required |
+| `disconnected` | — | Connect | — | Disconnected |
+
+Three rules the matrix encodes, each of which was wrong in the first draft:
+
+1. **A `resource`-class error never offers an OAuth action as its primary.**
+   Re-authorizing a healthy credential is busywork that looks like a fix.
+2. **A transient failure on a `connected` integration offers no destructive
+   recovery.** The badge stays green, the note is muted, and the only action
+   suggested is checking again. Nothing is broken.
+3. **An unknown error code falls back to the state's safe default** rather than
+   guessing. A new backend code that nobody mapped yet degrades to "Try again",
+   never to a wrong-but-confident action, and never to a blank card.
+
+### 7.3 Shape in code
 
 ```ts
+type RecoveryClass = "credential" | "authorization" | "resource" | "transient";
+
+/** Provider-neutral, and the only place a code is interpreted. */
+const RECOVERY_CLASS: Record<string, RecoveryClass> = { … };
+
 interface StatusPresentation {
   label: string;
   variant: BadgeVariant;
   needsAttention: boolean;
-  actionLabel: string | null;             // authorization: Connect / Reconnect / …
+  actionLabel: string | null;              // authorization action, or none
   resourceAction: "select" | "change" | null;
-  canTestConnection: boolean;             // NEW
-  canDisconnect: boolean;                 // NEW
+  canTestConnection: boolean;
+  canDisconnect: boolean;
   note: string | null;
 }
+
+function presentationFor(
+  status: IntegrationStatus,
+  errorCode: string,
+): StatusPresentation;
 ```
 
-| Status | `actionLabel` | `resourceAction` | Test | Disconnect |
-|---|---|---|---|---|
-| `not_connected` | Connect | — | no | no |
-| `pending_authorization` | Restart authorization | — | no | no |
-| `awaiting_resource_selection` | — | select | no | yes |
-| `connected` | — | change | **yes** | **yes** |
-| `error` | Try again | change | yes | yes |
-| `reauth_required` | **Reconnect** | — | no | yes |
-| `disconnected` | Connect | — | no | no |
+`presentationFor` is the single entry point; components never read a status or
+an error code themselves, exactly as `statusPresentation` established in M2.
+Two gates still apply on top, both from data the entry already carries and
+neither naming a provider: `resourceAction` requires
+`entry.supports_resource_selection`, and `canTestConnection` additionally
+requires a selected resource.
 
-Two gates on top, both from data the entry already carries and neither naming a
-provider (the M5 rule):
+**Drift guard.** The frontend map and the backend taxonomy can fall out of step
+silently. §14 pins both ends: a frontend test enumerates every code the map
+handles, and a backend test asserts that the set of error codes that can persist
+on a connection is exactly that set. Adding a code to the taxonomy without
+mapping it fails the backend test, which names the frontend file to update.
 
-- `resourceAction` is suppressed unless `entry.supports_resource_selection`.
-- `canTestConnection` additionally requires a selected resource — there is
-  nothing to test otherwise, and the endpoint would return 409.
-
-`reauth_required` offers no test: the answer is already known, and the action
-that helps is Reconnect.
-
-### 7.2 Components
+### 7.4 Components
 
 - **`TestConnectionButton`** (new, client): posts, then `router.refresh()`.
   Reports the outcome from the returned entry rather than inventing one —
@@ -347,7 +410,7 @@ that helps is Reconnect.
 - **`IntegrationCard`**: renders the action row from the flags above. No new
   provider branching anywhere.
 
-### 7.3 Error and recovery states
+### 7.5 Error and recovery states
 
 The card already renders `last_error_message`. M6 adds the distinction the
 taxonomy makes: a **transient** failure on a `connected` integration renders as
@@ -368,6 +431,33 @@ need the user to do something.
 Both new actions are already declared, and every metadata key is already
 allowlisted: **no new action, no allowlist change, no migration.**
 
+### 8.1 Which event a completed authorization writes
+
+M3 writes `INTEGRATION_AUTHORIZED` unconditionally. M6 makes the choice
+explicit, because "authorized" and "reconnected" are now both reachable and
+writing both would be the paired duplicate invariant 12 forbids.
+
+**Exactly one event per completed authorization, chosen by `previous_status` —
+never by whether a credential row happens to exist:**
+
+| `previous_status` | Event | Reasoning |
+|---|---|---|
+| `reauth_required` | `INTEGRATION_RECONNECTED` | Repairing a live integration whose credential died |
+| `error` | `INTEGRATION_RECONNECTED` | Repairing a live integration whose last authorization failed |
+| `pending_authorization` (or the row was just created) | `INTEGRATION_AUTHORIZED` | A first authorization |
+| `awaiting_resource_selection` | `INTEGRATION_AUTHORIZED` | Re-running an authorization that never finished; nothing was repaired |
+| **`disconnected`** | **`INTEGRATION_AUTHORIZED`** | The user deliberately ended the integration. Authorizing again starts it, it does not repair it — the lifecycle ended and a new one began |
+| `connected` | `INTEGRATION_RECONNECTED` | A voluntary re-authorization of a working integration |
+
+Credential existence is deliberately **not** the discriminator. It is an
+implementation detail that happens to correlate today — a disconnected
+connection has no credential row — and it would give the wrong answer the moment
+credential storage changed. Previous status is the lifecycle fact the event is
+actually about.
+
+This is a change to M3 behaviour on the repair paths, so it is called out in
+§15 and covered by a test rather than left to be noticed.
+
 Deliberately **not** audited: health checks. A user-triggered read that changes
 nothing is not a security event, and auditing every click turns the log into
 noise that hides the events that matter. When a health check *does* transition
@@ -380,7 +470,9 @@ same reason: nothing happened.
 
 ---
 
-## 9. Idempotency and concurrency
+## 9. Idempotency, concurrency, and the stale-result fence
+
+### 9.1 Idempotency
 
 | Operation | Idempotent? | How |
 |---|---|---|
@@ -389,24 +481,124 @@ same reason: nothing happened.
 | Change resource | Yes for the same id | Existing M4 behaviour, unchanged |
 | Reconnect | Yes | Each attempt is its own single-use OAuth state; M3 supersedes older unconsumed requests for the same user+project+provider |
 
-**Concurrency.** Every state-changing operation takes `select_for_update` on the
-connection row for its write, and — as in M4 — the lock is taken **after** the
-outbound call, so a slow Google request never holds a row lock.
+### 9.2 The problem the row lock does not solve
 
-Three races worth naming, all resolved by that lock:
+Every M6 operation has the same shape: read state, call Google, write a result.
+`select_for_update` taken **after** the outbound call prevents torn writes, and
+that is all it prevents. It does nothing about a result that was *computed
+against state that has since changed*. The lock happily commits a stale answer,
+consistently.
 
-- *Disconnect during an in-flight health check.* The check's write re-reads the
-  row under the lock and **must not resurrect a disconnected connection**: if
-  the status is `disconnected` when the lock is acquired, the check's result is
-  discarded. Losing a health result is correct; undoing a user's explicit
-  disconnect is not.
-- *Two concurrent resource changes.* Serialized; last writer wins with a
-  complete, consistent row. Neither can produce a torn mix of one resource's id
-  and another's label, because id, label and metadata are written in one save.
-- *Reconnect racing a health check.* Both end at a status justified by a live
-  call; the lock decides the order, and both write the same kind of state.
+Three races make this concrete, and all three are reachable in normal use:
 
----
+| | Sequence | Wrong outcome without a fence |
+|---|---|---|
+| **A** | Health check reads credential A → reconnect stores credential B → the old check returns 401 | A freshly repaired connection is knocked back to `reauth_required` by a 401 about a credential that no longer exists |
+| **B** | Health check starts against resource A → user changes to resource B → the old check returns 403 for A | A working connection to B is marked `error`, citing a resource it no longer points at |
+| **C** | Reconnect callback is in flight → user disconnects → the callback lands | Credentials are recreated and an explicitly disconnected connection is resurrected |
+
+A and B are one problem: an outbound result must only be applied to the state it
+was computed against. C is a different problem — an authorization *is* the
+user's intent, so it is not stale merely because time passed; it is invalid
+because a later, more explicit intent (disconnect) superseded it.
+
+### 9.3 The fence for A and B — an optimistic-concurrency snapshot
+
+Captured **immediately before the outbound call**, and — crucially — *after* any
+token refresh the operation performs, so an operation never fences out its own
+refresh:
+
+```python
+@dataclass(frozen=True)
+class Fence:
+    """What the outbound result will be about."""
+    connection_updated_at: datetime
+    external_resource_id: str
+    credential_updated_at: datetime | None   # None when no credential is stored
+```
+
+At write time, inside the transaction, after `select_for_update`:
+
+```python
+current = Fence.capture(reread_connection)
+if current != snapshot:
+    return DISCARD          # write nothing at all, not even a timestamp
+```
+
+**Discard means discard.** Not `last_health_check_at`, not an error code,
+nothing. A stale result has no claim on any field, and writing "we checked at
+T" from a check about superseded state would be its own small lie. The operation
+returns the connection's *current* entry, which is the truthful answer to "what
+is the state now".
+
+Why these three fields:
+
+| Field | Catches |
+|---|---|
+| `connection.updated_at` | Every connection mutation — reconnect, resource change, disconnect, another health check. `auto_now`, and every existing save already lists it in `update_fields` (verified across `oauth_service`, `resource_service` and `credentials`), so it already moves on every write |
+| `external_resource_id` | Race B directly and explicitly, rather than inferring it from a timestamp |
+| `credential.updated_at` | Race A directly. A reconnect **reuses** the credential row rather than replacing it, so the primary key is not a discriminator — the timestamp is. `None` covers "the credential was deleted by a disconnect" |
+
+The last two are redundant with the first *if* the `updated_at` convention holds
+everywhere. They are in the fence because that convention is a convention: one
+future `save()` that forgets `updated_at` would silently disable the whole
+fence, and these two fields keep the specific races covered even then. §14 adds
+a test that asserts the convention directly, so the redundancy is a backstop
+rather than the plan.
+
+### 9.4 The fence for C — invalidate outstanding authorizations on disconnect
+
+A timestamp comparison is the wrong tool here. Comparing
+`connection.updated_at` against `oauth_request.created_at` would also discard a
+perfectly good reconnect whose connection merely had a health-check timestamp
+written while the user was at Google — a false positive that throws away work
+the user actually did.
+
+The right tool already exists. `OAuthAuthorizationRequest.consumed_at` is
+documented as meaning *"this request can no longer complete an
+authorization"*, and `start_authorization` already uses it to supersede
+outstanding attempts. **Disconnect does the same:** in the same transaction that
+deletes the credential and sets `disconnected`, it marks every unconsumed
+authorization request for that (project, provider) consumed.
+
+A late callback then fails `_consume_request` and returns `InvalidState` — the
+existing path, the existing error, the existing redirect. No new field, no new
+comparison, and the semantics are the ones already written down.
+
+This also settles the reverse ordering: if the user disconnects and then starts
+a *new* authorization, `start_authorization` supersedes anything older, so the
+stale callback cannot land on top of the new one either.
+
+### 9.5 Race resolution table
+
+| Race | Fenced by | Result |
+|---|---|---|
+| A — stale 401 after reconnect | `credential_updated_at` (and `connection_updated_at`) | Discarded; connection stays `connected` |
+| B — stale 403 after resource change | `external_resource_id` (and `connection_updated_at`) | Discarded; connection stays `connected` on the new resource |
+| C — callback after disconnect | `consumed_at` set by disconnect | `InvalidState`; no credential written, no resurrection |
+| Two concurrent health checks | `connection_updated_at` | The later one discards; losing a redundant health result costs nothing |
+| Two concurrent resource changes | Row lock, then fence | Serialized; the second discards rather than overwriting the first with a result about the old state |
+| Health check racing a resource change it started before | `external_resource_id` | Discarded |
+
+### 9.6 Why this needs no migration — stated as a decision, not a preference
+
+The review's instruction was to propose a version column if correctness needs
+one rather than preserve "no migration" artificially. It does not, and here is
+the reasoning rather than the conclusion:
+
+- A dedicated `version` integer would be a strictly better *token* — monotonic,
+  immune to clock questions, impossible to forget in `update_fields` if the
+  save path increments it deliberately.
+- But `updated_at` already has every property the fence needs here: it changes
+  on every write, it is compared only for **equality** (never ordering, so
+  clock skew and monotonicity do not arise), and the whole comparison happens
+  inside one transaction on one row.
+- The one genuine weakness — a future save that omits `updated_at` — is
+  addressed by the two redundant fields in §9.3 *and* by a direct test (§14).
+
+If implementation finds a case the snapshot cannot express, that is the signal
+to stop and propose the column, with this section rewritten to say why. It is
+not a reason to weaken the fence.
 
 ## 10. Backend service boundaries
 
@@ -540,8 +732,32 @@ including that a transient failure does not change status and does not clear
 `last_successful_check_at`; errors cleared by each of the four clearing events
 and by nothing else.
 
-**Concurrency** — a health-check result is discarded if the row is
-`disconnected` when the lock is taken.
+**Concurrency — the three named races (§9.2), each asserted directly.** The
+outbound call is stubbed to mutate the row before it returns, which reproduces
+the interleaving deterministically without threads:
+
+- *Race A* — a health check whose 401 arrives after a reconnect stored a new
+  credential: the connection stays `connected`, `last_error_code` stays empty,
+  and `last_health_check_at` is **not** written.
+- *Race B* — a health check whose 403 for resource A arrives after the user
+  changed to resource B: the connection stays `connected` on B, with B's label
+  and metadata intact.
+- *Race C* — a disconnect between authorization start and callback: the callback
+  redirects with `invalid_state`, **no** `IntegrationCredential` row is created,
+  and the connection is still `disconnected`. Plus the direct unit assertion
+  that disconnect marks outstanding authorization requests consumed.
+- Two concurrent health checks: the later result discards.
+- A discarded result writes **nothing at all** — asserted field by field, since
+  "discard but still stamp the timestamp" is the tempting wrong implementation.
+
+**The fence convention** — a test asserts that every service function which
+mutates `IntegrationConnection` or `IntegrationCredential` leaves `updated_at`
+strictly greater than it was. This is what makes the `updated_at` component of
+the fence trustworthy rather than conventional (§9.6).
+
+**Recovery classes (§7.1)** — a backend test asserts the set of error codes that
+can persist on a connection equals the set the frontend map handles, and names
+`lib/integrations/status.ts` in its failure message.
 
 **Leakage** — no token, refresh token or Google error text in any response, log
 line or audit row, for every new path.
@@ -552,13 +768,21 @@ unauthenticated 403.
 **Mutation checks before hand-off** — make a transient failure clear
 `last_successful_check_at`; let disconnect blank the credential instead of
 deleting the row; let a failed reconnect verification set `connected`; add a
-revoke call. Each must turn the suite red.
+revoke call; **remove each of the three fence fields in turn**; let a discarded
+result still write `last_health_check_at`; **stop disconnect from consuming
+outstanding authorization requests**; and make `error` always offer the
+authorization action regardless of error class. Each must turn the suite red.
 
-Frontend — the action matrix in §7.1 asserted per status; no test button
-without a selected resource; the disconnect dialog states that access is not
-revoked at Google; a transient error on a `connected` card renders as a note,
-not a destructive alert; no provider-specific branching in any shared component
-(the existing source-scan test extended to the new components).
+Frontend — **the §7.2 matrix asserted row by row**, `status` ×
+`last_error_code`, including that a `resource`-class error offers Change
+property as primary and *not* an authorization action, that an unknown code
+falls back safely, and that a `transient` error on `connected` renders a muted
+note rather than a destructive alert; no test button without a selected
+resource; the disconnect dialog states that access is not revoked at Google and
+that revoking there affects every integration sharing the authorization; the
+recovery map enumerated for the drift guard; no provider-specific branching in
+any shared component (the existing source-scan test extended to the new
+components).
 
 ---
 
@@ -598,6 +822,19 @@ From M5:
 Every one of these has a test today. **The M6 rule is the M5 rule:** those
 tests may change where a symbol was renamed, never where a value is asserted.
 
+### Two M3 behaviours M6 changes deliberately
+
+Called out here rather than discovered in a diff. Both are in
+`complete_authorization`, both are covered by new tests, and neither weakens an
+invariant above:
+
+17. It no longer writes `INTEGRATION_AUTHORIZED` unconditionally — which event
+    is written now depends on `previous_status` (§8.1). Invariant 12 still
+    holds: exactly one event per completed authorization.
+18. It no longer ends unconditionally in `AWAITING_RESOURCE_SELECTION` — a
+    still-valid selection is preserved by re-verifying it (§5.1). Invariant 6
+    still holds: `connected` is reached only via a live successful call.
+
 ---
 
 ## 16. Rollback
@@ -628,61 +865,98 @@ change (M6 introduces no setting), and the two live connections from M4/M5 —
 GA4 on `properties/549483499` (*poolino*) and Search Console on
 `sc-domain:poolinogroup.com` (`siteFullUser`).
 
-**Regression first**
+**Ordering matters in this checklist.** Phases 1–4 are non-destructive and use
+the real account freely. Phase 5 revokes a combined authorization and is
+deliberately last, because it degrades **every** integration sharing it.
+
+### Phase 1 — regression
 
 1. Both integrations still read **Connected** with their existing resources,
    unchanged, before any M6 action.
 
-**Health check**
+### Phase 2 — health check
 
 2. **Test connection** on GA4 → stays Connected; `last_health_check_at` and
    `last_successful_check_at` both advance.
 3. Same for Search Console.
 4. No audit row is written by either check.
 
-**Change property**
+### Phase 3 — change property
 
 5. GA4: change to a different property → Connected on the new one; id, label
    and metadata all change together; one `integration.resource_selected` row.
 6. Change back to `properties/549483499` → Connected, *poolino* restored.
-7. Search Console: change to a different verified site and back, same
-   expectations.
+7. Search Console: change to a different verified site and back.
 8. Attempt a change to an inaccessible identifier → refused, and the existing
    resource is **completely unchanged** (id, label, metadata, both timestamps).
 
-**Reconnect**
+### Phase 4 — disconnect and reconnect (no revocation)
 
-9. Revoke access at `https://myaccount.google.com/permissions`, then **Test
-   connection** → `Reauthorization required`.
-10. **Reconnect** → Google consent → returns to **Connected on the same
-    property, without re-picking**. This is the milestone's headline behaviour.
-11. One `integration.reconnected` row; the stored refresh token is present and
-    still Fernet-encrypted.
+This phase tests **disconnect**, which deletes stored credentials and does
+**not** revoke (§0). That is exactly why GA4 is expected to survive it.
 
-**Disconnect**
+9. **Disconnect** Search Console → status `disconnected`; the
+   `integrations_integrationcredential` row for it is **gone** (`SELECT count(*)`
+   = 0 for that connection); the resource id and label remain;
+   `last_successful_check_at` remains.
+10. Exactly one `integration.disconnected` row.
+11. **GA4 is still Connected with its credential intact.** This is the check
+    that disconnect is correctly scoped — valid precisely because nothing was
+    revoked.
+12. Disconnect again → no change, no second audit row.
+13. Reconnect Search Console → Connected on the remembered site, with **no
+    re-picking**. Audit records `integration.authorized`, not
+    `integration.reconnected`, because the previous status was `disconnected`
+    (§8.1).
 
-12. **Disconnect** Search Console → status `disconnected`; the
-    `integrations_integrationcredential` row for it is **gone** (`SELECT count(*)`
-    = 0 for that connection); the resource id and label remain;
-    `last_successful_check_at` remains.
-13. Exactly one `integration.disconnected` row.
-14. **GA4 is unaffected** — still Connected, credential intact. This is the §0
-    blast-radius check, and the reason disconnect does not revoke.
-15. Disconnect again → no change, no second audit row.
-16. Reconnect Search Console → back to Connected on the remembered site.
+### Phase 5 — DESTRUCTIVE: grant revocation, run last
 
-**Security**
+> **Read before starting.** Revoking at
+> `https://myaccount.google.com/permissions` revokes the **combined
+> authorization for this Google account and API project**, not one integration.
+> Expect **both** GA4 and Search Console to degrade. Do not run this phase
+> unless you are prepared to reconnect both. A disposable Google account is the
+> better option if one is available; with the real account, budget for the full
+> restoration in steps 18–20.
 
-17. API log leak check over the whole session returns **0** for `ya29.`,
+14. Record the current state of both integrations first, so the blast radius can
+    be stated rather than guessed.
+15. Revoke access at `https://myaccount.google.com/permissions`.
+16. **Test connection** on GA4 → `Reauthorization required`, primary action
+    **Reconnect** (§7.2, `credential` class).
+17. **Test connection** on Search Console → also `Reauthorization required`.
+    **This is the expected blast radius**, and confirms §0's reasoning against
+    revoking on disconnect. Record it as an observed result, not an anomaly.
+18. **Reconnect GA4** → Google consent → returns to **Connected on
+    `properties/549483499` (*poolino*) without re-picking**. This is the
+    milestone's headline behaviour.
+19. **Reconnect Search Console** → Connected on `sc-domain:poolinogroup.com`.
+20. Both integrations verified Connected again, with refresh tokens present and
+    Fernet-encrypted. One `integration.reconnected` row each (previous status
+    was `reauth_required`, §8.1).
+
+**Do not report "GA4 unaffected" anywhere in this phase.** After a grant-wide
+revoke GA4 *is* affected; the only true statement is that it was restored in
+step 18. The "unaffected" claim belongs to step 11 and to disconnect alone.
+
+### Phase 6 — security and integrity
+
+21. API log leak check over the whole session returns **0** for `ya29.`,
     `1//`, `client_secret`, `"access_token"`, `"refresh_token"`.
-18. Both credentials Fernet-encrypted; no plaintext tokens in the database.
-19. `makemigrations --check` reports no changes.
+22. Both credentials Fernet-encrypted; no plaintext tokens in the database.
+23. `makemigrations --check` reports no changes.
 
 **Optional observation** — with a spare GA4 property, delete it in Google and
 run **Test connection**, to record what `properties.get` actually returns for a
 trashed property (§2). Not an acceptance gate; a fact worth having.
 
----
+**Concurrency races are not staged.** A and B (§9.2) need two requests
+interleaved at sub-second precision, which a browser cannot reliably produce;
+they are covered by the automated tests in §14 and by mutation checks. Claiming
+them as staging-verified would be false. Race C is observable by hand if wanted:
+start a reconnect, disconnect in a second tab before completing Google consent,
+then finish consent — the callback must land on the projects page with an
+`invalid_state` error and the integration must remain `disconnected`.
 
 ## 18. Hand-off
 
