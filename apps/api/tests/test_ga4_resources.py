@@ -694,10 +694,18 @@ class TestCredentialRefresh:
             access_token_for(connection)
 
     @responses.activate
-    def test_a_rejected_token_during_verification_requires_reauthorization(
+    def test_a_rejected_token_during_verification_writes_no_state(
         self, connected_project
     ):
+        """Replaces the M4 test that pinned reauth_required here (§4.1, §6).
+
+        The response is unchanged — this is still a 409 the user can act on —
+        but a 401 about a *candidate* resource is not a verdict on the stored
+        grant, and selection no longer writes one. The verdict that is about
+        the grant belongs to access_token_for, and it still fires there.
+        """
         client, _user, project, connection = connected_project
+        before_status = connection.status
         stub_property(status=401)
 
         response = client.post(
@@ -707,7 +715,8 @@ class TestCredentialRefresh:
         assert response.status_code == 409
         assert response.data["error"]["code"] == "credential_refresh_failed"
         connection.refresh_from_db()
-        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.status == before_status
+        assert connection.last_error_code == ""
 
 
 # --- Stored state, audit, and leakage ---------------------------------------
@@ -1133,3 +1142,83 @@ class TestRefreshFence:
             access_token_for(connection)
 
         assert not IntegrationCredential.objects.filter(connection=connection).exists()
+
+
+class TestAFailedChangeWritesNothing:
+    """§4.1/§6. A change that fails verification leaves the connection alone.
+
+    The distinction that matters is *where* the 401 came from. Acquiring a
+    token proves something about the stored grant, and the credential lifecycle
+    owns that verdict. A 401 while verifying a **candidate** resource proves
+    only that this change attempt failed: the connection still has the
+    credential it had a moment ago and the selection it had before, and writing
+    `reauth_required` over them would turn a rejected change into a broken
+    integration the user then has to repair.
+    """
+
+    def _connected(self, connection):
+        connection.status = ConnectionStatus.CONNECTED
+        connection.external_resource_id = "properties/111"
+        connection.external_resource_label = "First property"
+        connection.external_resource_meta = {"account": "accounts/1"}
+        connection.last_health_check_at = timezone.now() - timedelta(days=1)
+        connection.last_successful_check_at = timezone.now() - timedelta(days=1)
+        connection.save()
+        connection.refresh_from_db()
+        return connection
+
+    def _snapshot(self, connection):
+        connection.refresh_from_db()
+        return (
+            connection.status,
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+            connection.last_error_code,
+            connection.last_error_message,
+            connection.updated_at,
+        )
+
+    @responses.activate
+    def test_a_401_verifying_the_candidate_leaves_everything_unchanged(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        self._connected(connection)
+        before = self._snapshot(connection)
+        # The stored access token is valid, so no refresh is attempted: this
+        # 401 is Google's answer about the candidate property alone.
+        stub_property(property_id="properties/999", status=401)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_refresh_failed"
+        assert self._snapshot(connection) == before
+
+    @responses.activate
+    def test_a_dead_refresh_grant_still_requires_reauthorization(
+        self, connected_project
+    ):
+        """T05's behaviour, unweakened: this 401 is about the stored grant."""
+        client, _user, project, connection = connected_project
+        self._connected(connection)
+        credential = connection.credential
+        credential.access_token_expires_at = timezone.now() - timedelta(minutes=5)
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh(status=400)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 409
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.last_error_code == "credential_refresh_failed"
+        # The selection is still remembered, so reconnecting restores it.
+        assert connection.external_resource_id == "properties/111"

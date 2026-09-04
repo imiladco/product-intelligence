@@ -571,8 +571,15 @@ class TestParityWithGa4:
         }
 
     @responses.activate
-    def test_a_rejected_token_requires_reauthorization(self, authorized_project):
+    def test_a_rejected_token_writes_no_state(self, authorized_project):
+        """Replaces the M5 test that pinned reauth_required here (§4.1, §6).
+
+        Parity with GA4 in the corrected behaviour as much as in the old one:
+        the 409 is unchanged, and neither provider's selection path writes a
+        verdict about the stored grant from a candidate resource's 401.
+        """
         client, _user, project, connection = authorized_project
+        before_status = connection.status
         stub_site(DOMAIN_SITE, status=401)
 
         response = client.post(
@@ -581,7 +588,8 @@ class TestParityWithGa4:
 
         assert response.status_code == 409
         connection.refresh_from_db()
-        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.status == before_status
+        assert connection.last_error_code == ""
 
 
 # --- Provider independence --------------------------------------------------
@@ -657,3 +665,49 @@ class TestNoLeakage:
             client.post(selection_url(project.pk), {"resource_id": DOMAIN_SITE}, format="json")
 
         assert "access-token-1" not in caplog.text
+
+
+class TestAFailedChangeWritesNothing:
+    """§4.1/§6, for the second provider: the rule is not GA4-specific."""
+
+    def _connected(self, connection):
+        connection.status = ConnectionStatus.CONNECTED
+        connection.external_resource_id = DOMAIN_SITE
+        connection.external_resource_label = DOMAIN_SITE
+        connection.external_resource_meta = {"permission_level": "siteOwner"}
+        connection.last_health_check_at = timezone.now() - timedelta(days=1)
+        connection.last_successful_check_at = timezone.now() - timedelta(days=1)
+        connection.save()
+        connection.refresh_from_db()
+        return connection
+
+    def _snapshot(self, connection):
+        connection.refresh_from_db()
+        return (
+            connection.status,
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+            connection.last_error_code,
+            connection.last_error_message,
+            connection.updated_at,
+        )
+
+    @responses.activate
+    def test_a_401_verifying_the_candidate_leaves_everything_unchanged(
+        self, authorized_project
+    ):
+        client, _user, project, connection = authorized_project
+        self._connected(connection)
+        before = self._snapshot(connection)
+        stub_site(PREFIX_SITE, status=401)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": PREFIX_SITE}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_refresh_failed"
+        assert self._snapshot(connection) == before

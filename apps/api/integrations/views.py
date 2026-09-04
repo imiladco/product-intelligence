@@ -230,7 +230,13 @@ class IntegrationDisconnectView(GoogleApiErrorMixin, APIView):
     Answers 200 even when there was nothing to disconnect. The result the
     caller asked for — not connected, no credential — is already true, and the
     response carries the same entry the page renders either way.
+
+    On the same throttle scope as every other integration endpoint: it is a
+    write on a connection the same rate limit governs, and leaving one view out
+    of the scope is invisible until someone finds it.
     """
+
+    throttle_scope = "integrations"
 
     def post(self, request, project_id, provider):
         project = get_project_for_user(request.user, project_id)

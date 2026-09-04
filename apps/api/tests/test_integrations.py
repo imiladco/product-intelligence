@@ -368,3 +368,30 @@ class TestCredentialNonExposure:
         from integrations.models import IntegrationCredential
 
         assert IntegrationCredential not in admin.site._registry
+
+
+class TestIntegrationEndpointsAreThrottledTogether:
+    """Every endpoint that can reach Google shares one throttle scope.
+
+    These calls spend quota on Google's side, not ours, and a disconnect is no
+    different: it is a write on a connection the same rate limit governs.
+    Leaving one view out is invisible until someone finds it.
+    """
+
+    def test_every_google_touching_view_uses_the_integrations_scope(self):
+        from integrations.views import (
+            IntegrationDisconnectView,
+            IntegrationHealthCheckView,
+            IntegrationResourcesView,
+            IntegrationResourceSelectionView,
+        )
+
+        for view in (
+            IntegrationResourcesView,
+            IntegrationResourceSelectionView,
+            IntegrationHealthCheckView,
+            IntegrationDisconnectView,
+        ):
+            assert getattr(view, "throttle_scope", None) == "integrations", (
+                f"{view.__name__} is not on the integrations throttle scope"
+            )

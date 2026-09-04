@@ -126,12 +126,18 @@ def select_resource(
     connection.refresh_from_db()
     fence = Fence.capture(connection)
 
-    try:
-        selected = catalog.verify_resource(access_token, resource_id)
-    except CredentialRefreshFailed:
-        # Google rejected the token we just refreshed: the grant is gone.
-        mark_reauth_required(connection)
-        raise
+    # Deliberately no except clause. A failed verification writes **nothing**,
+    # including when Google answers 401 (§4.1, §6).
+    #
+    # Where the 401 came from is the whole distinction. Acquiring the token
+    # above proves something about the stored grant, and ``access_token_for``
+    # owns that verdict — a dead refresh token still moves the connection to
+    # reauth_required, under its own fence. A 401 while verifying a *candidate*
+    # resource proves only that this change attempt failed: the connection
+    # still holds the credential it had a moment ago and the selection it had
+    # before, and writing reauth_required over them would turn a rejected
+    # change into a broken integration the user then has to repair.
+    selected = catalog.verify_resource(access_token, resource_id)
 
     return _persist_selection(
         connection=connection, selected=selected, user=user, fence=fence
