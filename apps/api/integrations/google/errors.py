@@ -166,3 +166,15 @@ class ResourceSelectionUnsupported(GoogleApiError):
     code = "resource_selection_unsupported"
     message = "Not found."
     http_status = 404
+
+
+class ResourceMissing(GoogleApiError):
+    """A health check on a connection with nothing selected.
+
+    There is nothing to check, so the check never begins — distinct from a
+    check that ran and found the resource gone.
+    """
+
+    code = "resource_missing"
+    message = "No property is selected for this integration yet."
+    http_status = 409

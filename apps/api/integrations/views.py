@@ -13,6 +13,7 @@ from projects.selectors import get_project_for_user
 from common.errors import error_response
 
 from .google.errors import GoogleApiError, OAuthError
+from .lifecycle_service import health_check
 from .oauth_service import complete_authorization, start_authorization
 from .providers import get_provider
 from .resource_service import discover_resources, select_resource
@@ -188,5 +189,32 @@ class IntegrationResourceSelectionView(GoogleApiErrorMixin, APIView):
             provider_key=provider,
             resource_id=serializer.validated_data["resource_id"],
         )
+        entry = integration_entry_for_provider(project, provider)
+        return Response(IntegrationEntrySerializer(entry).data)
+
+
+class IntegrationHealthCheckView(GoogleApiErrorMixin, APIView):
+    """POST /api/projects/{project_id}/integrations/{provider}/health-check
+
+    Runs the check now, against the resource the connection already points at.
+    The request body is not read at all: an identifier in it would be a way to
+    ask about a resource this connection has not selected.
+
+    A check that *ran* is always a 200 carrying the resulting entry, whatever
+    it found — a dead credential and an unreachable Google are answers, not
+    failures of the endpoint. Only a check that could not begin is a 409.
+
+    POST because it writes: status, both health timestamps and the recorded
+    error are all consequences of running it.
+    """
+
+    throttle_scope = "integrations"
+
+    def post(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        health_check(project=project, provider_key=provider)
         entry = integration_entry_for_provider(project, provider)
         return Response(IntegrationEntrySerializer(entry).data)

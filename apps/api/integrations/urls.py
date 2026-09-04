@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     GoogleOAuthCallbackView,
     IntegrationAuthorizeView,
+    IntegrationHealthCheckView,
     IntegrationResourcesView,
     IntegrationResourceSelectionView,
     ProjectIntegrationsView,
@@ -28,6 +29,11 @@ urlpatterns = [
         "projects/<int:project_id>/integrations/<str:provider>/resource",
         IntegrationResourceSelectionView.as_view(),
         name="integration-resource-selection",
+    ),
+    path(
+        "projects/<int:project_id>/integrations/<str:provider>/health-check",
+        IntegrationHealthCheckView.as_view(),
+        name="integration-health-check",
     ),
     path(
         "integrations/oauth/google/callback",

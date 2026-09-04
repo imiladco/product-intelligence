@@ -425,3 +425,97 @@ class TestSelectionFence:
         assert not AuditEvent.objects.filter(
             action=AuditEvent.Action.INTEGRATION_RESOURCE_SELECTED
         ).exists()
+
+
+class TestHealthCheckFence:
+    """A health-check verdict may only be applied to the state it is about.
+
+    Design §9.5 races A and B. Both stubs make the world move *while the
+    provider is answering*, which is exactly the window a fence exists for: the
+    verdict that comes back is true about a connection that no longer exists.
+    """
+
+    def _connected(self, project, user):
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.CONNECTED,
+            external_resource_id="properties/111",
+            external_resource_label="poolino",
+            granted_scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+            connected_by=user,
+        )
+        IntegrationCredential.objects.create(
+            connection=connection,
+            access_token="access-token-1",
+            refresh_token="refresh-token-1",
+            access_token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        return connection
+
+    def test_stale_provider_401_after_reconnect_is_discarded(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        """Race A: a 401 about a credential that has since been replaced."""
+        from integrations import lifecycle_service
+        from integrations.google.errors import CredentialRefreshFailed
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = self._connected(project, user)
+
+        def reconnect_then_reject(access_token, resource_id):
+            # A reconnect lands: new credential material, connection touched.
+            credential = IntegrationCredential.objects.get(connection=connection)
+            credential.access_token = "access-token-2"
+            credential.refresh_token = "refresh-token-2"
+            credential.save(
+                update_fields=["access_token", "refresh_token", "updated_at"]
+            )
+            raise CredentialRefreshFailed
+
+        catalog = get_provider(ProviderKey.GA4).resources
+        monkeypatch.setattr(catalog, "verify_resource", reconnect_then_reject)
+
+        lifecycle_service.health_check(project=project, provider_key=ProviderKey.GA4)
+
+        connection.refresh_from_db()
+        # The repaired connection is untouched — not even a health timestamp.
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.last_error_code == ""
+        assert connection.last_health_check_at is None
+
+    def test_stale_403_after_resource_change_is_discarded(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        """Race B: a 403 about a resource this connection no longer points at."""
+        from integrations import lifecycle_service
+        from integrations.google.errors import ResourceNotAccessible
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = self._connected(project, user)
+
+        def change_resource_then_reject(access_token, resource_id):
+            newer = IntegrationConnection.objects.get(pk=connection.pk)
+            newer.external_resource_id = "properties/222"
+            newer.external_resource_label = "Newer"
+            newer.save(
+                update_fields=[
+                    "external_resource_id",
+                    "external_resource_label",
+                    "updated_at",
+                ]
+            )
+            raise ResourceNotAccessible
+
+        catalog = get_provider(ProviderKey.GA4).resources
+        monkeypatch.setattr(catalog, "verify_resource", change_resource_then_reject)
+
+        lifecycle_service.health_check(project=project, provider_key=ProviderKey.GA4)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == "properties/222"
+        assert connection.last_error_code == ""
+        assert connection.last_health_check_at is None

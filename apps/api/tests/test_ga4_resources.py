@@ -474,17 +474,6 @@ class TestScopeReductions:
             connection.last_successful_check_at,
         ) == before
 
-    def test_there_is_no_health_check_endpoint_in_this_milestone(
-        self, connected_project
-    ):
-        client, _user, project, _connection = connected_project
-
-        response = client.post(
-            f"/api/projects/{project.pk}/integrations/ga4/health-check", format="json"
-        )
-
-        assert response.status_code == 404
-
 
 # --- Credential refresh ------------------------------------------------------
 
