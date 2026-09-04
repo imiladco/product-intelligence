@@ -52,15 +52,15 @@ describe("StatusBadge", () => {
     ]);
   });
 
-  it("offers the property picker in exactly one state", () => {
-    // Choosing a property is only meaningful once Google has authorized and
-    // before anything is selected. Changing an existing selection is a later
-    // milestone, so connected offers nothing here.
+  it("distinguishes choosing a property from changing one", () => {
+    // Replaces the M2 assertion that connected offered no resource action at
+    // all: changing a selection is this milestone's (§6), and the two are kept
+    // as different actions because they read differently to the user.
     const selectable = ALL_STATUSES.filter(
       (status) => statusPresentation(status).resourceAction === "select",
     );
     expect(selectable).toEqual(["awaiting_resource_selection"]);
-    expect(statusPresentation("connected").resourceAction).toBeNull();
+    expect(statusPresentation("connected").resourceAction).toBe("change");
   });
 
   it("keeps the authorization and resource actions separate", () => {

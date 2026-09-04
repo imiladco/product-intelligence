@@ -181,7 +181,7 @@ describe("IntegrationCard after OAuth", () => {
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
   });
 
-  it("offers Reauthorize when authorization has become invalid", () => {
+  it("offers Reconnect when authorization has become invalid", () => {
     render(
       <IntegrationCard
         projectId={1}
@@ -191,7 +191,9 @@ describe("IntegrationCard after OAuth", () => {
         })}
       />,
     );
-    expect(screen.getByRole("button", { name: "Reauthorize" })).toBeEnabled();
+    // "Reconnect" from M6 on: the recovery matrix names one action for a dead
+    // grant, and it is the same word wherever that state is reached (§7.2).
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
   });
 
   it("keeps failure states useful", () => {
@@ -244,8 +246,10 @@ describe("IntegrationCard action semantics", () => {
     expect(statusesOffering("Connect")).toEqual(["not_connected", "disconnected"]);
   });
 
-  it("never offers a generic Reconnect", () => {
-    expect(statusesOffering("Reconnect")).toEqual([]);
+  it("offers Reconnect only where the grant itself is gone", () => {
+    // Replaces the M2 assertion that no state offered it: M6 makes reconnect
+    // real, and it is the credential-class recovery and nothing else (§7.1).
+    expect(statusesOffering("Reconnect")).toEqual(["reauth_required"]);
   });
 
   it("does not invite re-authorizing after a successful authorization", () => {

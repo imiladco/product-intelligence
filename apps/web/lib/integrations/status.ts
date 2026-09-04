@@ -2,7 +2,40 @@ import type { IntegrationStatus } from "@/lib/api/types";
 
 type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
 
-interface StatusPresentation {
+/**
+ * What kind of repair an error needs (§7.1).
+ *
+ * `error` is reached by causes whose fixes have nothing to do with each other:
+ * a deleted property and a declined OAuth scope both land there, and offering
+ * an authorization action for the first is busywork that looks like a fix. So
+ * recovery is keyed on status *and* error code, and the code is interpreted
+ * here and nowhere else.
+ */
+export type RecoveryClass = "credential" | "authorization" | "resource" | "transient";
+
+/**
+ * The only place an error code is interpreted.
+ *
+ * Provider-neutral by construction: every code names a credential, an
+ * authorization or a resource, never a property or a site — which is what lets
+ * one map serve both providers.
+ */
+export const RECOVERY_CLASS: Record<string, RecoveryClass> = {
+  credential_refresh_failed: "credential",
+  no_refresh_token: "credential",
+  scope_not_granted: "authorization",
+  token_exchange_failed: "authorization",
+  invalid_state: "authorization",
+  access_denied: "authorization",
+  provider_mismatch: "authorization",
+  oauth_error: "authorization",
+  resource_not_accessible: "resource",
+  resource_missing: "resource",
+  resource_unavailable: "transient",
+  google_api_error: "transient",
+};
+
+export interface StatusPresentation {
   /** Concise user-facing label. */
   label: string;
   variant: BadgeVariant;
@@ -11,28 +44,47 @@ interface StatusPresentation {
   /**
    * Label for the authorization action, or null when this state offers none.
    *
-   * Only authorization actions live here. Reconnect and disconnect for a
-   * healthy connection are a later milestone, and a state that already has
-   * what it needs from Google must not invite the user to re-authorize.
+   * Only authorization actions live here. A state whose credential is fine
+   * must not invite the user to re-authorize: it fixes nothing and teaches
+   * them the button does not work.
    */
   actionLabel: string | null;
   /**
    * Whether this state offers a resource action, and which one.
    *
-   * A separate channel from `actionLabel` on purpose: that one is for
-   * authorization, and the two are not interchangeable — a connection can need
-   * a property chosen without needing to be authorized again.
-   *
-   * Only "select" exists today. Changing an existing selection arrives with
-   * reconnect and disconnect, so a connected integration offers nothing here.
+   * A separate channel from `actionLabel` on purpose: a connection can need a
+   * property chosen without needing to be authorized again, and no state ever
+   * offers both.
    */
-  resourceAction: "select" | null;
+  resourceAction: "select" | "change" | null;
+  /** Whether an on-demand health check makes sense here. */
+  canTestConnection: boolean;
+  /** Whether there is anything to disconnect. */
+  canDisconnect: boolean;
+  /**
+   * Which of the offered actions is the primary one.
+   *
+   * The flags above say what is *possible*; this says what to emphasize, which
+   * the flags cannot express on their own — a connected card and a
+   * resource-class error both offer Test connection and Change property, and
+   * they lead with different ones.
+   */
+  primary: "authorization" | "resource" | "test" | null;
+  /**
+   * How a recorded error should read, or null when there is nothing to show.
+   *
+   * A transient failure on a working integration is a muted note beside a
+   * still-green badge, not a destructive alert (§7.5). Components take this
+   * from here rather than comparing codes themselves.
+   */
+  errorTone: "destructive" | "muted" | null;
   /** Truthful note about what is not possible yet, or null. */
   note: string | null;
 }
 
 /**
- * The single mapping from status to how it reads in the UI.
+ * The single mapping from status to how it reads in the UI, before any error
+ * code is taken into account.
  *
  * Centralized on purpose: components ask this module, and never compare status
  * strings themselves, so adding or renaming a state is one edit.
@@ -44,6 +96,10 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     needsAttention: false,
     actionLabel: "Connect",
     resourceAction: null,
+    canTestConnection: false,
+    canDisconnect: false,
+    primary: "authorization",
+    errorTone: null,
     note: null,
   },
   pending_authorization: {
@@ -57,6 +113,10 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     // successfully connected yet.
     actionLabel: "Restart authorization",
     resourceAction: null,
+    canTestConnection: false,
+    canDisconnect: false,
+    primary: "authorization",
+    errorTone: null,
     note: "Waiting for Google. If that window was closed, start again.",
   },
   awaiting_resource_selection: {
@@ -67,16 +127,22 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     // property, so this state must not invite re-authorizing.
     actionLabel: null,
     resourceAction: "select",
+    canTestConnection: false,
+    canDisconnect: true,
+    primary: "resource",
+    errorTone: null,
     note: null,
   },
   connected: {
     label: "Connected",
     variant: "default",
     needsAttention: false,
-    // Reconnect, disconnect and changing the selected property for a healthy
-    // connection all arrive later. A connected card offers no action at all.
     actionLabel: null,
-    resourceAction: null,
+    resourceAction: "change",
+    canTestConnection: true,
+    canDisconnect: true,
+    primary: "test",
+    errorTone: null,
     note: null,
   },
   error: {
@@ -85,14 +151,22 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     needsAttention: true,
     actionLabel: "Try again",
     resourceAction: null,
+    canTestConnection: false,
+    canDisconnect: true,
+    primary: "authorization",
+    errorTone: "destructive",
     note: null,
   },
   reauth_required: {
     label: "Reauthorization required",
     variant: "destructive",
     needsAttention: true,
-    actionLabel: "Reauthorize",
+    actionLabel: "Reconnect",
     resourceAction: null,
+    canTestConnection: false,
+    canDisconnect: true,
+    primary: "authorization",
+    errorTone: "destructive",
     note: null,
   },
   disconnected: {
@@ -101,6 +175,10 @@ const PRESENTATION: Record<IntegrationStatus, StatusPresentation> = {
     needsAttention: false,
     actionLabel: "Connect",
     resourceAction: null,
+    canTestConnection: false,
+    canDisconnect: false,
+    primary: "authorization",
+    errorTone: null,
     note: null,
   },
 };
@@ -111,6 +189,10 @@ const FALLBACK: StatusPresentation = {
   needsAttention: false,
   actionLabel: null,
   resourceAction: null,
+  canTestConnection: false,
+  canDisconnect: false,
+  primary: null,
+  errorTone: null,
   note: null,
 };
 
@@ -122,4 +204,75 @@ export function statusPresentation(status: IntegrationStatus): StatusPresentatio
 
 export function statusLabel(status: IntegrationStatus): string {
   return statusPresentation(status).label;
+}
+
+/**
+ * How a state reads once its recorded error is taken into account (§7.2).
+ *
+ * The single entry point for recovery: components read the flags it returns
+ * and never a status or an error code of their own. An unmapped code falls
+ * back to the state's own default rather than guessing — a new backend code
+ * degrades to "Try again", never to a wrong-but-confident action.
+ */
+export function presentationFor(
+  status: IntegrationStatus,
+  errorCode: string,
+): StatusPresentation {
+  const base = statusPresentation(status);
+  const recovery = RECOVERY_CLASS[errorCode];
+  if (recovery === undefined) {
+    return base;
+  }
+
+  switch (recovery) {
+    case "credential":
+      // The grant is gone; only re-authorizing helps, and nothing else offered
+      // here would do anything.
+      return {
+        ...base,
+        actionLabel: "Reconnect",
+        resourceAction: null,
+        canTestConnection: false,
+        primary: "authorization",
+        errorTone: base.errorTone ?? "destructive",
+      };
+
+    case "authorization":
+      // The authorization itself failed or was declined. Retrying it is the
+      // fix; the resource is not the problem and must not be offered as one.
+      return {
+        ...base,
+        actionLabel: "Try again",
+        resourceAction: null,
+        canTestConnection: false,
+        primary: "authorization",
+        errorTone: base.errorTone ?? "destructive",
+      };
+
+    case "resource":
+      // The credential is fine; what it points at is not. Re-authorizing a
+      // healthy credential is busywork that looks like a fix, so the picker is
+      // primary and no authorization action is offered at all.
+      return {
+        ...base,
+        actionLabel: null,
+        resourceAction: "change",
+        canTestConnection: true,
+        primary: "resource",
+        errorTone: base.errorTone ?? "destructive",
+      };
+
+    case "transient":
+      // Nothing is broken; the last attempt did not land. Checking again is
+      // the only thing worth suggesting, and the state keeps its own badge —
+      // a blip on a working integration stays green.
+      return {
+        ...base,
+        actionLabel: null,
+        resourceAction: base.resourceAction === null ? null : "change",
+        canTestConnection: true,
+        primary: "test",
+        errorTone: base.errorTone ?? "muted",
+      };
+  }
 }
