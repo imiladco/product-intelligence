@@ -59,20 +59,47 @@ class AuthorizationStart:
 
 
 def _needs_forced_consent(connection: IntegrationConnection | None) -> bool:
-    """True only when a new refresh token must actually be acquired.
+    """True unless we hold a refresh token we have no reason to distrust.
 
-    Never true for a first connection: Google issues a refresh token on the
-    first authorization for a client/account/scope combination anyway, and
-    forcing re-consent every time is user-hostile for no gain.
+    The rule is local capability, not "is this the first time":
 
-    The signal is connection state, not the presence of an empty credential
-    row — a failed authorization stores no credential at all (see
-    ``_store_credentials``), so there is no blank row to read.
+        Can this authorization preserve an existing refresh token?
+        If not, it must guarantee acquiring a new one.
+
+    M3 asked the wrong question. It assumed a new connection row meant a first
+    authorization of this Google account for this application, and skipped
+    consent on that basis. A new row proves only that *this project* has not
+    connected this provider. The same account may already have authorized us
+    through another project or workspace, and Google may then return no
+    ``refresh_token`` at all — so a *first* connection fails on NoRefreshToken
+    exactly as a post-disconnect one does. This system deliberately holds no
+    Google identity, so it cannot detect that; it does not need to, because the
+    local question is always answerable.
+
+    A genuinely first authorization pays nothing for this: Google shows a
+    consent screen for newly requested scopes regardless, so ``prompt=consent``
+    changes nothing the user sees. Offline access is a hard requirement — the
+    backend reaches the provider with no user present — and old behaviour is not
+    preserved for being old when it cannot guarantee it.
     """
     if connection is None:
-        return False
-    if connection.status == ConnectionStatus.REAUTH_REQUIRED:
+        # Nothing stored means nothing to preserve.
         return True
+
+    # Redundant with the credential check below, because disconnect deletes the
+    # credential row and a dead grant is still stored. Kept deliberately, so a
+    # future change to *how* those states clear credentials cannot silently
+    # remove forced consent.
+    if connection.status in (
+        ConnectionStatus.REAUTH_REQUIRED,
+        ConnectionStatus.DISCONNECTED,
+    ):
+        return True
+
+    credential = IntegrationCredential.objects.filter(connection=connection).first()
+    if credential is None or not credential.refresh_token:
+        return True
+
     # The previous attempt ended because Google returned no refresh token and
     # none was stored. Re-consent is the documented way to obtain one.
     return (

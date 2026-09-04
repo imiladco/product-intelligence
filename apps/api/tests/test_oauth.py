@@ -122,8 +122,14 @@ class TestAuthorizationStart:
         assert params["access_type"] == ["offline"]
         assert params["include_granted_scopes"] == ["true"]
         assert params["state"]
-        # Not forced on a normal first authorization.
-        assert "prompt" not in params
+        # Forced even on a first authorization (design §5.3.2, changed in M6).
+        # A new connection row proves only that this project has not connected
+        # this provider; the same Google account may already have authorized
+        # this application elsewhere, in which case Google can return no
+        # refresh token and the first connection fails. Consent is shown for new
+        # scopes anyway, so this costs the user nothing.
+        # Full table: TestForcedConsentIsKeyedOnCapability.
+        assert params["prompt"] == ["consent"]
 
     def test_requests_only_the_providers_own_scope(self, signed_in_client, make_project):
         """Each provider is independently authorizable."""
@@ -1138,3 +1144,147 @@ class TestRestartingAnAbandonedAuthorization:
         assert IntegrationConnection.objects.get().status == (
             ConnectionStatus.AWAITING_RESOURCE_SELECTION
         )
+
+
+class TestForcedConsentIsKeyedOnCapability:
+    """prompt=consent whenever no stored refresh token can be preserved.
+
+    Design §5.3.1-§5.3.2. The predicate M3 shipped assumed a new connection row
+    meant a first authorization of that Google account for this application.
+    It does not: the same account may already have authorized us through
+    another project or workspace, in which case Google can return no
+    refresh_token at all and the *first* connection fails on NoRefreshToken.
+
+    This system deliberately holds no Google identity, so it cannot ask whether
+    a prior grant exists. The question it can always answer is local: can this
+    authorization preserve a refresh token we already hold? If not, it must
+    guarantee acquiring one.
+    """
+
+    def _prompt(self, client, project, provider="ga4"):
+        response = authorize(client, project, provider)
+        assert response.status_code == 200, response.data
+        params = parse_qs(urlparse(response.data["authorization_url"]).query)
+        return params.get("prompt")
+
+    def _connection(self, project, **kwargs):
+        return IntegrationConnection.objects.create(
+            project=project, provider=ProviderKey.GA4, **kwargs
+        )
+
+    def _credential(self, connection, refresh_token="refresh-token-1"):
+        return IntegrationCredential.objects.create(
+            connection=connection,
+            access_token="access-token-1",
+            refresh_token=refresh_token,
+        )
+
+    # --- consent IS forced ---------------------------------------------------
+
+    def test_no_connection_row(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_connection_without_a_credential(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(project, status=ConnectionStatus.PENDING_AUTHORIZATION)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_stored_refresh_token_is_empty(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.CONNECTED)
+        self._credential(connection, refresh_token="")
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_disconnected(self, signed_in_client, make_project):
+        """Our token is gone; Google's consent is not."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(project, status=ConnectionStatus.DISCONNECTED)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_reauth_required(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.REAUTH_REQUIRED)
+        self._credential(connection)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_error_with_no_refresh_token(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(
+            project,
+            status=ConnectionStatus.ERROR,
+            last_error_code="no_refresh_token",
+        )
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_second_project_first_connection_still_forces_consent(
+        self, signed_in_client, make_project
+    ):
+        """The case M3 could not see.
+
+        A credential for the same provider already exists in another project —
+        so the same Google account may well have authorized this application
+        already — and this connection has none of its own. The predicate reads
+        *this* connection's credential, not the database at large.
+        """
+        client, _user, workspace = signed_in_client
+        other_project = make_project(workspace, name="Other", website_url="https://o.example")
+        other_connection = IntegrationConnection.objects.create(
+            project=other_project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.CONNECTED,
+        )
+        self._credential(other_connection)
+        fresh_project = make_project(workspace, name="Fresh", website_url="https://f.example")
+
+        assert self._prompt(client, fresh_project) == ["consent"]
+
+    # --- consent is NOT forced ----------------------------------------------
+
+    def test_connected_with_a_usable_refresh_token(self, signed_in_client, make_project):
+        """A working token is preserved; re-consent would be noise."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.CONNECTED)
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
+
+    def test_awaiting_resource_selection_with_a_refresh_token(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(
+            project, status=ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
+
+    def test_error_with_another_code_and_an_intact_credential(
+        self, signed_in_client, make_project
+    ):
+        """The credential is not the problem, so do not re-consent."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(
+            project,
+            status=ConnectionStatus.ERROR,
+            last_error_code="scope_not_granted",
+        )
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
