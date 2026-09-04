@@ -325,7 +325,10 @@ describe("IntegrationCard action semantics", () => {
     vi.unstubAllGlobals();
   });
 
-  it("adds no reconnect or disconnect action to a connected integration", () => {
+  it("lets a connected integration be checked, and still offers no OAuth action", () => {
+    // Replaces the M2 assertion that a connected card had no actions at all.
+    // Testing a connection is non-destructive and is what a healthy card leads
+    // with (§7.2); re-authorizing a working credential is still not offered.
     render(
       <IntegrationCard
         projectId={1}
@@ -333,8 +336,29 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+  });
+
+  it("offers no check when nothing is selected to check", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({
+            status: "awaiting_resource_selection",
+            external_resource_id: "",
+            external_resource_label: "",
+          }),
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
   });
 });
 

@@ -1,9 +1,10 @@
 import { ConnectButton } from "@/components/integrations/connect-button";
 import { ResourcePickerDialog } from "@/components/integrations/resource-picker-dialog";
 import { StatusBadge } from "@/components/integrations/status-badge";
+import { TestConnectionButton } from "@/components/integrations/test-connection-button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
-import { statusPresentation } from "@/lib/integrations/status";
+import { presentationFor } from "@/lib/integrations/status";
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Never";
@@ -29,7 +30,13 @@ export function IntegrationCard({
   projectId: number | string;
 }) {
   const { connection } = entry;
-  const { actionLabel, note, ...presentation } = statusPresentation(entry.status);
+  // Status and the recorded error code together: `error` is reached by causes
+  // whose repairs have nothing to do with each other, so the action offered is
+  // keyed on both. The card reads neither itself — it asks the recovery model.
+  const { actionLabel, note, ...presentation } = presentationFor(
+    entry.status,
+    connection?.last_error_code ?? "",
+  );
   // Two independent questions, and the action needs a yes to both: does this
   // state call for choosing a resource, and can this provider offer any? The
   // status mapping answers only the first — it knows nothing about providers —
@@ -37,6 +44,11 @@ export function IntegrationCard({
   // catalog. Read from the entry, so no provider is named here.
   const resourceAction =
     entry.supports_resource_selection ? presentation.resourceAction : null;
+  // Checking a connection means asking the provider about the resource it
+  // points at, so with nothing selected there is nothing to check. Both gates
+  // come from the entry itself; neither names a provider.
+  const canTestConnection =
+    presentation.canTestConnection && Boolean(connection?.external_resource_id);
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -77,7 +89,7 @@ export function IntegrationCard({
         {/* Which action a state offers comes from the status mapping, so the
             card never invents one. A state that already has what it needs from
             Google offers no authorization action at all. */}
-        {actionLabel || resourceAction || note ? (
+        {actionLabel || resourceAction || canTestConnection || note ? (
           <div className="flex items-center gap-3">
             {actionLabel ? (
               <ConnectButton
@@ -85,6 +97,12 @@ export function IntegrationCard({
                 provider={entry.provider}
                 label={actionLabel}
                 variant={entry.status === "not_connected" ? "default" : "outline"}
+              />
+            ) : null}
+            {canTestConnection ? (
+              <TestConnectionButton
+                projectId={projectId}
+                provider={entry.provider}
               />
             ) : null}
             {resourceAction === "select" ? (
