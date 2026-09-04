@@ -1,4 +1,5 @@
 import { ConnectButton } from "@/components/integrations/connect-button";
+import { DisconnectDialog } from "@/components/integrations/disconnect-dialog";
 import { ResourcePickerDialog } from "@/components/integrations/resource-picker-dialog";
 import { StatusBadge } from "@/components/integrations/status-badge";
 import { TestConnectionButton } from "@/components/integrations/test-connection-button";
@@ -89,7 +90,11 @@ export function IntegrationCard({
         {/* Which action a state offers comes from the status mapping, so the
             card never invents one. A state that already has what it needs from
             Google offers no authorization action at all. */}
-        {actionLabel || resourceAction || canTestConnection || note ? (
+        {actionLabel ||
+        resourceAction ||
+        canTestConnection ||
+        presentation.canDisconnect ||
+        note ? (
           <div className="flex items-center gap-3">
             {actionLabel ? (
               <ConnectButton
@@ -117,6 +122,13 @@ export function IntegrationCard({
                 triggerLabel={
                   resourceAction === "change" ? "Change property" : "Choose property"
                 }
+              />
+            ) : null}
+            {presentation.canDisconnect ? (
+              <DisconnectDialog
+                projectId={projectId}
+                provider={entry.provider}
+                providerName={entry.display_name}
               />
             ) : null}
             {note ? (

@@ -263,10 +263,12 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    // The one action offered is choosing a property. Authorization already
-    // succeeded, so nothing here suggests doing it again.
-    expect(screen.getAllByRole("button")).toHaveLength(1);
+    // Authorization already succeeded, so nothing here suggests doing it
+    // again. Choosing a property and ending the integration are the two
+    // actions this state offers (§7.2); neither is an authorization action.
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeEnabled();
+    expect(screen.getAllByRole("button")).toHaveLength(2);
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
   });
 
@@ -404,7 +406,10 @@ describe("IntegrationCard resource action capability", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    // Disconnect is offered here from M6 on; the picker is what must not be.
+    expect(
+      screen.queryByRole("button", { name: /property/i }),
+    ).not.toBeInTheDocument();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
   });
 
@@ -478,4 +483,41 @@ describe("IntegrationCard changing a selection", () => {
       screen.queryByRole("button", { name: "Change property" }),
     ).not.toBeInTheDocument();
   });
+});
+
+describe("IntegrationCard ending an integration", () => {
+  it.each([
+    ["awaiting_resource_selection"],
+    ["connected"],
+    ["error"],
+    ["reauth_required"],
+  ] as const)("offers Disconnect while %s", (status) => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status, connection: connection({ status }) })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeEnabled();
+  });
+
+  it.each([["not_connected"], ["disconnected"], ["pending_authorization"]] as const)(
+    "offers nothing to disconnect while %s",
+    (status) => {
+      render(
+        <IntegrationCard
+          projectId={1}
+          entry={entry({
+            status,
+            connection: status === "not_connected" ? null : connection({ status }),
+          })}
+        />,
+      );
+
+      expect(
+        screen.queryByRole("button", { name: "Disconnect" }),
+      ).not.toBeInTheDocument();
+    },
+  );
 });
