@@ -28,6 +28,7 @@ function entry(overrides: Partial<IntegrationEntry> = {}): IntegrationEntry {
     description: "Connect a GA4 property.",
     status: "not_connected",
     connection: null,
+    supports_resource_selection: true,
     ...overrides,
   };
 }
@@ -330,5 +331,67 @@ describe("IntegrationCard action semantics", () => {
 
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+  });
+});
+
+describe("IntegrationCard resource action capability", () => {
+  /**
+   * Connection status says where a connection is; it says nothing about what
+   * the provider can do. Gating the picker on status alone offered a button
+   * that 404s for a provider with no resource discovery — which is what a
+   * Search Console connection did from the moment it reached
+   * awaiting_resource_selection.
+   */
+  it("does not render the picker for a connected provider without a catalog", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "connected",
+          connection: connection({ status: "connected" }),
+          supports_resource_selection: false,
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Choose property" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+  });
+
+  it("does not render the picker while awaiting selection on such a provider", () => {
+    // The state that most invites the action is exactly where the broken
+    // button appeared, so it is the case worth pinning.
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          provider: "search_console",
+          display_name: "Google Search Console",
+          status: "awaiting_resource_selection",
+          connection: connection({ status: "awaiting_resource_selection" }),
+          supports_resource_selection: false,
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
+  });
+
+  it("still renders the picker when the provider supports selection", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({ status: "awaiting_resource_selection" }),
+          supports_resource_selection: true,
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
   });
 });

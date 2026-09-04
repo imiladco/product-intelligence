@@ -18,6 +18,14 @@ class IntegrationEntry:
     description: str
     status: str
     connection: IntegrationConnection | None
+    #: Whether this provider can list and verify resources at all.
+    #:
+    #: Connection status says where a connection is in its lifecycle; it says
+    #: nothing about what the provider can do. The two are independent, and the
+    #: UI needs both: a provider with no catalog has no resource selection no
+    #: matter how healthy its connection is, and offering the action anyway
+    #: produces a button that cannot work.
+    supports_resource_selection: bool
 
 
 def _entry(
@@ -31,6 +39,9 @@ def _entry(
         # synthesized here and never written to the database.
         status=connection.status if connection is not None else NOT_CONNECTED,
         connection=connection,
+        # Read from the catalog itself, so the frontend never keeps its own
+        # idea of which providers support what.
+        supports_resource_selection=provider.resources is not None,
     )
 
 

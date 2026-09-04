@@ -29,7 +29,14 @@ export function IntegrationCard({
   projectId: number | string;
 }) {
   const { connection } = entry;
-  const { actionLabel, resourceAction, note } = statusPresentation(entry.status);
+  const { actionLabel, note, ...presentation } = statusPresentation(entry.status);
+  // Two independent questions, and the action needs a yes to both: does this
+  // state call for choosing a resource, and can this provider offer any? The
+  // status mapping answers only the first — it knows nothing about providers —
+  // so gating on it alone renders a picker that 404s for a provider without a
+  // catalog. Read from the entry, so no provider is named here.
+  const resourceAction =
+    entry.supports_resource_selection ? presentation.resourceAction : null;
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -84,6 +91,7 @@ export function IntegrationCard({
               <ResourcePickerDialog
                 projectId={projectId}
                 provider={entry.provider}
+                providerName={entry.display_name}
               />
             ) : null}
             {note ? (

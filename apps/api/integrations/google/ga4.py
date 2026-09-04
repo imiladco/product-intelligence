@@ -29,9 +29,11 @@ from dataclasses import dataclass
 import requests
 from django.conf import settings
 
+from ..resources import RemoteResource, ResourceListing
 from .errors import (
     CredentialRefreshFailed,
     GoogleApiError,
+    InvalidResourceId,
     ResourceNotAccessible,
     ResourceUnavailable,
 )
@@ -57,40 +59,42 @@ def is_valid_property_id(value: str) -> bool:
     return bool(PROPERTY_ID_RE.match(value or ""))
 
 
-@dataclass(frozen=True)
-class Ga4Property:
-    """One GA4 property, as this project sees it.
+def normalize_resource_id(resource_id: str) -> str:
+    """The canonical form of a submitted property identifier.
 
-    ``id`` is the immutable identifier Google issues; ``label`` is Google's own
-    display name. Neither is ever taken from a client request.
+    GA4 identifiers are already canonical, so this validates and returns the
+    input unchanged. It raises rather than returning a boolean because the
+    caller has nothing useful to do with False except raise this.
     """
-
-    id: str
-    label: str
-    account_id: str
-    account_label: str
-    property_type: str
-
-    def as_metadata(self) -> dict[str, str]:
-        """The small, non-sensitive subset worth storing on a connection.
-
-        Deliberately minimal: a stable identifier and one display field, both
-        read straight from the verification response. No timestamp — the health
-        fields already record when this was verified, and two records of one
-        fact can disagree. No raw response object.
-        """
-        metadata = {"account": self.account_id}
-        if self.property_type:
-            metadata["property_type"] = self.property_type
-        return metadata
+    if not is_valid_property_id(resource_id):
+        raise InvalidResourceId
+    return resource_id
 
 
-@dataclass(frozen=True)
-class Ga4PropertyPage:
-    """Everything the picker needs: the properties, and whether we stopped early."""
+def _property(
+    *, property_id: str, label: str, account_id: str, account_label: str, property_type: str
+) -> RemoteResource:
+    """A GA4 property as a provider-neutral resource.
 
-    properties: tuple[Ga4Property, ...]
-    truncated: bool
+    The stored metadata is built here and only here: a stable account
+    identifier and one display field, both read straight from Google. No
+    timestamp — the health fields already record when this was verified, and
+    two records of one fact can disagree. No raw response object.
+
+    ``account`` and ``property_type`` are GA4's words, so they stay GA4's
+    problem: they are *values* inside an opaque mapping and a neutral
+    ``resource_type``, never names the shared layer has to know.
+    """
+    metadata = {"account": account_id}
+    if property_type:
+        metadata["property_type"] = property_type
+    return RemoteResource(
+        id=property_id,
+        label=label,
+        resource_type=property_type,
+        group_label=account_label,
+        metadata=metadata,
+    )
 
 
 def _url(path: str) -> str:
@@ -139,7 +143,7 @@ def _get(url: str, *, access_token: str, params: dict | None = None) -> dict:
 
 
 def _property_from_summary(summary: dict, *, account_id: str, account_label: str):
-    """Build a Ga4Property from one propertySummaries[] entry, or None.
+    """Build a resource from one propertySummaries[] entry, or None.
 
     A summary missing its identifier is skipped rather than raised on: one
     malformed entry must not cost the user the whole list.
@@ -147,8 +151,8 @@ def _property_from_summary(summary: dict, *, account_id: str, account_label: str
     property_id = summary.get("property") or ""
     if not is_valid_property_id(property_id):
         return None
-    return Ga4Property(
-        id=property_id,
+    return _property(
+        property_id=property_id,
         label=summary.get("displayName") or property_id,
         account_id=account_id,
         account_label=account_label,
@@ -156,9 +160,9 @@ def _property_from_summary(summary: dict, *, account_id: str, account_label: str
     )
 
 
-def list_properties(access_token: str) -> Ga4PropertyPage:
+def list_resources(access_token: str) -> ResourceListing:
     """Every GA4 property this token can see, across all pages of summaries."""
-    properties: list[Ga4Property] = []
+    properties: list[RemoteResource] = []
     page_token = ""
     truncated = False
 
@@ -189,11 +193,13 @@ def list_properties(access_token: str) -> Ga4PropertyPage:
         # The loop ran out of pages with a token still outstanding.
         truncated = bool(page_token)
 
-    properties.sort(key=lambda item: (item.account_label, item.label, item.id))
-    return Ga4PropertyPage(properties=tuple(properties), truncated=truncated)
+    # The same ordering as before the shared type existed: account, then
+    # display name, then id.
+    properties.sort(key=lambda item: (item.group_label, item.label, item.id))
+    return ResourceListing(resources=tuple(properties), truncated=truncated)
 
 
-def get_property(access_token: str, property_id: str) -> Ga4Property:
+def verify_resource(access_token: str, property_id: str) -> RemoteResource:
     """Read one property, proving this token can actually access it.
 
     The returned label comes from Google's response. Nothing a client submitted
@@ -208,13 +214,23 @@ def get_property(access_token: str, property_id: str) -> Ga4Property:
 
     name = payload.get("name") or ""
     resolved_id = name if is_valid_property_id(name) else property_id
-    account_id = payload.get("parent") or ""
-    return Ga4Property(
-        id=resolved_id,
+    return _property(
+        property_id=resolved_id,
         label=payload.get("displayName") or resolved_id,
-        account_id=account_id,
+        account_id=payload.get("parent") or "",
         # properties.get does not carry the account's display name; the picker
         # is where grouping happens, and it has the summaries.
         account_label="",
         property_type=payload.get("propertyType") or "",
     )
+
+
+class _Ga4Catalog:
+    """The three operations, bound together as this provider's catalog."""
+
+    normalize_resource_id = staticmethod(normalize_resource_id)
+    list_resources = staticmethod(list_resources)
+    verify_resource = staticmethod(verify_resource)
+
+
+CATALOG = _Ga4Catalog()

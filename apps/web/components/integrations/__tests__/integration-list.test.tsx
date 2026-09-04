@@ -17,6 +17,7 @@ const API_RESPONSE: IntegrationEntry[] = [
       "Connect a GA4 property to bring this project's traffic and behaviour data into the platform.",
     status: "not_connected",
     connection: null,
+    supports_resource_selection: true,
   },
   {
     provider: "search_console",
@@ -25,6 +26,7 @@ const API_RESPONSE: IntegrationEntry[] = [
       "Connect a Search Console property to bring this project's search impressions, clicks and queries into the platform.",
     status: "not_connected",
     connection: null,
+    supports_resource_selection: true,
   },
 ];
 
@@ -82,6 +84,7 @@ describe("integration list", () => {
             description: "Added to the backend catalog.",
             status: "not_connected",
             connection: null,
+            supports_resource_selection: false,
           },
         ]}
       />,

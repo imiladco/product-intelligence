@@ -76,6 +76,13 @@ export interface IntegrationEntry {
   description: string;
   status: IntegrationStatus;
   connection: IntegrationConnection | null;
+  /** Whether this provider can list and verify resources at all.
+   *
+   *  Independent of `status`: a provider with no resource discovery offers no
+   *  picker however healthy its connection is. The backend is the source of
+   *  truth, so the frontend never keeps its own list of what each provider
+   *  supports. */
+  supports_resource_selection: boolean;
 }
 
 /** Response of GET /api/projects/{id}/integrations/{provider}/authorize.
@@ -84,14 +91,17 @@ export interface AuthorizationStart {
   authorization_url: string;
 }
 
-/** One selectable external resource — for GA4, a property.
- *  `id` is Google's own immutable identifier and is sent back verbatim; the
- *  browser never builds one. */
+/** One selectable external resource, in provider-neutral terms.
+ *
+ *  `id` is the provider's own identifier and is sent back verbatim; the
+ *  browser never builds or parses one. `resource_type` and `group_label` are
+ *  display-only and may be empty — a provider whose resources have no grouping
+ *  leaves `group_label` blank everywhere, and the list renders flat. */
 export interface DiscoveredResource {
   id: string;
   label: string;
-  account_label: string;
-  property_type: string;
+  group_label: string;
+  resource_type: string;
 }
 
 /** Response of GET /api/projects/{id}/integrations/{provider}/resources.

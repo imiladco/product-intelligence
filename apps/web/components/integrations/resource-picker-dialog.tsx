@@ -31,31 +31,53 @@ function errorMessage(error: unknown): string {
     : "Could not reach the server. Please try again.";
 }
 
-/** Group in render order. The backend already sorts by account, then name. */
-function byAccount(resources: DiscoveredResource[]): [string, DiscoveredResource[]][] {
+/**
+ * Group in render order, or don't.
+ *
+ * Grouping is decided by the data, never by which provider sent it: some
+ * providers' resources have a parent to group under and some have none. When
+ * nothing is grouped, the list renders flat rather than under an invented
+ * heading. The backend has already sorted, so insertion order is render order.
+ */
+function intoGroups(
+  resources: DiscoveredResource[],
+): { grouped: boolean; groups: [string, DiscoveredResource[]][] } {
+  const grouped = resources.some((resource) => resource.group_label !== "");
+  if (!grouped) return { grouped: false, groups: [["", resources]] };
+
   const groups = new Map<string, DiscoveredResource[]>();
   for (const resource of resources) {
-    const key = resource.account_label || "Other";
+    const key = resource.group_label;
     groups.set(key, [...(groups.get(key) ?? []), resource]);
   }
-  return [...groups.entries()];
+  return { grouped: true, groups: [...groups.entries()] };
 }
 
 /**
  * Chooses which external resource an integration uses.
  *
+ * Provider-neutral by construction: this component knows it is picking one
+ * item from a list, and nothing else. `provider` goes straight into the
+ * request path and is never inspected; `providerName` is interpolated into
+ * copy and never compared. Neither appears in a conditional anywhere below,
+ * which is what makes "no provider-specific behaviour" checkable rather than
+ * merely intended.
+ *
  * The browser sends back the identifier it was given and nothing else. The
- * property's name is whatever the backend read from Google when it verified
- * the choice — this component never submits a label, because a label from here
- * would not be evidence of anything.
+ * resource's name is whatever the backend read from the provider when it
+ * verified the choice — this component never submits a label, because a label
+ * from here would not be evidence of anything.
  */
 export function ResourcePickerDialog({
   projectId,
   provider,
+  providerName,
   triggerLabel = "Choose property",
 }: {
   projectId: number | string;
   provider: string;
+  /** Human name of the provider, for copy only. Never compared or branched on. */
+  providerName: string;
   triggerLabel?: string;
 }) {
   const router = useRouter();
@@ -115,7 +137,9 @@ export function ResourcePickerDialog({
         <DialogHeader>
           <DialogTitle>Select a property</DialogTitle>
           <DialogDescription>
-            These are the properties the connected Google account can read.
+            These are the properties the connected Google account can use in
+            {" "}
+            {providerName}.
           </DialogDescription>
         </DialogHeader>
 
@@ -141,12 +165,12 @@ export function ResourcePickerDialog({
         {state.kind === "loaded" && state.resources.length === 0 ? (
           <div className="space-y-2 text-sm text-muted-foreground">
             <p>
-              No Google Analytics properties are available to this Google
-              account.
+              No properties are available to this Google account in{" "}
+              {providerName}.
             </p>
             <p>
-              Ask an administrator for at least Viewer access to a property, or
-              connect a different Google account.
+              Ask an administrator for access to a property, or connect a
+              different Google account.
             </p>
           </div>
         ) : null}
@@ -159,11 +183,13 @@ export function ResourcePickerDialog({
                 can be listed here.
               </p>
             ) : null}
-            {byAccount(state.resources).map(([accountLabel, resources]) => (
-              <fieldset key={accountLabel} className="space-y-1">
-                <legend className="text-xs text-muted-foreground">
-                  {accountLabel}
-                </legend>
+            {intoGroups(state.resources).groups.map(([groupLabel, resources]) => (
+              <fieldset key={groupLabel} className="space-y-1">
+                {groupLabel ? (
+                  <legend className="text-xs text-muted-foreground">
+                    {groupLabel}
+                  </legend>
+                ) : null}
                 {resources.map((resource) => (
                   <label
                     key={resource.id}
@@ -180,7 +206,7 @@ export function ResourcePickerDialog({
                     <span className="space-y-0.5">
                       <span className="block font-medium">{resource.label}</span>
                       <span className="block text-xs text-muted-foreground">
-                        {resource.id}
+                        {resource.resource_type || resource.id}
                       </span>
                     </span>
                   </label>

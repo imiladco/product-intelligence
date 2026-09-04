@@ -276,6 +276,13 @@ GA4_ADMIN_BASE_URL = os.environ.get(
     "GA4_ADMIN_BASE_URL", "https://analyticsadmin.googleapis.com/v1beta"
 )
 
+# Base URL for the Search Console Sites API. A different host and version from
+# the Analytics Admin API above, and not searchconsole.googleapis.com, which
+# serves URL Inspection only.
+SEARCH_CONSOLE_BASE_URL = os.environ.get(
+    "SEARCH_CONSOLE_BASE_URL", "https://www.googleapis.com/webmasters/v3"
+)
+
 # Connect+read timeout for every outbound Google API call. A request that hangs
 # holds a Gunicorn worker, and there is only one on the staging VPS.
 GOOGLE_API_TIMEOUT_SECONDS = float(os.environ.get("GOOGLE_API_TIMEOUT_SECONDS", "10"))

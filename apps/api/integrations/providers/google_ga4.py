@@ -1,11 +1,8 @@
-"""Google Analytics 4 provider definition.
-
-Milestone 2 is the catalog entry only. OAuth (Milestone 3) and property
-discovery plus health checks (Milestone 4) are added here later.
-"""
+"""Google Analytics 4 provider definition."""
 
 from __future__ import annotations
 
+from ..google import ga4
 from .base import IntegrationProvider, ProviderKey
 
 PROVIDER = IntegrationProvider(
@@ -18,4 +15,5 @@ PROVIDER = IntegrationProvider(
     # Read-only. Verified 2026-09-02 against
     # https://developers.google.com/identity/protocols/oauth2/scopes
     oauth_scopes=("https://www.googleapis.com/auth/analytics.readonly",),
+    resources=ga4.CATALOG,
 )
