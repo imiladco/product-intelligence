@@ -444,7 +444,35 @@ class TestScopeReductions:
         assert connection.last_successful_check_at >= first_check
 
     @responses.activate
-    def test_changing_to_a_different_property_is_refused(self, connected_project):
+    def test_changing_to_a_different_property_replaces_the_selection(
+        self, connected_project
+    ):
+        """Replaces the M4 test that pinned the 409 this milestone lifts (§6)."""
+        client, _user, project, connection = connected_project
+        stub_property()
+        client.post(
+            selection_url(project.pk), {"resource_id": "properties/111"}, format="json"
+        )
+        responses.reset()
+        stub_property(property_id="properties/999", display_name="Second property")
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        # Id, label and metadata move together: a half-applied change would
+        # leave a connection claiming one property under another one's name.
+        assert connection.external_resource_id == "properties/999"
+        assert connection.external_resource_label == "Second property"
+        assert connection.status == ConnectionStatus.CONNECTED
+
+    @responses.activate
+    def test_a_failed_change_leaves_the_previous_selection_intact(
+        self, connected_project
+    ):
+        """Nothing is written on any failure path, so the old selection stands."""
         client, _user, project, connection = connected_project
         stub_property()
         client.post(
@@ -454,36 +482,48 @@ class TestScopeReductions:
         before = (
             connection.external_resource_id,
             connection.external_resource_label,
+            dict(connection.external_resource_meta),
             connection.last_health_check_at,
             connection.last_successful_check_at,
         )
         responses.reset()
+        stub_property(property_id="properties/999", status=403)
 
         response = client.post(
             selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
         )
 
-        assert response.status_code == 409
-        assert response.data["error"]["code"] == "resource_change_not_supported"
-        assert len(responses.calls) == 0
+        assert response.status_code == 400
         connection.refresh_from_db()
         assert (
             connection.external_resource_id,
             connection.external_resource_label,
+            connection.external_resource_meta,
             connection.last_health_check_at,
             connection.last_successful_check_at,
         ) == before
 
-    def test_there_is_no_health_check_endpoint_in_this_milestone(
-        self, connected_project
-    ):
-        client, _user, project, _connection = connected_project
+    @responses.activate
+    def test_a_connection_in_error_can_be_repointed(self, connected_project):
+        """A deleted property leaves `error`; repointing is the repair (§6)."""
+        client, _user, project, connection = connected_project
+        connection.status = ConnectionStatus.ERROR
+        connection.external_resource_id = "properties/111"
+        connection.last_error_code = "resource_not_accessible"
+        connection.save(
+            update_fields=["status", "external_resource_id", "last_error_code"]
+        )
+        stub_property(property_id="properties/999", display_name="Second property")
 
         response = client.post(
-            f"/api/projects/{project.pk}/integrations/ga4/health-check", format="json"
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
         )
 
-        assert response.status_code == 404
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.external_resource_id == "properties/999"
+        assert connection.last_error_code == ""
 
 
 # --- Credential refresh ------------------------------------------------------
@@ -654,10 +694,18 @@ class TestCredentialRefresh:
             access_token_for(connection)
 
     @responses.activate
-    def test_a_rejected_token_during_verification_requires_reauthorization(
+    def test_a_rejected_token_during_verification_writes_no_state(
         self, connected_project
     ):
+        """Replaces the M4 test that pinned reauth_required here (§4.1, §6).
+
+        The response is unchanged — this is still a 409 the user can act on —
+        but a 401 about a *candidate* resource is not a verdict on the stored
+        grant, and selection no longer writes one. The verdict that is about
+        the grant belongs to access_token_for, and it still fires there.
+        """
         client, _user, project, connection = connected_project
+        before_status = connection.status
         stub_property(status=401)
 
         response = client.post(
@@ -667,7 +715,8 @@ class TestCredentialRefresh:
         assert response.status_code == 409
         assert response.data["error"]["code"] == "credential_refresh_failed"
         connection.refresh_from_db()
-        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.status == before_status
+        assert connection.last_error_code == ""
 
 
 # --- Stored state, audit, and leakage ---------------------------------------
@@ -919,3 +968,257 @@ class TestConnectedComesOnlyFromVerification:
         assert "Discovery label" not in str(connection.external_resource_label)
         assert "accounts/999" not in str(connection.external_resource_meta)
         assert "SUBPROPERTY" not in str(connection.external_resource_meta)
+
+
+class TestRefreshFence:
+    """A refresh result may only be applied to the credential it came from.
+
+    access_token_for is itself an outbound, state-mutating operation: it writes
+    on success and calls mark_reauth_required on invalid_grant. Both writes
+    happen before any caller could capture its own fence, so the refresh needs
+    optimistic concurrency of its own (design §9.3.1).
+    """
+
+    def _expire(self, connection):
+        credential = connection.credential
+        credential.access_token_expires_at = timezone.now() - timedelta(minutes=5)
+        credential.save(update_fields=["access_token_expires_at"])
+        return credential
+
+    def _reconnect(self, connection):
+        """Simulate a reconnect committing while a refresh is in flight."""
+        credential = connection.credential
+        credential.access_token = "access-token-from-reconnect"
+        credential.refresh_token = "refresh-token-from-reconnect"
+        credential.access_token_expires_at = timezone.now() + timedelta(hours=1)
+        credential.save()
+
+    @responses.activate
+    def test_stale_invalid_grant_does_not_mark_reauth_required(
+        self, connected_project
+    ):
+        """Race A1. The verdict belongs to a token that no longer exists."""
+        _client, _user, _project, connection = connected_project
+        self._expire(connection)
+
+        def reconnect_then_reject(request):
+            self._reconnect(connection)
+            return (400, {}, json.dumps({"error": "invalid_grant"}))
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=reconnect_then_reject,
+            content_type="application/json",
+        )
+
+        before = connection.status
+        token = access_token_for(connection)
+
+        assert token == "access-token-from-reconnect"
+        connection.refresh_from_db()
+        # Not knocked down to reauth_required by a verdict about a token that
+        # no longer exists.
+        assert connection.status == before
+        assert connection.last_error_code == ""
+
+    @responses.activate
+    def test_stale_successful_refresh_does_not_overwrite_newer_credential(
+        self, connected_project
+    ):
+        """Race A2 — the dangerous one, because it looks like success."""
+        _client, _user, _project, connection = connected_project
+        self._expire(connection)
+
+        def reconnect_then_succeed(request):
+            self._reconnect(connection)
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "access_token": "access-token-from-stale-refresh",
+                        "expires_in": 3599,
+                        "token_type": "Bearer",
+                    }
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=reconnect_then_succeed,
+            content_type="application/json",
+        )
+
+        token = access_token_for(connection)
+
+        credential = IntegrationCredential.objects.get(connection=connection)
+        assert token == "access-token-from-reconnect"
+        assert credential.access_token == "access-token-from-reconnect"
+        assert credential.refresh_token == "refresh-token-from-reconnect"
+
+    @responses.activate
+    def test_refresh_retry_returns_a_usable_current_token_without_a_second_call(
+        self, connected_project
+    ):
+        _client, _user, _project, connection = connected_project
+        self._expire(connection)
+
+        def reconnect_then_succeed(request):
+            self._reconnect(connection)
+            return (
+                200,
+                {},
+                json.dumps(
+                    {"access_token": "stale", "expires_in": 3599, "token_type": "Bearer"}
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=reconnect_then_succeed,
+            content_type="application/json",
+        )
+
+        access_token_for(connection)
+
+        # The re-read token was usable, so no second refresh was needed.
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_refresh_superseded_twice_raises_resource_unavailable(
+        self, connected_project
+    ):
+        """State churning twice is transient, not proof anything is broken."""
+        _client, _user, _project, connection = connected_project
+        self._expire(connection)
+
+        def supersede_but_leave_expired(request):
+            credential = connection.credential
+            credential.access_token = "still-expired"
+            credential.access_token_expires_at = timezone.now() - timedelta(minutes=5)
+            credential.save()
+            return (
+                200,
+                {},
+                json.dumps(
+                    {"access_token": "stale", "expires_in": 3599, "token_type": "Bearer"}
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=supersede_but_leave_expired,
+            content_type="application/json",
+        )
+
+        before = connection.status
+        with pytest.raises(ResourceUnavailable):
+            access_token_for(connection)
+
+        connection.refresh_from_db()
+        # Transient: nothing is proven broken, so no durable state changes.
+        assert connection.status == before
+
+    @responses.activate
+    def test_refresh_deleted_credential_is_a_fence_mismatch_not_a_crash(
+        self, connected_project
+    ):
+        """A disconnect deletes the row while the refresh is in flight."""
+        _client, _user, _project, connection = connected_project
+        self._expire(connection)
+
+        def disconnect_then_succeed(request):
+            IntegrationCredential.objects.filter(connection=connection).delete()
+            return (
+                200,
+                {},
+                json.dumps(
+                    {"access_token": "stale", "expires_in": 3599, "token_type": "Bearer"}
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=disconnect_then_succeed,
+            content_type="application/json",
+        )
+
+        with pytest.raises((ResourceUnavailable, CredentialMissing)):
+            access_token_for(connection)
+
+        assert not IntegrationCredential.objects.filter(connection=connection).exists()
+
+
+class TestAFailedChangeWritesNothing:
+    """§4.1/§6. A change that fails verification leaves the connection alone.
+
+    The distinction that matters is *where* the 401 came from. Acquiring a
+    token proves something about the stored grant, and the credential lifecycle
+    owns that verdict. A 401 while verifying a **candidate** resource proves
+    only that this change attempt failed: the connection still has the
+    credential it had a moment ago and the selection it had before, and writing
+    `reauth_required` over them would turn a rejected change into a broken
+    integration the user then has to repair.
+    """
+
+    def _connected(self, connection):
+        connection.status = ConnectionStatus.CONNECTED
+        connection.external_resource_id = "properties/111"
+        connection.external_resource_label = "First property"
+        connection.external_resource_meta = {"account": "accounts/1"}
+        connection.last_health_check_at = timezone.now() - timedelta(days=1)
+        connection.last_successful_check_at = timezone.now() - timedelta(days=1)
+        connection.save()
+        connection.refresh_from_db()
+        return connection
+
+    def _snapshot(self, connection):
+        connection.refresh_from_db()
+        return (
+            connection.status,
+            connection.external_resource_id,
+            connection.external_resource_label,
+            dict(connection.external_resource_meta),
+            connection.last_health_check_at,
+            connection.last_successful_check_at,
+            connection.last_error_code,
+            connection.last_error_message,
+            connection.updated_at,
+        )
+
+    @responses.activate
+    def test_a_401_verifying_the_candidate_leaves_everything_unchanged(
+        self, connected_project
+    ):
+        client, _user, project, connection = connected_project
+        self._connected(connection)
+        before = self._snapshot(connection)
+        # The stored access token is valid, so no refresh is attempted: this
+        # 401 is Google's answer about the candidate property alone.
+        stub_property(property_id="properties/999", status=401)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 409
+        assert response.data["error"]["code"] == "credential_refresh_failed"
+        assert self._snapshot(connection) == before
+
+    @responses.activate
+    def test_a_dead_refresh_grant_still_requires_reauthorization(
+        self, connected_project
+    ):
+        """T05's behaviour, unweakened: this 401 is about the stored grant."""
+        client, _user, project, connection = connected_project
+        self._connected(connection)
+        credential = connection.credential
+        credential.access_token_expires_at = timezone.now() - timedelta(minutes=5)
+        credential.save(update_fields=["access_token_expires_at"])
+        stub_refresh(status=400)
+
+        response = client.post(
+            selection_url(project.pk), {"resource_id": "properties/999"}, format="json"
+        )
+
+        assert response.status_code == 409
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.REAUTH_REQUIRED
+        assert connection.last_error_code == "credential_refresh_failed"
+        # The selection is still remembered, so reconnecting restores it.
+        assert connection.external_resource_id == "properties/111"

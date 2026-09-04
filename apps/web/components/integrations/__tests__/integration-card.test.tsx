@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -181,7 +183,7 @@ describe("IntegrationCard after OAuth", () => {
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
   });
 
-  it("offers Reauthorize when authorization has become invalid", () => {
+  it("offers Reconnect when authorization has become invalid", () => {
     render(
       <IntegrationCard
         projectId={1}
@@ -191,7 +193,9 @@ describe("IntegrationCard after OAuth", () => {
         })}
       />,
     );
-    expect(screen.getByRole("button", { name: "Reauthorize" })).toBeEnabled();
+    // "Reconnect" from M6 on: the recovery matrix names one action for a dead
+    // grant, and it is the same word wherever that state is reached (§7.2).
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
   });
 
   it("keeps failure states useful", () => {
@@ -244,8 +248,10 @@ describe("IntegrationCard action semantics", () => {
     expect(statusesOffering("Connect")).toEqual(["not_connected", "disconnected"]);
   });
 
-  it("never offers a generic Reconnect", () => {
-    expect(statusesOffering("Reconnect")).toEqual([]);
+  it("offers Reconnect only where the grant itself is gone", () => {
+    // Replaces the M2 assertion that no state offered it: M6 makes reconnect
+    // real, and it is the credential-class recovery and nothing else (§7.1).
+    expect(statusesOffering("Reconnect")).toEqual(["reauth_required"]);
   });
 
   it("does not invite re-authorizing after a successful authorization", () => {
@@ -259,10 +265,12 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    // The one action offered is choosing a property. Authorization already
-    // succeeded, so nothing here suggests doing it again.
-    expect(screen.getAllByRole("button")).toHaveLength(1);
+    // Authorization already succeeded, so nothing here suggests doing it
+    // again. Choosing a property and ending the integration are the two
+    // actions this state offers (§7.2); neither is an authorization action.
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeEnabled();
+    expect(screen.getAllByRole("button")).toHaveLength(2);
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
   });
 
@@ -321,7 +329,10 @@ describe("IntegrationCard action semantics", () => {
     vi.unstubAllGlobals();
   });
 
-  it("adds no reconnect or disconnect action to a connected integration", () => {
+  it("lets a connected integration be checked, and still offers no OAuth action", () => {
+    // Replaces the M2 assertion that a connected card had no actions at all.
+    // Testing a connection is non-destructive and is what a healthy card leads
+    // with (§7.2); re-authorizing a working credential is still not offered.
     render(
       <IntegrationCard
         projectId={1}
@@ -329,8 +340,29 @@ describe("IntegrationCard action semantics", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+  });
+
+  it("offers no check when nothing is selected to check", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "awaiting_resource_selection",
+          connection: connection({
+            status: "awaiting_resource_selection",
+            external_resource_id: "",
+            external_resource_label: "",
+          }),
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -376,7 +408,10 @@ describe("IntegrationCard resource action capability", () => {
       />,
     );
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    // Disconnect is offered here from M6 on; the picker is what must not be.
+    expect(
+      screen.queryByRole("button", { name: /property/i }),
+    ).not.toBeInTheDocument();
     expect(screen.getByTestId("status-badge")).toHaveTextContent("Select a property");
   });
 
@@ -393,5 +428,200 @@ describe("IntegrationCard resource action capability", () => {
     );
 
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
+  });
+});
+
+describe("IntegrationCard changing a selection", () => {
+  it("offers Change property on a connected card", () => {
+    // Selecting and changing are one backend operation (§6); they read as two
+    // different actions because the user is doing different things.
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status: "connected", connection: connection() })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Change property" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Choose property" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers it as the primary recovery when the resource is the problem", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "resource_not_accessible",
+            last_error_message: "That property is not available.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Change property" })).toBeEnabled();
+    // The credential is fine, so no authorization action is offered at all.
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer it for a provider with no catalog", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "connected",
+          supports_resource_selection: false,
+          connection: connection(),
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Change property" }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("IntegrationCard ending an integration", () => {
+  it.each([
+    ["awaiting_resource_selection"],
+    ["connected"],
+    ["error"],
+    ["reauth_required"],
+  ] as const)("offers Disconnect while %s", (status) => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status, connection: connection({ status }) })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeEnabled();
+  });
+
+  it.each([["not_connected"], ["disconnected"], ["pending_authorization"]] as const)(
+    "offers nothing to disconnect while %s",
+    (status) => {
+      render(
+        <IntegrationCard
+          projectId={1}
+          entry={entry({
+            status,
+            connection: status === "not_connected" ? null : connection({ status }),
+          })}
+        />,
+      );
+
+      expect(
+        screen.queryByRole("button", { name: "Disconnect" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+});
+
+describe("IntegrationCard recovery states", () => {
+  it("offers Reconnect, and no check, when the grant is gone", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "credential_refresh_failed",
+            last_error_message: "Google access has expired.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+    // Checking a credential we already know Google rejects proves nothing.
+    expect(
+      screen.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers Try again when the authorization itself failed", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "scope_not_granted",
+            last_error_message: "The required permission was not granted.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Change property" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a transient failure on a working integration as a muted note", () => {
+    // Nothing is broken: the last attempt did not land. A destructive alert
+    // would say otherwise (§7.5).
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "connected",
+          connection: connection({
+            last_error_code: "resource_unavailable",
+            last_error_message: "Google could not be reached.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    const note = screen.getByTestId("integration-error-note");
+    expect(note).toHaveTextContent("Google could not be reached.");
+    expect(note.className).not.toContain("destructive");
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+  });
+
+  it("keeps the destructive treatment for states that need the user", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "resource_not_accessible",
+            last_error_message: "That property is not available.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("That property is not available.");
+  });
+
+  it("branches on no provider anywhere in the action row", () => {
+    // The neutrality claim, checked rather than intended, extended to the two
+    // components this milestone adds.
+    for (const file of [
+      "components/integrations/integration-card.tsx",
+      "components/integrations/test-connection-button.tsx",
+      "components/integrations/disconnect-dialog.tsx",
+    ]) {
+      const source = readFileSync(file, "utf8");
+      for (const forbidden of ["Analytics", "GA4", "ga4", "sc-domain", "Search Console"]) {
+        expect(source).not.toContain(forbidden);
+      }
+    }
   });
 });

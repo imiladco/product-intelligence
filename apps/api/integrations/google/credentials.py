@@ -22,11 +22,13 @@ from datetime import UTC, timedelta
 import requests
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import transaction
 from django.utils import timezone
 from google.auth.exceptions import GoogleAuthError, RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 
+from ..concurrency import RefreshFence, locked_existing_connection
 from ..status import ConnectionStatus
 from .errors import CredentialMissing, CredentialRefreshFailed, ResourceUnavailable
 from .oauth import TOKEN_URI
@@ -102,21 +104,65 @@ def _persist(credential, refreshed: Credentials) -> None:
     )
 
 
+#: How many times a refresh may be superseded before we call it transient.
+#: State churning twice in a row is a reason to report a blip, not to loop.
+MAX_REFRESH_ATTEMPTS = 2
+
+
 def access_token_for(connection) -> str:
     """A usable access token for this connection, refreshing if needed.
 
+    The refresh is itself an outbound, state-mutating operation, so it carries
+    its own optimistic concurrency (design §9.3.1). Two races it closes:
+
+    * a stale ``invalid_grant`` arriving after a reconnect would otherwise mark
+      a repaired connection ``reauth_required`` — but that verdict belongs to a
+      refresh token that no longer exists;
+    * a stale *successful* refresh would otherwise overwrite the reconnect's
+      credential with one derived from the superseded token. That one is the
+      more dangerous, because it looks like success.
+
+    On a fence mismatch the whole result is discarded — nothing persisted, and
+    ``mark_reauth_required`` explicitly not called whatever Google said.
+
     Raises CredentialMissing when nothing is stored, CredentialRefreshFailed
     when the grant is gone, and ResourceUnavailable when Google could not be
-    reached. Never raises a Google exception, and never logs one: their text
-    can echo a request body carrying the refresh token and the client secret.
+    reached or the state kept moving. Never raises a Google exception, and
+    never logs one: their text can echo a request body carrying the refresh
+    token and the client secret.
     """
-    credential = _stored_credential(connection)
-    if credential is None or not credential.refresh_token:
-        raise CredentialMissing
+    for _attempt in range(MAX_REFRESH_ATTEMPTS):
+        credential = _stored_credential(connection)
+        if credential is None or not credential.refresh_token:
+            raise CredentialMissing
 
-    if _is_still_usable(credential):
-        return credential.access_token
+        if _is_still_usable(credential):
+            return credential.access_token
 
+        # Captured immediately before the call, so the result can be checked
+        # against the credential it was actually derived from.
+        fence = RefreshFence.capture(connection)
+
+        token = _refresh_and_apply(connection, credential, fence)
+        if token is not None:
+            return token
+
+        # Superseded. Whatever the current credential now is, it was written by
+        # someone with better information than this refresh had.
+        connection.refresh_from_db()
+        current = _stored_credential(connection)
+        if current is not None and _is_still_usable(current):
+            return current.access_token
+
+    raise ResourceUnavailable
+
+
+def _refresh_and_apply(connection, credential, fence: RefreshFence) -> str | None:
+    """Refresh without a lock, then apply the result only if still current.
+
+    Returns the new access token, or None when the result was superseded and
+    discarded.
+    """
     refreshed = Credentials(
         token=credential.access_token or None,
         refresh_token=credential.refresh_token,
@@ -130,11 +176,18 @@ def access_token_for(connection) -> str:
         refreshed.refresh(GoogleAuthRequest())
     except RefreshError as exc:
         # The grant itself is gone: revoked in the Google account, password
-        # changed, or expired. Retrying cannot help, so this is durable state.
+        # changed, or expired. Retrying cannot help, so this is durable state —
+        # but only if the verdict is still about the credential we hold.
         logger.warning(
             "Google credential refresh rejected for connection %s", connection.pk
         )
-        mark_reauth_required(connection)
+        with transaction.atomic():
+            locked = locked_existing_connection(connection.project, connection.provider)
+            if not fence.matches(locked):
+                # The token this verdict is about has already been replaced.
+                # Applying it would knock a repaired connection back down.
+                return None
+            mark_reauth_required(locked)
         raise CredentialRefreshFailed from exc
     except (GoogleAuthError, requests.RequestException) as exc:
         # Transport-level: unreachable, timed out, TLS. Transient, so the
@@ -144,15 +197,24 @@ def access_token_for(connection) -> str:
         )
         raise ResourceUnavailable from exc
 
-    if not refreshed.token:
-        # A refresh that returns no access token leaves nothing usable to
-        # store, and storing an empty one would loop forever on the next call.
-        logger.warning(
-            "Google credential refresh returned no access token for connection %s",
-            connection.pk,
-        )
-        mark_reauth_required(connection)
-        raise CredentialRefreshFailed
+    with transaction.atomic():
+        locked = locked_existing_connection(connection.project, connection.provider)
+        if not fence.matches(locked):
+            # A reconnect or a disconnect landed while this refresh was in
+            # flight. Persisting now would overwrite newer credential material
+            # with a token derived from a superseded refresh token.
+            return None
 
-    _persist(credential, refreshed)
-    return credential.access_token
+        if not refreshed.token:
+            # A refresh that returns no access token leaves nothing usable to
+            # store, and storing an empty one would loop forever.
+            logger.warning(
+                "Google credential refresh returned no access token for connection %s",
+                connection.pk,
+            )
+            mark_reauth_required(locked)
+            raise CredentialRefreshFailed
+
+        current = _stored_credential(locked)
+        _persist(current, refreshed)
+        return current.access_token

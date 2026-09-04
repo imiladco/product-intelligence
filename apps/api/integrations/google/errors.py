@@ -144,19 +144,6 @@ class ResourceUnavailable(GoogleApiError):
     http_status = 503
 
 
-class ResourceChangeNotSupported(GoogleApiError):
-    """A different resource was submitted for an already connected integration.
-
-    Changing a selection belongs with reconnect and disconnect in a later
-    milestone. Re-submitting the *same* resource is allowed, so a retried or
-    double-submitted request is not an error.
-    """
-
-    code = "resource_change_not_supported"
-    message = "This integration already has a property selected."
-    http_status = 409
-
-
 class ResourceSelectionUnsupported(GoogleApiError):
     """This provider has no resource selection yet.
 
@@ -166,3 +153,15 @@ class ResourceSelectionUnsupported(GoogleApiError):
     code = "resource_selection_unsupported"
     message = "Not found."
     http_status = 404
+
+
+class ResourceMissing(GoogleApiError):
+    """A health check on a connection with nothing selected.
+
+    There is nothing to check, so the check never begins — distinct from a
+    check that ran and found the resource gone.
+    """
+
+    code = "resource_missing"
+    message = "No property is selected for this integration yet."
+    http_status = 409

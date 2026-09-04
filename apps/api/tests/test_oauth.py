@@ -17,6 +17,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from audit.models import AuditEvent
+from integrations.google.errors import NoRefreshToken
 from integrations.google.oauth import TOKEN_URI
 from integrations.models import (
     IntegrationConnection,
@@ -122,8 +123,14 @@ class TestAuthorizationStart:
         assert params["access_type"] == ["offline"]
         assert params["include_granted_scopes"] == ["true"]
         assert params["state"]
-        # Not forced on a normal first authorization.
-        assert "prompt" not in params
+        # Forced even on a first authorization (design §5.3.2, changed in M6).
+        # A new connection row proves only that this project has not connected
+        # this provider; the same Google account may already have authorized
+        # this application elsewhere, in which case Google can return no
+        # refresh token and the first connection fails. Consent is shown for new
+        # scopes anyway, so this costs the user nothing.
+        # Full table: TestForcedConsentIsKeyedOnCapability.
+        assert params["prompt"] == ["consent"]
 
     def test_requests_only_the_providers_own_scope(self, signed_in_client, make_project):
         """Each provider is independently authorizable."""
@@ -1138,3 +1145,564 @@ class TestRestartingAnAbandonedAuthorization:
         assert IntegrationConnection.objects.get().status == (
             ConnectionStatus.AWAITING_RESOURCE_SELECTION
         )
+
+
+class TestForcedConsentIsKeyedOnCapability:
+    """prompt=consent whenever no stored refresh token can be preserved.
+
+    Design §5.3.1-§5.3.2. The predicate M3 shipped assumed a new connection row
+    meant a first authorization of that Google account for this application.
+    It does not: the same account may already have authorized us through
+    another project or workspace, in which case Google can return no
+    refresh_token at all and the *first* connection fails on NoRefreshToken.
+
+    This system deliberately holds no Google identity, so it cannot ask whether
+    a prior grant exists. The question it can always answer is local: can this
+    authorization preserve a refresh token we already hold? If not, it must
+    guarantee acquiring one.
+    """
+
+    def _prompt(self, client, project, provider="ga4"):
+        response = authorize(client, project, provider)
+        assert response.status_code == 200, response.data
+        params = parse_qs(urlparse(response.data["authorization_url"]).query)
+        return params.get("prompt")
+
+    def _connection(self, project, **kwargs):
+        return IntegrationConnection.objects.create(
+            project=project, provider=ProviderKey.GA4, **kwargs
+        )
+
+    def _credential(self, connection, refresh_token="refresh-token-1"):
+        return IntegrationCredential.objects.create(
+            connection=connection,
+            access_token="access-token-1",
+            refresh_token=refresh_token,
+        )
+
+    # --- consent IS forced ---------------------------------------------------
+
+    def test_no_connection_row(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_connection_without_a_credential(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(project, status=ConnectionStatus.PENDING_AUTHORIZATION)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_stored_refresh_token_is_empty(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.CONNECTED)
+        self._credential(connection, refresh_token="")
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_disconnected(self, signed_in_client, make_project):
+        """Our token is gone; Google's consent is not."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(project, status=ConnectionStatus.DISCONNECTED)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_reauth_required(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.REAUTH_REQUIRED)
+        self._credential(connection)
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_error_with_no_refresh_token(self, signed_in_client, make_project):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._connection(
+            project,
+            status=ConnectionStatus.ERROR,
+            last_error_code="no_refresh_token",
+        )
+
+        assert self._prompt(client, project) == ["consent"]
+
+    def test_second_project_first_connection_still_forces_consent(
+        self, signed_in_client, make_project
+    ):
+        """The case M3 could not see.
+
+        A credential for the same provider already exists in another project —
+        so the same Google account may well have authorized this application
+        already — and this connection has none of its own. The predicate reads
+        *this* connection's credential, not the database at large.
+        """
+        client, _user, workspace = signed_in_client
+        other_project = make_project(workspace, name="Other", website_url="https://o.example")
+        other_connection = IntegrationConnection.objects.create(
+            project=other_project,
+            provider=ProviderKey.GA4,
+            status=ConnectionStatus.CONNECTED,
+        )
+        self._credential(other_connection)
+        fresh_project = make_project(workspace, name="Fresh", website_url="https://f.example")
+
+        assert self._prompt(client, fresh_project) == ["consent"]
+
+    # --- consent is NOT forced ----------------------------------------------
+
+    def test_connected_with_a_usable_refresh_token(self, signed_in_client, make_project):
+        """A working token is preserved; re-consent would be noise."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(project, status=ConnectionStatus.CONNECTED)
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
+
+    def test_awaiting_resource_selection_with_a_refresh_token(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(
+            project, status=ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        )
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
+
+    def test_error_with_another_code_and_an_intact_credential(
+        self, signed_in_client, make_project
+    ):
+        """The credential is not the problem, so do not re-consent."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._connection(
+            project,
+            status=ConnectionStatus.ERROR,
+            last_error_code="scope_not_granted",
+        )
+        self._credential(connection)
+
+        assert self._prompt(client, project) is None
+
+
+class TestCallbackGenerationFence:
+    """Stage 3 refuses to persist for a superseded authorization (§9.4.2).
+
+    The callback consumes its request *before* the token exchange, so from that
+    moment consume-on-disconnect can no longer see it. The generation is what
+    covers the remaining window: at the instant of writing, is this attempt
+    still the user's current intent?
+    """
+
+    @responses.activate
+    def test_callback_proceeds_when_generation_matches(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "authorized=1" in response.url
+        connection = IntegrationConnection.objects.get(project=project)
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert IntegrationCredential.objects.filter(connection=connection).exists()
+
+    @responses.activate
+    def test_callback_is_discarded_when_generation_advanced(
+        self, signed_in_client, make_project
+    ):
+        """A newer intent landed while the user was at Google."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        connection = IntegrationConnection.objects.get(project=project)
+        before = IntegrationConnection.objects.get(pk=connection.pk)
+        # Something expressed a newer intent for this integration.
+        connection.lifecycle_generation += 1
+        connection.save(update_fields=["lifecycle_generation", "updated_at"])
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+
+        connection.refresh_from_db()
+        assert not IntegrationCredential.objects.filter(connection=connection).exists()
+        assert connection.status == before.status
+        assert connection.granted_scopes == before.granted_scopes
+        assert not AuditEvent.objects.filter(
+            action__in=[
+                AuditEvent.Action.INTEGRATION_AUTHORIZED,
+                AuditEvent.Action.INTEGRATION_RECONNECTED,
+            ]
+        ).exists()
+
+    @responses.activate
+    def test_callback_does_not_recreate_a_deleted_connection(
+        self, signed_in_client, make_project
+    ):
+        """Finalization takes the existing-only lock; it never creates."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token()
+
+        IntegrationConnection.objects.filter(project=project).delete()
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        assert not IntegrationConnection.objects.filter(project=project).exists()
+        assert not IntegrationCredential.objects.exists()
+        assert not AuditEvent.objects.filter(
+            action__in=[
+                AuditEvent.Action.INTEGRATION_AUTHORIZED,
+                AuditEvent.Action.INTEGRATION_RECONNECTED,
+            ]
+        ).exists()
+
+    @responses.activate
+    def test_no_database_lock_is_held_across_the_token_exchange(
+        self, signed_in_client, make_project
+    ):
+        """Stage 2 is a network call of unbounded duration.
+
+        Holding a row lock across it would block every other operation on the
+        integration for as long as Google takes. The stub writes to the same
+        connection mid-exchange; if a lock were held, this would deadlock or
+        block rather than complete.
+        """
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def write_during_exchange(request):
+            IntegrationConnection.objects.filter(project=project).update(
+                last_error_message="written during the exchange"
+            )
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "access_token": "access-token-1",
+                        "expires_in": 3599,
+                        "refresh_token": "refresh-token-1",
+                        "scope": GA4_SCOPE,
+                        "token_type": "Bearer",
+                    }
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=write_during_exchange,
+            content_type="application/json",
+        )
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "authorized=1" in response.url
+
+
+class TestCallbackFailurePathsAreGenerationFenced:
+    """A superseded callback may not write failure state either (§9.4.2).
+
+    Stage 3 fences the success path, but every failure path also mutates the
+    connection — and each did so through the stale object read before the token
+    exchange. A newer authorization that completed while R1 was at Google would
+    be overwritten with R1's error, or in the denial case have its connection
+    deleted outright.
+    """
+
+    def _advance_generation(self, project):
+        connection = IntegrationConnection.objects.get(project=project)
+        connection.lifecycle_generation += 1
+        connection.save(update_fields=["lifecycle_generation", "updated_at"])
+        return connection
+
+    def _assert_untouched_and_no_failure_audit(self, project, before):
+        connection = IntegrationConnection.objects.get(project=project)
+        assert connection.status == before.status
+        assert connection.last_error_code == ""
+        assert connection.last_error_message == ""
+        assert connection.lifecycle_generation == before.lifecycle_generation
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZATION_FAILED
+        ).exists()
+
+    @responses.activate
+    def test_stale_token_exchange_failure_does_not_overwrite_newer_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def newer_intent_then_fail(request):
+            self._advance_generation(project)
+            return (400, {}, json.dumps({"error": "invalid_grant"}))
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=newer_intent_then_fail,
+            content_type="application/json",
+        )
+        before = self._advance_generation(project)
+        before.lifecycle_generation += 1  # the stub will advance it once more
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+
+    @responses.activate
+    def test_stale_scope_not_granted_does_not_overwrite_newer_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        def newer_intent_then_wrong_scope(request):
+            self._advance_generation(project)
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "access_token": "access-token-1",
+                        "expires_in": 3599,
+                        "refresh_token": "refresh-token-1",
+                        "scope": GSC_SCOPE,  # not the scope GA4 requires
+                        "token_type": "Bearer",
+                    }
+                ),
+            )
+
+        responses.add_callback(
+            responses.POST, TOKEN_URI, callback=newer_intent_then_wrong_scope,
+            content_type="application/json",
+        )
+        before = self._advance_generation(project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+        assert not IntegrationCredential.objects.exists()
+
+    def test_stale_denial_does_not_delete_newer_authorization_connection(
+        self, monkeypatch, signed_in_client, make_project
+    ):
+        """The sharpest case: a stale denial would delete a live connection.
+
+        Denial makes no outbound call, so the window is between consuming the
+        request and writing the failure. A newer intent landing there is
+        reproduced by advancing the generation immediately after consumption.
+        """
+        from integrations import oauth_service
+
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+
+        real_consume = oauth_service._consume_request
+
+        def consume_then_newer_intent(**kwargs):
+            request = real_consume(**kwargs)
+            self._advance_generation(project)
+            return request
+
+        monkeypatch.setattr(oauth_service, "_consume_request", consume_then_newer_intent)
+
+        before = IntegrationConnection.objects.get(project=project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "error": "access_denied"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        # The newer attempt's connection survives — this is the deletion the
+        # unfenced denial path would have performed.
+        assert IntegrationConnection.objects.filter(project=project).exists()
+        self._assert_untouched_and_no_failure_audit(project, before)
+
+    @responses.activate
+    def test_no_refresh_token_failure_is_generation_fenced(
+        self, monkeypatch, signed_in_client, make_project
+    ):
+        """The window after stage 3 rolls back and before the error is written.
+
+        The advance has to happen *outside* stage 3's transaction to be a
+        faithful simulation: a concurrent bump commits independently, whereas
+        one made inside that transaction is undone by the same rollback that
+        raises NoRefreshToken. So the whole of stage 3 is replaced here, which
+        is exactly the state the failure finalizer inherits.
+        """
+        from integrations import oauth_service
+
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+        state = start_flow(client, project)
+        stub_token(refresh_token=None)
+
+        def rolled_back_then_newer_intent(*, request, result, user):
+            # Stage 3 rolled back (nothing written), and a newer intent lands
+            # before the error state is persisted.
+            self._advance_generation(project)
+            raise NoRefreshToken
+
+        monkeypatch.setattr(
+            oauth_service, "_finalize_credentials", rolled_back_then_newer_intent
+        )
+
+        before = IntegrationConnection.objects.get(project=project)
+        before.lifecycle_generation += 1
+
+        response = client.get(CALLBACK, {"state": state, "code": "auth-code"})
+
+        assert response.status_code == 302
+        assert "oauth_error=invalid_state" in response.url
+        self._assert_untouched_and_no_failure_audit(project, before)
+        assert not IntegrationCredential.objects.exists()
+
+
+class TestAuthorizationEventSelection:
+    """§8.1. Exactly one event per completed authorization, chosen by state.
+
+    "Authorized" and "reconnected" are now both reachable, and the choice is
+    made from where the connection *was* — never from whether a credential row
+    happens to exist, and never from the status stage 3 has just written.
+    """
+
+    def _in_state(self, project, user, status, *, with_credential=True):
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=status,
+            granted_scopes=[GA4_SCOPE],
+            connected_by=user,
+        )
+        if with_credential:
+            IntegrationCredential.objects.create(
+                connection=connection,
+                access_token="access-token-0",
+                refresh_token="refresh-token-0",
+                access_token_expires_at=timezone.now() + timedelta(hours=1),
+            )
+        return connection
+
+    def _complete(self, client, project):
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "previous_status",
+        [
+            ConnectionStatus.REAUTH_REQUIRED,
+            ConnectionStatus.ERROR,
+            ConnectionStatus.CONNECTED,
+        ],
+    )
+    def test_repairing_a_live_integration_is_a_reconnection(
+        self, signed_in_client, make_project, previous_status
+    ):
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._in_state(project, user, previous_status)
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        ).count() == 1
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).exists()
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "previous_status",
+        [
+            ConnectionStatus.PENDING_AUTHORIZATION,
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+            # The user deliberately ended the integration: authorizing again
+            # starts a new lifecycle rather than repairing the old one.
+            ConnectionStatus.DISCONNECTED,
+        ],
+    )
+    def test_starting_an_integration_is_an_authorization(
+        self, signed_in_client, make_project, previous_status
+    ):
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._in_state(
+            project,
+            user,
+            previous_status,
+            with_credential=previous_status != ConnectionStatus.DISCONNECTED,
+        )
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).count() == 1
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        ).exists()
+
+    @responses.activate
+    def test_a_first_authorization_with_no_row_is_an_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).count() == 1
+
+    @responses.activate
+    def test_previous_status_is_read_before_stage_three_mutates_it(
+        self, signed_in_client, make_project
+    ):
+        """Stage 3 writes awaiting_resource_selection itself.
+
+        Reading the field afterwards would make every authorization look like
+        it came from that state and collapse the whole §8.1 table into one row.
+        This is the case that catches it: reauth_required must not be read back
+        as awaiting_resource_selection.
+        """
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._in_state(project, user, ConnectionStatus.REAUTH_REQUIRED)
+
+        self._complete(client, project)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        event = AuditEvent.objects.get(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        )
+        assert event.metadata["previous_status"] == ConnectionStatus.REAUTH_REQUIRED

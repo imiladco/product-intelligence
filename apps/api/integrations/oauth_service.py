@@ -36,9 +36,17 @@ from .google.errors import (
     ScopeNotGranted,
 )
 from .google.oauth import build_authorization_redirect, exchange_code
+from .concurrency import (
+    Fence,
+    advance_generation,
+    locked_existing_connection,
+    locked_or_create_connection_for_authorization,
+)
 from .models import IntegrationConnection, IntegrationCredential, OAuthAuthorizationRequest
+from .lifecycle_service import apply_verification_outcome
 from .providers import get_provider
 from .status import ConnectionStatus
+from .verification import VerificationContext, verify
 
 logger = logging.getLogger(__name__)
 
@@ -58,20 +66,52 @@ class AuthorizationStart:
 
 
 def _needs_forced_consent(connection: IntegrationConnection | None) -> bool:
-    """True only when a new refresh token must actually be acquired.
+    """True unless we hold a refresh token we have no reason to distrust.
 
-    Never true for a first connection: Google issues a refresh token on the
-    first authorization for a client/account/scope combination anyway, and
-    forcing re-consent every time is user-hostile for no gain.
+    The rule is local capability, not "is this the first time":
 
-    The signal is connection state, not the presence of an empty credential
-    row — a failed authorization stores no credential at all (see
-    ``_store_credentials``), so there is no blank row to read.
+        Can this authorization preserve an existing refresh token?
+        If not, it must guarantee acquiring a new one.
+
+    M3 asked the wrong question. It assumed a new connection row meant a first
+    authorization of this Google account for this application, and skipped
+    consent on that basis. A new row proves only that *this project* has not
+    connected this provider. The same account may already have authorized us
+    through another project or workspace, and Google may then return no
+    ``refresh_token`` at all — so a *first* connection fails on NoRefreshToken
+    exactly as a post-disconnect one does. This system deliberately holds no
+    Google identity, so it cannot detect that; it does not need to, because the
+    local question is always answerable.
+
+    A genuinely first authorization pays nothing for this: Google shows a
+    consent screen for newly requested scopes regardless, so ``prompt=consent``
+    changes nothing the user sees. Offline access is a hard requirement — the
+    backend reaches the provider with no user present — and old behaviour is not
+    preserved for being old when it cannot guarantee it.
     """
     if connection is None:
-        return False
-    if connection.status == ConnectionStatus.REAUTH_REQUIRED:
+        # Nothing stored means nothing to preserve.
         return True
+
+    # REAUTH_REQUIRED is semantically necessary, not defensive: the credential
+    # row may still be there, holding a refresh token we already know is dead.
+    # The credential check below would see a non-empty token and wrongly say
+    # "preservable".
+    #
+    # DISCONNECTED is the genuinely redundant one — disconnect deletes the
+    # credential row, so the check below would catch it too. Kept deliberately,
+    # so a future change to how disconnect clears credentials cannot silently
+    # remove forced consent.
+    if connection.status in (
+        ConnectionStatus.REAUTH_REQUIRED,
+        ConnectionStatus.DISCONNECTED,
+    ):
+        return True
+
+    credential = IntegrationCredential.objects.filter(connection=connection).first()
+    if credential is None or not credential.refresh_token:
+        return True
+
     # The previous attempt ended because Google returned no refresh token and
     # none was stored. Re-consent is the documented way to obtain one.
     return (
@@ -93,14 +133,16 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
     # state that survives a cancellation. Someone who reaches
     # awaiting_resource_selection and then cancels a re-authorization is still
     # awaiting resource selection.
-    connection, _created = IntegrationConnection.objects.get_or_create(
-        project=project,
-        provider=provider.key,
-        defaults={
-            "status": ConnectionStatus.PENDING_AUTHORIZATION,
-            "connected_by": user,
-        },
+    #
+    # This is the only place in the codebase allowed to create a connection.
+    connection = locked_or_create_connection_for_authorization(
+        project, provider.key, user=user
     )
+
+    # A new attempt supersedes any older one. Advanced on every invocation, not
+    # only when a durable field changes: the counter tracks expressions of
+    # intent, and a start that changes no status is still one.
+    generation = advance_generation(connection)
 
     # Supersede any attempt still outstanding for this exact tuple. Without
     # this, abandoning a flow (closing the Google tab, losing connectivity)
@@ -132,6 +174,7 @@ def start_authorization(*, user, project, provider_key: str) -> AuthorizationSta
         provider=provider.key,
         user=user,
         code_verifier=redirect.code_verifier,
+        connection_generation=generation,
         expires_at=timezone.now()
         + timedelta(seconds=settings.OAUTH_STATE_TTL_SECONDS),
     )
@@ -224,6 +267,151 @@ def _record_failure(request, error_code: str) -> None:
     )
 
 
+def _locked_current_connection(request) -> IntegrationConnection:
+    """The connection this attempt is still entitled to write, locked.
+
+    Raises InvalidState when the connection is gone, or when a newer intent —
+    an explicit disconnect, or a newer authorization — has advanced the
+    generation past the one this attempt was started against. Every callback
+    path that mutates or deletes the connection goes through here, so a
+    superseded attempt cannot write *anything*: not success, and not failure.
+
+    Takes the existing-only lock, so no callback path can recreate a connection
+    that has been deleted.
+    """
+    try:
+        connection = locked_existing_connection(request.project, request.provider)
+    except IntegrationConnection.DoesNotExist as exc:
+        raise InvalidState from exc
+
+    if connection.lifecycle_generation != request.connection_generation:
+        raise InvalidState
+
+    return connection
+
+
+def _finalize_failure(*, request, exc_class) -> None:
+    """Record a failed authorization — only if this attempt is still current.
+
+    The failure paths used to write through the connection object read before
+    the token exchange. A newer authorization completing while the user was at
+    Google would then be overwritten with this attempt's error, which is the
+    same stale-write the success path is fenced against.
+    """
+    with transaction.atomic():
+        connection = _locked_current_connection(request)
+
+        connection.status = ConnectionStatus.ERROR
+        connection.last_error_code = exc_class.code
+        connection.last_error_message = exc_class.message
+        connection.save(
+            update_fields=[
+                "status",
+                "last_error_code",
+                "last_error_message",
+                "updated_at",
+            ]
+        )
+        _record_failure(request, exc_class.code)
+
+
+def _finalize_denial(*, request) -> None:
+    """The user declined, or Google refused.
+
+    Not an error state on the connection: nothing was ever authorized, so a
+    first authorization's row is removed and an existing integration keeps
+    everything it had. Backing out of a consent screen must never damage a
+    working integration.
+
+    Fenced like every other path, and for the sharpest reason: unfenced, a
+    stale denial would *delete* the connection belonging to a newer attempt.
+    """
+    with transaction.atomic():
+        connection = _locked_current_connection(request)
+
+        if not IntegrationCredential.objects.filter(connection=connection).exists():
+            connection.delete()
+        _record_failure(request, AuthorizationDenied.code)
+
+
+def _finalize_credentials(*, request, result, user) -> str:
+    """Stage 3: persist credentials, under the lock, if still the current intent.
+
+    Returns the connection's ``previous_status`` — read from the re-read row
+    **before** anything is mutated, because this function is what sets
+    ``awaiting_resource_selection``. Reading it afterwards would make every
+    authorization look like it came from that state (§8.1).
+
+    Raises InvalidState, writing nothing at all, when the connection was
+    superseded while the user was at Google: an explicit disconnect, or a newer
+    authorization attempt. Takes the **existing-only** lock, so a callback whose
+    connection has been deleted fails here rather than recreating it.
+    """
+    with transaction.atomic():
+        # Superseded -> InvalidState, and nothing is written: no credential, no
+        # status, no scopes, no audit event.
+        connection = _locked_current_connection(request)
+
+        previous_status = connection.status
+
+        _store_credentials(connection, result)
+
+        connection.status = ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        connection.granted_scopes = list(result.granted_scopes)
+        connection.connected_by = user
+        connection.last_error_code = ""
+        connection.last_error_message = ""
+        connection.save(
+            update_fields=[
+                "status",
+                "granted_scopes",
+                "connected_by",
+                "last_error_code",
+                "last_error_message",
+                "updated_at",
+            ]
+        )
+
+        record_event(
+            action=_authorization_event(previous_status),
+            actor=user,
+            project=request.project,
+            provider=request.provider,
+            metadata={
+                "provider": request.provider,
+                "status": connection.status,
+                "previous_status": previous_status,
+            },
+        )
+
+    return previous_status
+
+
+#: The states a completed authorization *repairs* rather than starts (§8.1).
+#: Everything else — a first authorization, one that never finished, and a
+#: deliberate disconnect the user is now undoing — begins a lifecycle rather
+#: than restoring one, and reads as "authorized".
+_REPAIRED_STATUSES = frozenset(
+    {
+        ConnectionStatus.REAUTH_REQUIRED,
+        ConnectionStatus.ERROR,
+        ConnectionStatus.CONNECTED,
+    }
+)
+
+
+def _authorization_event(previous_status: str) -> str:
+    """Which event one completed authorization writes.
+
+    Exactly one, chosen from where the connection *was* — never from whether a
+    credential row happens to exist, which would say "reconnected" for a first
+    authorization that had merely failed halfway.
+    """
+    if previous_status in _REPAIRED_STATUSES:
+        return AuditEvent.Action.INTEGRATION_RECONNECTED
+    return AuditEvent.Action.INTEGRATION_AUTHORIZED
+
+
 def complete_authorization(*, user, state: str, code: str, error: str = "") -> OAuthAuthorizationRequest:
     """Finish an authorization and return the consumed request.
 
@@ -245,30 +433,12 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
         _record_failure(request, ProviderMismatch.code)
         raise ProviderMismatch
 
-    connection = IntegrationConnection.objects.get(
-        project=request.project, provider=request.provider
-    )
-
-    def fail(exc_class) -> None:
-        connection.status = ConnectionStatus.ERROR
-        connection.last_error_code = exc_class.code
-        connection.last_error_message = exc_class.message
-        connection.save(
-            update_fields=["status", "last_error_code", "last_error_message", "updated_at"]
-        )
-        _record_failure(request, exc_class.code)
-
     if error:
-        # The user declined, or Google refused. Not an error state on the
-        # connection: nothing was ever authorized, so the row returns to
-        # "not connected" by being removed if it has no credential.
-        if not IntegrationCredential.objects.filter(connection=connection).exists():
-            connection.delete()
-        _record_failure(request, AuthorizationDenied.code)
+        _finalize_denial(request=request)
         raise AuthorizationDenied
 
     if not code:
-        fail(InvalidState)
+        _finalize_failure(request=request, exc_class=InvalidState)
         raise InvalidState
 
     try:
@@ -278,43 +448,84 @@ def complete_authorization(*, user, state: str, code: str, error: str = "") -> O
             code_verifier=request.code_verifier,
         )
     except Exception as exc:
-        fail(type(exc))
+        _finalize_failure(request=request, exc_class=type(exc))
         raise
 
     # Granular consent means the user can untick a scope. Verify what was
     # actually granted rather than assuming the request was honoured.
     missing = set(provider.oauth_scopes) - set(result.granted_scopes)
     if missing:
-        fail(ScopeNotGranted)
+        _finalize_failure(request=request, exc_class=ScopeNotGranted)
         raise ScopeNotGranted
 
+    # Stage 3. The transaction rolls back cleanly on NoRefreshToken, so the
+    # error status below is written outside it and survives — the same reason
+    # M3 kept the consumption transaction narrow.
     try:
-        _store_credentials(connection, result)
+        _finalize_credentials(request=request, result=result, user=user)
     except NoRefreshToken:
-        fail(NoRefreshToken)
+        _finalize_failure(request=request, exc_class=NoRefreshToken)
         raise
 
-    connection.status = ConnectionStatus.AWAITING_RESOURCE_SELECTION
-    connection.granted_scopes = list(result.granted_scopes)
-    connection.connected_by = user
-    connection.last_error_code = ""
-    connection.last_error_message = ""
-    connection.save(
-        update_fields=[
-            "status",
-            "granted_scopes",
-            "connected_by",
-            "last_error_code",
-            "last_error_message",
-            "updated_at",
-        ]
+    # Stages 4 and 5. Outside every transaction: the verification is a network
+    # call, and holding the row lock across it would block the integration for
+    # as long as Google takes.
+    _finalize_stored_resource(request=request, provider=provider, result=result)
+
+    return request
+
+
+def _finalize_stored_resource(*, request, provider, result) -> None:
+    """Stages 4 and 5: re-verify the remembered selection, and record where it stands.
+
+    A reconnect that ended in ``awaiting_resource_selection`` regardless would
+    throw away a selection the user made and still wants (§5.1). So the stored
+    resource is checked with the credential that was just issued, and the
+    outcome decides the terminal state — *when still valid* being answered by a
+    live call rather than assumed.
+
+    With nothing selected there is nothing to preserve, and M3's terminal state
+    stands unchanged.
+
+    The verdict goes through the same two functions the health check uses, so
+    the two paths cannot drift; only the context differs. It carries the
+    generation as well as the snapshot, because credentials committed at stage 3
+    do not license a terminal write later (§9.4.2): a disconnect or a newer
+    authorization arriving in between discards this result entirely.
+    """
+    catalog = provider.resources
+    if catalog is None:
+        return
+
+    try:
+        connection = IntegrationConnection.objects.get(
+            project=request.project, provider=request.provider
+        )
+    except IntegrationConnection.DoesNotExist:
+        return
+
+    if not connection.external_resource_id:
+        return
+
+    # Captured after stage 3 has committed and before the outbound call, so the
+    # result is compared against the state it was actually computed from.
+    fence = Fence.capture(connection)
+
+    outcome = verify(
+        catalog=catalog,
+        access_token=result.access_token,
+        resource_id=connection.external_resource_id,
     )
 
-    record_event(
-        action=AuditEvent.Action.INTEGRATION_AUTHORIZED,
-        actor=user,
-        project=request.project,
-        provider=request.provider,
-        metadata={"provider": request.provider, "status": connection.status},
-    )
-    return request
+    try:
+        apply_verification_outcome(
+            connection=connection,
+            outcome=outcome,
+            fence=fence,
+            context=VerificationContext.RECONNECT,
+            expected_generation=request.connection_generation,
+        )
+    except IntegrationConnection.DoesNotExist:
+        # The connection was removed while the provider was answering. Nothing
+        # to write to, which is the correct end of a discarded stage 5.
+        return

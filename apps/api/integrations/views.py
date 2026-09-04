@@ -13,6 +13,7 @@ from projects.selectors import get_project_for_user
 from common.errors import error_response
 
 from .google.errors import GoogleApiError, OAuthError
+from .lifecycle_service import disconnect, health_check
 from .oauth_service import complete_authorization, start_authorization
 from .providers import get_provider
 from .resource_service import discover_resources, select_resource
@@ -188,5 +189,60 @@ class IntegrationResourceSelectionView(GoogleApiErrorMixin, APIView):
             provider_key=provider,
             resource_id=serializer.validated_data["resource_id"],
         )
+        entry = integration_entry_for_provider(project, provider)
+        return Response(IntegrationEntrySerializer(entry).data)
+
+
+class IntegrationHealthCheckView(GoogleApiErrorMixin, APIView):
+    """POST /api/projects/{project_id}/integrations/{provider}/health-check
+
+    Runs the check now, against the resource the connection already points at.
+    The request body is not read at all: an identifier in it would be a way to
+    ask about a resource this connection has not selected.
+
+    A check that *ran* is always a 200 carrying the resulting entry, whatever
+    it found — a dead credential and an unreachable Google are answers, not
+    failures of the endpoint. Only a check that could not begin is a 409.
+
+    POST because it writes: status, both health timestamps and the recorded
+    error are all consequences of running it.
+    """
+
+    throttle_scope = "integrations"
+
+    def post(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        health_check(project=project, provider_key=provider)
+        entry = integration_entry_for_provider(project, provider)
+        return Response(IntegrationEntrySerializer(entry).data)
+
+
+class IntegrationDisconnectView(GoogleApiErrorMixin, APIView):
+    """POST /api/projects/{project_id}/integrations/{provider}/disconnect
+
+    Ends the integration here. The Google grant is never revoked: it belongs to
+    the user's Google account, and one consent can cover more than this
+    connection.
+
+    Answers 200 even when there was nothing to disconnect. The result the
+    caller asked for — not connected, no credential — is already true, and the
+    response carries the same entry the page renders either way.
+
+    On the same throttle scope as every other integration endpoint: it is a
+    write on a connection the same rate limit governs, and leaving one view out
+    of the scope is invisible until someone finds it.
+    """
+
+    throttle_scope = "integrations"
+
+    def post(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        disconnect(user=request.user, project=project, provider_key=provider)
         entry = integration_entry_for_provider(project, provider)
         return Response(IntegrationEntrySerializer(entry).data)

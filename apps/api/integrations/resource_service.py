@@ -24,11 +24,11 @@ from django.utils import timezone
 from audit.models import AuditEvent
 from audit.services import record_event
 
+from .concurrency import Fence, locked_existing_connection
 from .google.credentials import access_token_for, mark_reauth_required
 from .google.errors import (
     CredentialMissing,
     CredentialRefreshFailed,
-    ResourceChangeNotSupported,
     ResourceSelectionUnsupported,
 )
 from .models import IntegrationConnection
@@ -38,8 +38,16 @@ from .status import ConnectionStatus
 
 #: The states in which a connection holds a credential worth using. Anything
 #: else has nothing to reach Google with, and says so rather than trying.
+#:
+#: ``ERROR`` is included: a connection whose property was deleted sits there
+#: holding a perfectly good credential, and repointing it at another property
+#: is precisely the repair (§6).
 USABLE_STATUSES = frozenset(
-    {ConnectionStatus.AWAITING_RESOURCE_SELECTION, ConnectionStatus.CONNECTED}
+    {
+        ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+        ConnectionStatus.CONNECTED,
+        ConnectionStatus.ERROR,
+    }
 )
 
 
@@ -90,6 +98,14 @@ def select_resource(
 ) -> IntegrationConnection:
     """Verify a resource against the provider and, only then, store it.
 
+    Selecting and *changing* a selection are one operation (§6). What makes
+    changing safe is not a guard but the order: the identifier is normalized
+    before any outbound call, the resource is verified against the provider
+    before anything is written, the label and metadata come from that
+    verification rather than the body, and the write happens once under the row
+    lock. Nothing is written on any failure path, so a failed change leaves the
+    previous selection exactly as it was.
+
     The verifying call is also the connection's first health check: the same
     success that proves the resource is usable is what stamps the health
     timestamps, so there is no second code path that could disagree with it.
@@ -102,27 +118,33 @@ def select_resource(
 
     connection = _usable_connection(project, provider_key)
 
-    # Changing an existing selection is a later milestone. Re-submitting the
-    # same one is not a change, so a retried or double-submitted request stays
-    # harmless instead of becoming an error the user has to interpret.
-    if (
-        connection.status == ConnectionStatus.CONNECTED
-        and connection.external_resource_id != resource_id
-    ):
-        raise ResourceChangeNotSupported
-
     access_token = access_token_for(connection)
-    try:
-        selected = catalog.verify_resource(access_token, resource_id)
-    except CredentialRefreshFailed:
-        # Google rejected the token we just refreshed: the grant is gone.
-        mark_reauth_required(connection)
-        raise
 
-    return _persist_selection(connection=connection, selected=selected, user=user)
+    # Captured after any refresh has committed and immediately before the
+    # provider call, so the result can be checked against the state it was
+    # actually computed from (§9.3).
+    connection.refresh_from_db()
+    fence = Fence.capture(connection)
+
+    # Deliberately no except clause. A failed verification writes **nothing**,
+    # including when Google answers 401 (§4.1, §6).
+    #
+    # Where the 401 came from is the whole distinction. Acquiring the token
+    # above proves something about the stored grant, and ``access_token_for``
+    # owns that verdict — a dead refresh token still moves the connection to
+    # reauth_required, under its own fence. A 401 while verifying a *candidate*
+    # resource proves only that this change attempt failed: the connection
+    # still holds the credential it had a moment ago and the selection it had
+    # before, and writing reauth_required over them would turn a rejected
+    # change into a broken integration the user then has to repair.
+    selected = catalog.verify_resource(access_token, resource_id)
+
+    return _persist_selection(
+        connection=connection, selected=selected, user=user, fence=fence
+    )
 
 
-def _persist_selection(*, connection, selected, user) -> IntegrationConnection:
+def _persist_selection(*, connection, selected, user, fence) -> IntegrationConnection:
     """Write the verified selection, or nothing at all.
 
     Everything lands in one save inside one transaction, so a connection is
@@ -130,17 +152,16 @@ def _persist_selection(*, connection, selected, user) -> IntegrationConnection:
     it.
     """
     with transaction.atomic():
-        locked = IntegrationConnection.objects.select_for_update().get(pk=connection.pk)
-        previous_status = locked.status
+        locked = locked_existing_connection(connection.project, connection.provider)
 
-        # Re-checked under the lock: two concurrent selections must not slip a
-        # change past the guard above by racing it.
-        if (
-            previous_status == ConnectionStatus.CONNECTED
-            and locked.external_resource_id
-            and locked.external_resource_id != selected.id
-        ):
-            raise ResourceChangeNotSupported
+        if not fence.matches(locked):
+            # The world moved while the provider was answering: this result
+            # describes a state that no longer exists. Discard it entirely —
+            # not even a timestamp, since a stale result has no claim on any
+            # field — and report what the connection actually is now.
+            return locked
+
+        previous_status = locked.status
 
         now = timezone.now()
         locked.external_resource_id = selected.id

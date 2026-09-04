@@ -1,9 +1,11 @@
 import { ConnectButton } from "@/components/integrations/connect-button";
+import { DisconnectDialog } from "@/components/integrations/disconnect-dialog";
 import { ResourcePickerDialog } from "@/components/integrations/resource-picker-dialog";
 import { StatusBadge } from "@/components/integrations/status-badge";
+import { TestConnectionButton } from "@/components/integrations/test-connection-button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import type { IntegrationEntry } from "@/lib/api/types";
-import { statusPresentation } from "@/lib/integrations/status";
+import { presentationFor } from "@/lib/integrations/status";
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Never";
@@ -29,7 +31,13 @@ export function IntegrationCard({
   projectId: number | string;
 }) {
   const { connection } = entry;
-  const { actionLabel, note, ...presentation } = statusPresentation(entry.status);
+  // Status and the recorded error code together: `error` is reached by causes
+  // whose repairs have nothing to do with each other, so the action offered is
+  // keyed on both. The card reads neither itself — it asks the recovery model.
+  const { actionLabel, note, ...presentation } = presentationFor(
+    entry.status,
+    connection?.last_error_code ?? "",
+  );
   // Two independent questions, and the action needs a yes to both: does this
   // state call for choosing a resource, and can this provider offer any? The
   // status mapping answers only the first — it knows nothing about providers —
@@ -37,6 +45,11 @@ export function IntegrationCard({
   // catalog. Read from the entry, so no provider is named here.
   const resourceAction =
     entry.supports_resource_selection ? presentation.resourceAction : null;
+  // Checking a connection means asking the provider about the resource it
+  // points at, so with nothing selected there is nothing to check. Both gates
+  // come from the entry itself; neither names a provider.
+  const canTestConnection =
+    presentation.canTestConnection && Boolean(connection?.external_resource_id);
 
   return (
     <Card data-testid={`integration-card-${entry.provider}`}>
@@ -68,8 +81,20 @@ export function IntegrationCard({
           </dl>
         ) : null}
 
-        {connection?.last_error_message ? (
-          <p role="alert" className="text-sm text-destructive">
+        {/* How a recorded error reads comes from the recovery model, not from
+            the card: a transient failure on a working integration is a muted
+            note beside a still-green badge, and only the states that need the
+            user to do something get the destructive treatment (§7.5). */}
+        {connection?.last_error_message && presentation.errorTone ? (
+          <p
+            data-testid="integration-error-note"
+            {...(presentation.errorTone === "destructive" ? { role: "alert" } : {})}
+            className={
+              presentation.errorTone === "destructive"
+                ? "text-sm text-destructive"
+                : "text-sm text-muted-foreground"
+            }
+          >
             {connection.last_error_message}
           </p>
         ) : null}
@@ -77,7 +102,11 @@ export function IntegrationCard({
         {/* Which action a state offers comes from the status mapping, so the
             card never invents one. A state that already has what it needs from
             Google offers no authorization action at all. */}
-        {actionLabel || resourceAction || note ? (
+        {actionLabel ||
+        resourceAction ||
+        canTestConnection ||
+        presentation.canDisconnect ||
+        note ? (
           <div className="flex items-center gap-3">
             {actionLabel ? (
               <ConnectButton
@@ -87,8 +116,28 @@ export function IntegrationCard({
                 variant={entry.status === "not_connected" ? "default" : "outline"}
               />
             ) : null}
-            {resourceAction === "select" ? (
+            {canTestConnection ? (
+              <TestConnectionButton
+                projectId={projectId}
+                provider={entry.provider}
+              />
+            ) : null}
+            {resourceAction ? (
               <ResourcePickerDialog
+                projectId={projectId}
+                provider={entry.provider}
+                providerName={entry.display_name}
+                // The same dialog, and the same request: only the word on the
+                // trigger differs, because choosing a first property and
+                // replacing one are different things to the user and one
+                // operation to the backend.
+                triggerLabel={
+                  resourceAction === "change" ? "Change property" : "Choose property"
+                }
+              />
+            ) : null}
+            {presentation.canDisconnect ? (
+              <DisconnectDialog
                 projectId={projectId}
                 provider={entry.provider}
                 providerName={entry.display_name}

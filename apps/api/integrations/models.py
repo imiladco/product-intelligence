@@ -59,6 +59,18 @@ class IntegrationConnection(models.Model):
         blank=True,
         related_name="connected_integrations",
     )
+
+    # Advanced whenever a user expresses a new authorization intent for this
+    # integration: starting an authorization, or disconnecting. An in-flight
+    # callback carries the generation it was started against, and may only
+    # finalize while the two are equal — which is how an explicit disconnect, or
+    # a newer attempt, supersedes a callback already past the point where its
+    # single-use request could stop it. See docs §9.4.
+    #
+    # A counter and not a timestamp: the question spans two tables and two
+    # lifetimes, and equal timestamps cannot say which came first.
+    lifecycle_generation = models.PositiveIntegerField(default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -140,6 +152,13 @@ class OAuthAuthorizationRequest(models.Model):
     # flow; it must survive the redirect to Google and back, and it is secret
     # until used, so it is encrypted like any other credential material.
     code_verifier = EncryptedTextField(blank=True, default="")
+
+    # The connection's lifecycle_generation at the moment this attempt started.
+    # Finalization requires it still to match; see docs §9.4. Rows predating the
+    # field default to 0, as do connections, so an authorization in flight
+    # across the deploy still matches and completes.
+    connection_generation = models.PositiveIntegerField(default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
     consumed_at = models.DateTimeField(null=True, blank=True)

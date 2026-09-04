@@ -68,11 +68,47 @@ def test_provider_vocabulary_stays_in_its_own_module(term, owner):
     )
 
 
-def test_the_orchestration_layer_names_no_provider():
-    """resource_service must dispatch, not decide."""
-    source = (INTEGRATIONS_DIR / "resource_service.py").read_text()
+#: Every shared module that orchestrates providers without being one.
+ORCHESTRATION_MODULES = (
+    "resource_service.py",
+    "lifecycle_service.py",
+    "concurrency.py",
+    "verification.py",
+)
+
+
+@pytest.mark.parametrize("module", ORCHESTRATION_MODULES)
+def test_the_orchestration_layer_names_no_provider(module):
+    """These modules must dispatch, not decide."""
+    source = (INTEGRATIONS_DIR / module).read_text()
     for term in ("ga4", "search_console", "GA4", "SEARCH_CONSOLE"):
-        assert term not in source, f"resource_service.py names a provider: {term!r}"
+        assert term not in source, f"{module} names a provider: {term!r}"
+
+
+def test_only_authorization_start_can_create_a_connection():
+    """One creating entry point, and its name says what it is.
+
+    A disconnect that created the row it was ending, or a stale callback that
+    resurrected a deleted one, would both be defects that read as ordinary
+    code. This is what keeps them from being written by accident.
+    """
+    creators = [
+        path.name
+        for path in _source_files()
+        if "locked_or_create_connection_for_authorization(" in path.read_text()
+        and path.name not in {"concurrency.py"}
+    ]
+    assert creators == ["oauth_service.py"], (
+        f"connection creation reached beyond authorization start: {sorted(creators)}"
+    )
+
+    for module in ("lifecycle_service.py", "resource_service.py", "verification.py"):
+        source = (INTEGRATIONS_DIR / module).read_text()
+        for forbidden in (
+            "IntegrationConnection.objects.create",
+            "get_or_create",
+        ):
+            assert forbidden not in source, f"{module} can create a connection"
 
 
 def test_every_catalog_satisfies_the_protocol():
