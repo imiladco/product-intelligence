@@ -105,11 +105,18 @@ export function IntegrationCard({
                 provider={entry.provider}
               />
             ) : null}
-            {resourceAction === "select" ? (
+            {resourceAction ? (
               <ResourcePickerDialog
                 projectId={projectId}
                 provider={entry.provider}
                 providerName={entry.display_name}
+                // The same dialog, and the same request: only the word on the
+                // trigger differs, because choosing a first property and
+                // replacing one are different things to the user and one
+                // operation to the backend.
+                triggerLabel={
+                  resourceAction === "change" ? "Change property" : "Choose property"
+                }
               />
             ) : null}
             {note ? (

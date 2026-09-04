@@ -423,3 +423,59 @@ describe("IntegrationCard resource action capability", () => {
     expect(screen.getByRole("button", { name: "Choose property" })).toBeEnabled();
   });
 });
+
+describe("IntegrationCard changing a selection", () => {
+  it("offers Change property on a connected card", () => {
+    // Selecting and changing are one backend operation (§6); they read as two
+    // different actions because the user is doing different things.
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({ status: "connected", connection: connection() })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Change property" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Choose property" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers it as the primary recovery when the resource is the problem", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "resource_not_accessible",
+            last_error_message: "That property is not available.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Change property" })).toBeEnabled();
+    // The credential is fine, so no authorization action is offered at all.
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer it for a provider with no catalog", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "connected",
+          supports_resource_selection: false,
+          connection: connection(),
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Change property" }),
+    ).not.toBeInTheDocument();
+  });
+});
