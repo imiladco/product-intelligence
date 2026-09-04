@@ -152,3 +152,37 @@ def _credential_updated_at(connection: IntegrationConnection) -> datetime | None
         return connection.credential.updated_at
     except ObjectDoesNotExist:
         return None
+
+
+@dataclass(frozen=True)
+class RefreshFence:
+    """The credential state a token refresh was derived from.
+
+    Separate from ``Fence`` and never merged with it: this answers "is this
+    refresh result about the credential it came from", which is a question one
+    level below "is this provider result about the connection state it was
+    computed from". Merging them would make a refresh fence itself out on any
+    unrelated connection write.
+
+    ``credential_id`` is part of the identity because a reconnect *reuses* the
+    credential row rather than replacing it — so the primary key is not a
+    discriminator on its own — and because a disconnect deletes the row, which
+    must read as a mismatch rather than a crash.
+    """
+
+    credential_id: int | None
+    credential_updated_at: datetime | None
+
+    @classmethod
+    def capture(cls, connection: IntegrationConnection) -> "RefreshFence":
+        try:
+            credential = connection.credential
+        except ObjectDoesNotExist:
+            return cls(credential_id=None, credential_updated_at=None)
+        return cls(
+            credential_id=credential.pk,
+            credential_updated_at=credential.updated_at,
+        )
+
+    def matches(self, connection: IntegrationConnection) -> bool:
+        return self == RefreshFence.capture(connection)
