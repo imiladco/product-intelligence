@@ -2,6 +2,15 @@
 
 Design draft. 2026-09-04. Revised after review; not implemented; not approved.
 
+**Revision 5 — the generation bug, and two things left implicit:** a repeat
+disconnect on an already-disconnected connection must still advance the
+generation, or Race C′ reopens through a path revision 4 created (§9.1, §9.4);
+generation increments must happen under the connection row lock, or two
+operations can both read N and both write N+1 (§9.4.1); the reconnect callback
+is four stages, not one outbound call, and each fence's placement is now
+specified (§9.4.2); plus a full internal-consistency pass reconciling every
+stale "no migration" and "unchanged" claim with the final model (§19).
+
 **Revision 4 — what the third review found, and the decision it forced:**
 credential refresh is itself an unfenced mutating outbound call, so it needs
 its own optimistic concurrency and `google/credentials.py` can no longer be
@@ -94,12 +103,12 @@ would take to do revocation safely, if you want it later.
 | # | Finding | Consequence for M6 |
 |---|---|---|
 | 1 | `ConnectionStatus` has six states; `NOT_CONNECTED` is synthesized. | **No new state is needed** (§4). M6 adds transitions, not statuses. |
-| 2 | `IntegrationConnection` already has `last_health_check_at`, `last_successful_check_at`, `last_error_code`, `last_error_message`. | **No migration** (§11). |
+| 2 | `IntegrationConnection` already has `last_health_check_at`, `last_successful_check_at`, `last_error_code`, `last_error_message`. | Every *health and error* field M6 writes already exists. This was originally read as "no migration"; revision 4 added `lifecycle_generation` for a need no existing column expresses, so M6 does carry one (§11). |
 | 3 | `AuditEvent.Action` already declares `INTEGRATION_RECONNECTED` and `INTEGRATION_DISCONNECTED`, both unwritten. The metadata allowlist already has `status`, `previous_status`, `error_code`, `reason`. | **No new audit action, no allowlist change** (§8). |
 | 4 | `complete_authorization` ends by unconditionally setting `AWAITING_RESOURCE_SELECTION`. | This is the one M3 behaviour M6 must change, to preserve a still-valid selection across a reconnect (§5). |
 | 5 | `_needs_forced_consent` already sends `prompt=consent` for `REAUTH_REQUIRED` and for a prior `no_refresh_token`. | Reconnect needs **no new OAuth code**; it reuses the existing authorize endpoint. |
 | 6 | `resource_service.select_resource` refuses a *different* resource while `connected` (`ResourceChangeNotSupported`), and re-verifies the same one idempotently. Verification-before-persistence and "nothing written on failure" are already in place. | Change-resource is mostly a **deletion**: lift the guard, retire the now-dead error class (§6). |
-| 7 | `credentials.access_token_for` and `mark_reauth_required` are provider-agnostic and already map `invalid_grant` → `reauth_required`. | Health checks and reconnect reuse them unchanged. |
+| 7 | `credentials.access_token_for` and `mark_reauth_required` are provider-agnostic and already map `invalid_grant` → `reauth_required`. | The *mapping* is reused as-is, but the module is **not** unchanged: the refresh is itself a mutating outbound call and needs its own fence (§9.3.1). |
 | 8 | `ResourceCatalog.verify_resource` is exactly what a health check needs, for both providers. | The health check is `verify_resource` against the **stored** resource — no new provider method, and the catalog stays at three methods. |
 | 9 | `resource_service._usable_connection` treats `REAUTH_REQUIRED` as a hard stop and restricts work to `{AWAITING_RESOURCE_SELECTION, CONNECTED}`. | Health check and change-resource need `ERROR` admitted too (§4), since a connection in `ERROR` is exactly one the user wants to test or repoint. |
 | 10 | `IntegrationEntry` exposes `supports_resource_selection` (M5). | The lifecycle actions gate on capability the same way, with no provider names in components (§7). |
@@ -146,8 +155,11 @@ identifier comes from the database, never from the request.
 
 ### 3.2 `POST …/integrations/{provider}/disconnect`
 
-- `200` — the entry, now `disconnected`. Idempotent: disconnecting an already
-  disconnected integration is a 200 that changes nothing (§9).
+- `200` — the entry, now `disconnected`. Idempotent in its externally
+  meaningful result — status, credential and audit are the same afterwards
+  either way — but **never write-inert**: every disconnect advances the
+  lifecycle generation and invalidates outstanding authorization attempts, even
+  when the connection is already `disconnected` (§9.1).
 - `404` — unknown project/provider.
 - No body.
 
@@ -586,7 +598,8 @@ need the user to do something.
 | `INTEGRATION_RESOURCE_SELECTED` | unchanged, including for a *change* | `provider`, `resource_id`, `resource_label`, `status`, `previous_status` |
 
 Both new actions are already declared, and every metadata key is already
-allowlisted: **no new action, no allowlist change, no migration.**
+allowlisted: **no new audit action and no allowlist change.** The migration M6
+carries (§11) adds nothing to `audit`.
 
 ### 8.1 Which event a completed authorization writes
 
@@ -634,7 +647,7 @@ same reason: nothing happened.
 | Operation | Idempotent? | How |
 |---|---|---|
 | Health check | Yes, apart from timestamps | Pure re-verification; no resource state is written |
-| Disconnect | Yes, for connection state and audit — **but never a no-op** | Already `disconnected` → 200, no connection fields written and no audit row, **but outstanding authorization requests are still invalidated** (see below) |
+| Disconnect | Yes, for connection state and audit — **but never write-inert** | Already `disconnected` → 200 with no status change and no audit row, **but the generation advances and outstanding requests are consumed** (see below) |
 | Change resource | Yes for the same id | Existing M4 behaviour, unchanged |
 | Reconnect | Yes | Each attempt is its own single-use OAuth state; M3 supersedes older unconsumed requests, and §9.4 supersedes ones already in flight |
 
@@ -649,11 +662,33 @@ that (project, provider), whether or not it changes the connection:
 
 | Aspect | Second disconnect on an already-disconnected integration |
 |---|---|
-| Connection fields | Not written |
+| `status` | Unchanged — already `disconnected` |
 | Credential | Already gone; nothing to delete |
 | Audit event | **Not** written — nothing happened to the integration |
-| Outstanding authorization requests | **Consumed** — this is the part that is not idempotent-as-no-op |
+| **`lifecycle_generation`** | **Advances** — this is a fresh statement of intent, and it is what invalidates an authorization already past consumption |
+| Outstanding authorization requests | **Consumed** |
+| `updated_at` | Advances, as a consequence of the generation write |
 | Response | 200 with the current entry |
+
+**Why the generation must advance even here** — this is the exact hole revision
+4 left open:
+
+```
+connection DISCONNECTED, generation 10
+user clicks Connect      → start_authorization bumps to 11; request captures 11
+callback consumes its request, token exchange begins
+user clicks Disconnect   → status is already disconnected
+                         → under a "no writes" rule, generation stays 11
+                         → the request is already consumed, so
+                           consume-on-disconnect cannot see it
+callback resumes         → 11 == 11 → credentials written
+                         → the explicitly disconnected integration is resurrected
+```
+
+The user's second Disconnect is a real statement of intent about an
+authorization that is genuinely in flight. Treating it as a no-op because the
+durable status happens to already read `disconnected` confuses *state* with
+*intent*, and the two are exactly what the generation exists to separate.
 
 ### 9.2 The problem the row lock does not solve
 
@@ -844,11 +879,24 @@ integer equality, exactly like §9.3.
 | `IntegrationConnection` | `lifecycle_generation` (`PositiveIntegerField`, default `0`) | Bumped whenever the connection's authorization intent changes |
 | `OAuthAuthorizationRequest` | `connection_generation` (`PositiveIntegerField`, default `0`) | The generation this attempt was started against |
 
-**It increments in exactly two places**, both of which are "the user expressed a
-new intent for this integration":
+**It increments on exactly two operations**, both of which mean "the user has
+expressed a new intent for this integration":
 
 1. **`start_authorization`** — a new attempt supersedes any older one.
 2. **`disconnect`** — an explicit end supersedes any attempt in flight.
+
+**"Two operations", not "two state changes".** Every invocation of either
+operation on an existing connection advances the generation, whatever the
+durable status already is. A disconnect of an already-disconnected connection
+still advances it (§9.1); a `start_authorization` on a connection that is
+already `pending_authorization` still advances it. The counter tracks
+*expressions of intent*, and an operation that changes no durable field is
+still an expression of intent — which is precisely the case that reopens Race
+C′ when it is treated as inert.
+
+Nothing else increments it. A health check, a resource change, a token refresh
+and a completing callback all leave it alone: none of them is a new intent
+about *whether* this integration should be authorized.
 
 **Finalization is one comparison:**
 
@@ -891,6 +939,114 @@ at all.
   so the newest intent for **the connection** wins regardless of which member
   started it. No separate per-user reasoning is needed.
 
+### 9.4.1 Increments must be atomic
+
+A counter is a total order only if two operations cannot both read `N` and both
+write `N+1`. Read-increment-save outside a lock is exactly that bug, and it
+would silently collapse two distinct intents into one generation — after which
+a superseded callback would pass the equality check.
+
+**Both incrementing operations serialize on the same `IntegrationConnection`
+row**, and the increment is inside the lock:
+
+```python
+# start_authorization and disconnect share this shape
+with transaction.atomic():
+    connection = (
+        IntegrationConnection.objects
+        .select_for_update()
+        .get(project=project, provider=provider_key)
+    )
+    connection.lifecycle_generation += 1
+    generation = connection.lifecycle_generation      # the exact value, in hand
+    connection.save(update_fields=["lifecycle_generation", "updated_at"])
+
+    # start_authorization only: the request carries exactly this generation
+    OAuthAuthorizationRequest.objects.create(
+        ..., connection_generation=generation,
+    )
+    # disconnect only: delete the credential, set status, consume outstanding
+    # requests, write the audit event when the status actually changed
+```
+
+Two properties this shape gives, and both are needed:
+
+- **No lost update.** The second operation blocks on `select_for_update` until
+  the first commits, then reads the committed value. `N` and `N+1` are distinct
+  and both are used.
+- **The request carries the generation it was actually assigned**, created in
+  the same transaction as the increment. There is no window in which a request
+  exists with a stale generation, and none in which the generation exists with
+  no request.
+
+**On `F()` expressions.** `F("lifecycle_generation") + 1` is the usual way to
+increment without a lock, and it is *not* used here — not because it is unsafe
+in itself, but because it does not give back the value assigned. Learning it
+requires a `refresh_from_db()` after the save, and between the save and that
+read another transaction may have incremented again, so the request could be
+created carrying a generation that is no longer the connection's. Under the row
+lock that hazard cannot arise, and the plain read-increment-save is both correct
+and easier to read. If `F()` were ever preferred, it would still have to be
+inside the same `select_for_update` block, with `refresh_from_db(fields=[…])`
+before creating the request — at which point it buys nothing.
+
+**The two orderings this must satisfy**, both tested (§14):
+
+| | Race | Required outcome |
+|---|---|---|
+| **A** | Two concurrent `start_authorization` calls | They capture **distinct** generations; only the later one's callback can finalize |
+| **B** | `start_authorization` racing `disconnect` | The row lock defines the order; whichever **commits second** owns the connection's final generation, and the other side's attempt is thereby superseded |
+
+Ordering B is genuinely either-way, and that is correct rather than a gap: if
+the disconnect commits second, the in-flight authorization is superseded and
+discarded; if the authorization commits second, the user's Connect is the newer
+intent and the disconnect that preceded it does not invalidate it. The lock does
+not decide the *policy*, it just makes the outcome deterministic and consistent
+with whatever actually happened first.
+
+### 9.4.2 Where each fence applies in a callback
+
+A reconnect callback is **four stages**, not one outbound operation, and each
+fence has a place. Stating it explicitly is what stops an implementation from
+holding a lock across a network call, or from applying a resource verification
+that a disconnect has since invalidated.
+
+| Stage | Lock? | Fence applied | Writes |
+|---|---|---|---|
+| **1. Consume the request** | Yes, brief | `consumed_at` single-use (M3) | `consumed_at` |
+| **2. Token exchange with Google** | **No** | — | none |
+| **3. Credential persistence** | Yes | **generation equality** (§9.4) | credential, `granted_scopes`, `status = awaiting_resource_selection`, errors cleared |
+| **4. Stored-resource verification** | **No** | — | none |
+| **5. Apply the verification result** | Yes | **generation equality again, plus the §9.3 snapshot** | terminal status and health fields, per §5.1.1 |
+
+The invariants that follow, in the order they matter:
+
+- **After the token exchange and *before any* credential or state persistence**,
+  stage 3 locks the connection and requires
+  `connection.lifecycle_generation == request.connection_generation`. A
+  disconnect or a newer authorization that landed during the exchange stops the
+  callback here, and **nothing at all is written** — no credential row, no
+  status, no scopes.
+- **No database lock is held across stage 2 or stage 4.** Both are network calls
+  of unbounded duration; holding a row lock across either would block every
+  other operation on that integration for as long as Google takes.
+- **Stage 5 re-checks.** Credentials committed at stage 3 do not license a
+  terminal write later: the generation is checked *again*, and the §9.3
+  snapshot (captured immediately after stage 3 commits, before stage 4's call)
+  is compared as well. A disconnect, a newer authorization, or a concurrent
+  resource change between stages 3 and 5 discards the verification result.
+- **A discarded stage 5 is safe, not broken.** The connection sits in
+  `awaiting_resource_selection` holding valid credentials — truthful, since
+  access was never proven — and the user's next Test connection or selection
+  resolves it. If a disconnect caused the discard, the disconnect has already
+  deleted those credentials and set `disconnected`, and stage 5 writing nothing
+  is exactly right.
+
+This is what closes the window the review named: *disconnect or a new
+authorization arriving after credential persistence but before resource
+verification finishes cannot let the callback write `connected` or `error`
+afterwards.*
+
 ### 9.5 Race resolution table
 
 | Race | Fenced by | Comparison | Result |
@@ -900,10 +1056,14 @@ at all.
 | A — stale 401 from the *provider* after reconnect | `credential_updated_at` | equality | Discarded; connection stays `connected` |
 | B — stale 403 after resource change | `external_resource_id` | equality | Discarded; connection stays `connected` on the new resource |
 | C — disconnect **before** the callback consumes its request | `consumed_at` set by disconnect | n/a | `InvalidState` at consumption; nothing written |
+| **C″ — repeat disconnect while a Connect is past consumption** | `lifecycle_generation`, advanced by the *already-disconnected* disconnect (§9.1) | **equality** | Discarded; the hole revision 4 left open |
 | **C′ — disconnect *after* consumption, callback still running** | `lifecycle_generation` (§9.4) | **equality** | Discarded at finalization; no credential, no resurrection |
 | **D — older callback returns after a newer authorization completed** | `lifecycle_generation` (§9.4) | **equality** | Discarded; the newer attempt's state survives |
 | Two concurrent health checks | `connection_updated_at` | equality | The later one discards |
 | Two concurrent resource changes | Row lock, then fence | equality | Serialized; the second discards |
+| **Two concurrent `start_authorization` calls** | `select_for_update` around the increment (§9.4.1) | **equality** | Distinct generations; only the later attempt can finalize |
+| **`start_authorization` racing `disconnect`** | `select_for_update` around the increment (§9.4.1) | **equality** | Whichever commits second owns the generation; the other is superseded |
+| **Disconnect between credential persistence and resource verification** | generation re-checked at stage 5 (§9.4.2) | **equality** | Verification result discarded; no `connected`, no `error` |
 | Health check racing a resource change it started before | `external_resource_id` | equality | Discarded |
 | Legitimate Connect **after** a disconnect | `lifecycle_generation` matches | **equality** | **Allowed** — the case that ruled out every status- or clock-based rule |
 
@@ -1060,7 +1220,9 @@ tests that hold them. Specific to M6:
   body, so it cannot be turned into a probe for arbitrary resources.
 - **Change-resource keeps every M4 protection**; lifting the guard changes *when*
   a selection may be made, never *how* it is proven (§6).
-- No new scope, no new token storage, no change to encryption or refresh.
+- No new scope, no new token storage, no change to how tokens are encrypted.
+  The refresh **path** changes (§9.3.1) — it gains a fence and can now discard
+  a result — but what it stores, and how, is untouched.
 - New endpoints are POST, so CSRF applies through the existing
   `SessionAuthentication` path, and both are throttled.
 
@@ -1197,10 +1359,43 @@ and each must still resolve correctly:
   both directions.
 - R1 and R2 created at the same frozen instant: exactly one succeeds, and it is
   R2 — the one whose generation the connection holds.
-- A generation counter test proving the increment happens in exactly the two
-  places §9.4 names, and nowhere else: a health check, a resource change and a
-  repeat disconnect on an already-disconnected connection all leave
-  `lifecycle_generation` unchanged.
+- A generation counter test proving it advances on **every** invocation of the
+  two intent operations and on nothing else: a health check, a resource change,
+  a token refresh and a completing callback all leave `lifecycle_generation`
+  untouched, while **a disconnect of an already-disconnected connection
+  advances it**, as does a `start_authorization` on a connection already in
+  `pending_authorization`.
+
+**Race C″ — repeat disconnect while a Connect is in flight (§9.1).** The
+ordering revision 4 left open, reproduced exactly:
+
+```
+connection DISCONNECTED
+→ Connect starts (generation captured)
+→ callback consumes its request; the token exchange is stubbed to block
+→ Disconnect again  (status already disconnected)
+→ callback resumes
+```
+
+Assert: the generations mismatch, **no `IntegrationCredential` row exists**, no
+`INTEGRATION_AUTHORIZED` or `INTEGRATION_RECONNECTED` event was written, the
+status is still `disconnected`, and no second `INTEGRATION_DISCONNECTED` event
+was written either — idempotent in result, not inert in effect.
+
+**Atomicity of the increment (§9.4.1)** — two `start_authorization` calls
+serialized through the row lock capture **distinct** generations, and the
+connection ends at the higher one; `start_authorization` racing `disconnect`
+leaves the connection at whichever committed second, with the other side's
+attempt superseded. Both asserted by driving the two operations against the same
+connection and inspecting the resulting request rows.
+
+**Callback staging (§9.4.2)** — the interleaving the stage model exists for:
+credentials are persisted at stage 3, then a **disconnect lands**, then the
+stored-resource verification returns. Assert the verification result is
+**discarded** — the connection is `disconnected` with no credential, and neither
+`connected` nor `error` was written by the callback. Plus the milder case: a
+*newer authorization* lands between stages 3 and 5, and the older callback's
+verification result is discarded rather than overwriting it.
 - Two concurrent health checks: the later result discards.
 - A discarded result writes **nothing at all** — asserted field by field, since
   "discard but still stamp the timestamp" is the tempting wrong implementation.
@@ -1239,8 +1434,11 @@ outstanding authorization requests**; **remove `DISCONNECTED` from
 credential is stored**; **remove the §9.3.1 refresh fence**, then remove only
 its `invalid_grant` arm, then only its success arm; **stop
 `start_authorization` from incrementing the generation**, then stop
-`disconnect` from incrementing it; **compare generations with `>` instead of
-`!=`**; **collapse the §5.1.1 transient outcome into
+`disconnect` from incrementing it, then **stop only the already-disconnected
+path from incrementing it** (the revision-4 bug, restored deliberately);
+**compare generations with `>` instead of `!=`**; **move the increment outside
+`select_for_update`**; **drop the stage-3 generation check**, then the stage-5
+one; **collapse the §5.1.1 transient outcome into
 `resource_not_accessible`**; make denial set `error`; and make `error` always
 offer the authorization action regardless of error class. Each must turn the
 suite red.
@@ -1459,3 +1657,31 @@ anticipates or blocks it.
 Explicitly still out of scope, and still out of V1: scheduled or background
 health checks, retry policies, notifications, any analytics data, and
 grant-wide revocation (§13).
+
+---
+
+## 19. Internal-consistency record
+
+Revisions 4 and 5 changed two things the earlier text asserted throughout — that
+M6 needed no migration, and that `google/credentials.py` was unchanged. Every
+occurrence has been reconciled so the implementation plan has one source of
+truth. Recorded here so a reader can verify the sweep rather than trust it.
+
+| Term | Occurrences | Status |
+|---|---|---|
+| "no migration" | §0 revision header, §1 finding 2, §8, §9.6, §11 | **Reconciled.** §11 is authoritative: **one migration, and it is required.** Finding 2 now says only that the *health and error* fields already exist. §8 now says only that `audit` needs no schema change |
+| "unchanged" (credentials) | §1 finding 7, §9.3.1, §10, §13 | **Reconciled.** `google/credentials.py` is **modified**. Finding 7 says the error *mapping* is reused, not the module; §13 says the storage format is untouched while the path gains a fence |
+| "unchanged" (other) | §4.1 denial rows, §10 provider modules, §15 invariants | **Correct as written.** Provider modules and `resources.py` genuinely do not change; the denial rows describe M3 behaviour M6 preserves |
+| "repeat disconnect" | §3.2, §9.1, §9.4, §9.5 (C″), §14 | **Reconciled.** Idempotent in result, never write-inert: it advances the generation and consumes outstanding requests. The revision-4 test asserting the generation was unchanged is **replaced** |
+| "exactly two places" | — | **Removed.** Replaced by "exactly two *operations*", with the explicit statement that every invocation counts, not only state-changing ones (§9.4) |
+| `lifecycle_generation` | §9.4, §9.4.1, §9.4.2, §9.5, §10, §11, §14, §16, §17 | **Consistent.** Defined in §9.4, atomicity in §9.4.1, placement in §9.4.2, migration in §11, rollback in §16 |
+
+Two further statements worth pinning, because both were true in earlier
+revisions and are not now:
+
+- **"No provider module changes at all"** (§10) is still true. `ga4.py`,
+  `search_console.py` and `resources.py` are untouched; the catalog stays at
+  three methods.
+- **"The row lock is taken after the outbound call"** (§9.2) remains the rule
+  for lifecycle operations, and §9.4.2 states the one place a lock is taken
+  *around* a write that follows an outbound call — never across one.
