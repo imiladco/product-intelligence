@@ -2,7 +2,19 @@
 
 Design draft. 2026-09-04. Revised after review; not implemented; not approved.
 
-**Revision — what the review asked for and where it lives:** a stale-result
+**Revision 3 — what the second review found:** forced consent is required
+after a disconnect, because the local refresh token is gone while Google's
+authorization is not (§5.3); the Race C fence only covered callbacks that had
+not yet consumed their request, so authorization finalization needs its own
+fence covering an already-running callback and a superseded older one (§9.4);
+idempotent disconnect must still invalidate in-flight authorizations (§9.1);
+reconnect verification failure needed the same taxonomy split as everything
+else rather than one collapsed path (§5.1); the transition table misstated M3's
+denial behaviour, which is non-destructive (§4.1); and the fence-convention test
+must assert that `updated_at` **changed**, not that wall-clock time advanced
+(§14).
+
+**Revision 2 — what the first review asked for and where it lives:** a stale-result
 fence, designed and tested against three named races (§9); a recovery model
 keyed on `status` **and** `last_error_code` rather than status alone, with the
 full action matrix (§7.1); a staging checklist that treats grant revocation as
@@ -162,7 +174,9 @@ allowed.
 | `reauth_required` | reauthorization completes, stored resource verifies | `connected` | as above |
 | `reauth_required` | reauthorization completes, no stored resource | `awaiting_resource_selection` | M3 behaviour, unchanged |
 | `reauth_required` | reauthorization completes, stored resource fails to verify | `awaiting_resource_selection` | resource id **retained**, error fields set (§5.2) |
-| any | reauthorization denied / scope not granted | `error` | M3 behaviour, unchanged |
+| any *with a credential* | authorization **denied** by the user | *unchanged* | Nothing. Credential, status and resource all preserved; `INTEGRATION_AUTHORIZATION_FAILED` recorded (§5.5) |
+| first authorization, no credential | authorization **denied** by the user | *row deleted* → `not_connected` | M3 behaviour, unchanged |
+| any | **scope not granted** | `error` | `scope_not_granted`; M3 behaviour, unchanged |
 | `disconnected` | authorize completes, stored resource verifies | `connected` | credential recreated; resource restored |
 | `disconnected` | health check | — | `409 credential_missing`; no state change |
 
@@ -226,16 +240,43 @@ New terminal logic, after credentials are stored and scopes verified:
 if no stored external_resource_id:
     status = awaiting_resource_selection          # unchanged from M3
 else:
-    verify the stored resource with the new credential
-      success  -> status = connected, both timestamps, errors cleared
-      failure  -> status = awaiting_resource_selection,
-                  resource id and label RETAINED, error fields set
+    verify the stored resource with the new credential, and apply §5.1.1
 ```
 
 So the ordinary reconnect — credential expired, user re-authorizes, everything
 else still fine — returns straight to `connected` on the same property, with no
 re-picking. That is "preserve the selection when still valid", and the *when
 still valid* is decided by a live call, never assumed.
+
+### 5.1.1 Reconnect verification outcomes
+
+"Failure" is not one thing, and collapsing it into a single
+`awaiting_resource_selection` path would contradict the taxonomy in §4.3. The
+same four classes apply here as everywhere else:
+
+| Verification outcome | Status | Resource | `last_error_code` | Primary recovery (§7.2) |
+|---|---|---|---|---|
+| Success | `connected` | kept | cleared | — |
+| `ResourceNotAccessible` (403/404/`siteUnverifiedUser`) | `awaiting_resource_selection` | **retained** | `resource_not_accessible` | **Change property** |
+| Credential rejected (401 / `invalid_grant`) | `reauth_required` | **retained** | `credential_refresh_failed` | **Reconnect** |
+| Transient (429/5xx/timeout) | `awaiting_resource_selection` | **retained** | `resource_unavailable` | **Test connection** |
+
+Three things this gets right that the collapsed version did not:
+
+- **A transient blip never claims the resource became inaccessible.** The error
+  code is `resource_unavailable`, which is the transient class, so the card
+  offers *Test connection* — non-destructive, and the truthful next step. The
+  user is not sent to re-pick a property that is probably fine.
+- **A credential rejected immediately after a successful token exchange is
+  real, and says so.** It happens when access is revoked between the exchange
+  and the verify. `reauth_required` is honest: we hold a credential Google will
+  not accept. Recovery is Reconnect, and the resource is retained so the repair
+  costs nothing extra.
+- **Only a genuine resource failure sends the user to the picker**, which is the
+  only case where re-picking is the actual fix.
+
+In every non-success row the resource id and label are **retained** (§5.2), and
+in none of them is `last_successful_check_at` touched.
 
 ### 5.2 Why a failed re-verify retains the resource id
 
@@ -254,7 +295,7 @@ All M3 rules preserved verbatim:
 
 - A token response without a `refresh_token` never blanks the stored one.
 - `prompt=consent` is sent only when a new refresh token is actually needed —
-  `_needs_forced_consent` already returns true for `REAUTH_REQUIRED`.
+  and M6 adds one state where it is (§5.3.1).
 - Granted scopes are verified explicitly; a missing required scope is
   `ScopeNotGranted` → `error`, never a silent partial connection.
 - `granted_scopes` is overwritten with what Google actually granted this time.
@@ -266,7 +307,63 @@ re-consent, the existing check fails the reconnect into `error` with
 `scope_not_granted`. If they grant *more* than we need, we store what was
 granted and carry on: extra scope is Google's business, not a failure.
 
-### 5.4 Revoked credentials
+### 5.3.1 `DISCONNECTED` must force consent
+
+`_needs_forced_consent` returns true today for `REAUTH_REQUIRED` and for
+`ERROR` + `no_refresh_token`. **`DISCONNECTED` must be added**, and the reason
+is a direct consequence of §0's decision not to revoke:
+
+```
+disconnect                    → our refresh token is deleted
+                              → Google's authorization still exists
+user clicks Connect           → no prompt=consent, because the state is not
+                                one of the two that force it
+Google sees existing consent  → may omit refresh_token entirely
+_store_credentials            → no new token, and none stored to preserve
+                              → NoRefreshToken → error
+```
+
+The user's first attempt after a disconnect fails. It self-heals on the second
+attempt — `ERROR` + `no_refresh_token` does force consent — but a first try that
+fails for a reason we designed in is not acceptable when one predicate fixes it.
+
+`DISCONNECTED` is *precisely* the state where a new refresh token is required:
+we deliberately destroyed ours while leaving Google's authorization intact.
+
+The full predicate after M6, with what each case must keep doing:
+
+| Connection state | Force consent? | Why |
+|---|---|---|
+| No connection row (first authorization) | **No** | Google issues a refresh token on first authorization anyway; forcing consent is user-hostile for no gain |
+| `PENDING_AUTHORIZATION` | No | Same as a first authorization; nothing has been stored |
+| `AWAITING_RESOURCE_SELECTION` | No | A refresh token is already stored |
+| `CONNECTED` (voluntary re-authorization) | **No** | The stored refresh token still works; a response without one preserves it |
+| `ERROR` + `no_refresh_token` | Yes | Unchanged from M3 |
+| `ERROR` (other codes) | No | The credential is not the problem |
+| `REAUTH_REQUIRED` | Yes | Unchanged from M3 |
+| **`DISCONNECTED`** | **Yes (new)** | Our refresh token is gone and Google's consent is not |
+
+### 5.4 Cancellation is non-destructive
+
+M3's denial path is **not** an error path, and the first draft of this design
+described it wrongly. What it actually does, and what M6 preserves:
+
+| Situation | Behaviour |
+|---|---|
+| A first authorization is denied, and no credential is stored | The connection row is **deleted**; the integration returns to `not_connected` |
+| An authorization on an **existing** integration is denied | The credential, the status and the resource are all **left exactly as they were**. No `error`, no state change |
+| Either case | `INTEGRATION_AUTHORIZATION_FAILED` is recorded with `access_denied` |
+
+Backing out of a Google consent screen must never damage a working integration.
+A user who clicks Reconnect, thinks better of it, and presses back still has the
+integration they had a minute ago.
+
+**`ScopeNotGranted` is a different case and is not conflated with it.** Denial
+means "I did not do this"; a missing scope means "I did this, but withheld
+something the integration requires". The second is a genuine misconfiguration
+and does set `error`, which is M3 behaviour and correct.
+
+### 5.5 Revoked credentials
 
 A user who revokes access in their Google account sees, on the next call:
 `invalid_grant` → `reauth_required` → **Reconnect** → `prompt=consent` (because
@@ -335,7 +432,9 @@ primary action:
 | `not_connected` | — | Connect | — | Not connected |
 | `pending_authorization` | — | Restart authorization | — | Connecting |
 | `awaiting_resource_selection` | *(none)* | Select property | Disconnect | Select a property |
-| `awaiting_resource_selection` | `resource` class | Select property | Disconnect | Select a property + error note |
+| `awaiting_resource_selection` | `resource` class | **Change property** | Test connection, Disconnect | Select a property + error note |
+| `awaiting_resource_selection` | `transient` class | **Test connection** | Change property, Disconnect | Select a property + muted note |
+| `awaiting_resource_selection` | `credential` class | **Reconnect** | Disconnect | Select a property + error note |
 | `connected` | *(none)* | Test connection | Change property, Disconnect | Connected |
 | `connected` | `transient` class | Test connection | Change property, Disconnect | Connected + **muted note** |
 | `error` | `resource` class | **Change property** | Test connection, Disconnect | Error |
@@ -477,9 +576,26 @@ same reason: nothing happened.
 | Operation | Idempotent? | How |
 |---|---|---|
 | Health check | Yes, apart from timestamps | Pure re-verification; no resource state is written |
-| Disconnect | Yes | Already `disconnected` → 200, no writes, no audit row |
+| Disconnect | Yes, for connection state and audit — **but never a no-op** | Already `disconnected` → 200, no connection fields written and no audit row, **but outstanding authorization requests are still invalidated** (see below) |
 | Change resource | Yes for the same id | Existing M4 behaviour, unchanged |
-| Reconnect | Yes | Each attempt is its own single-use OAuth state; M3 supersedes older unconsumed requests for the same user+project+provider |
+| Reconnect | Yes | Each attempt is its own single-use OAuth state; M3 supersedes older unconsumed requests, and §9.4 supersedes ones already in flight |
+
+**Disconnect is idempotent, not inert.** A connection can be `DISCONNECTED`
+*while a new authorization is in flight*, because `start_authorization`
+deliberately preserves durable status (M3). So "already disconnected → do
+nothing" would leave a live authorization attempt able to complete against an
+integration the user has just told us, again, to switch off.
+
+Every disconnect therefore invalidates outstanding authorization requests for
+that (project, provider), whether or not it changes the connection:
+
+| Aspect | Second disconnect on an already-disconnected integration |
+|---|---|
+| Connection fields | Not written |
+| Credential | Already gone; nothing to delete |
+| Audit event | **Not** written — nothing happened to the integration |
+| Outstanding authorization requests | **Consumed** — this is the part that is not idempotent-as-no-op |
+| Response | 200 with the current entry |
 
 ### 9.2 The problem the row lock does not solve
 
@@ -546,28 +662,94 @@ fence, and these two fields keep the specific races covered even then. §14 adds
 a test that asserts the convention directly, so the redundancy is a backstop
 rather than the plan.
 
-### 9.4 The fence for C — invalidate outstanding authorizations on disconnect
+### 9.4 The authorization finalization fence
 
-A timestamp comparison is the wrong tool here. Comparing
-`connection.updated_at` against `oauth_request.created_at` would also discard a
-perfectly good reconnect whose connection merely had a health-check timestamp
-written while the user was at Google — a false positive that throws away work
-the user actually did.
+The first draft fenced Race C by having disconnect consume outstanding
+authorization requests. **That is necessary but not sufficient**, and the gap is
+in the callback's own ordering:
 
-The right tool already exists. `OAuthAuthorizationRequest.consumed_at` is
-documented as meaning *"this request can no longer complete an
-authorization"*, and `start_authorization` already uses it to supersede
-outstanding attempts. **Disconnect does the same:** in the same transaction that
-deletes the credential and sets `disconnected`, it marks every unconsumed
-authorization request for that (project, provider) consumed.
+```
+_consume_request()          # consumed_at committed, transaction closed
+  ...token exchange with Google...   # seconds, and blockable
+_store_credentials(); status = …     # the write
+```
 
-A late callback then fails `_consume_request` and returns `InvalidState` — the
-existing path, the existing error, the existing redirect. No new field, no new
-comparison, and the semantics are the ones already written down.
+Once the request is consumed, disconnect can no longer see it. So:
 
-This also settles the reverse ordering: if the user disconnects and then starts
-a *new* authorization, `start_authorization` supersedes anything older, so the
-stale callback cannot land on top of the new one either.
+> **Race C′** — callback consumes its request → token exchange is slow → user
+> disconnects (finds nothing unconsumed to invalidate) → callback resumes and
+> writes credentials → the explicitly disconnected connection is resurrected.
+
+And the same window admits a second case that supersession-at-start also
+misses, because `start_authorization` only supersedes *unconsumed* requests:
+
+> **Race D** — callback R1 consumes its request and begins the token exchange →
+> the user starts R2 → R2 completes → R1 returns late and overwrites R2's
+> credentials and state with older ones.
+
+Both are the same question asked at the same moment: **at the instant of
+writing, is this authorization attempt still the user's current intent?** So
+both get one fence, evaluated inside the finalization transaction, under
+`select_for_update` on the connection.
+
+```python
+def _authorization_is_superseded(connection, request) -> bool:
+    # D — a newer attempt exists for this integration.
+    if OAuthAuthorizationRequest.objects.filter(
+        project_id=request.project_id,
+        provider=request.provider,
+        created_at__gt=request.created_at,
+    ).exists():
+        return True
+
+    # C′ — the integration was disconnected after this attempt began.
+    if (
+        connection.status == ConnectionStatus.DISCONNECTED
+        and connection.updated_at > request.created_at
+    ):
+        return True
+
+    return False
+```
+
+Superseded → **write nothing**: no credential, no status, no scopes, no audit
+event beyond the existing failure record. The callback redirects with
+`invalid_state`, the same terminal the user already sees for a stale link.
+
+Three details that make this correct rather than merely plausible:
+
+- **The disconnect check is specific to `DISCONNECTED`.** A blanket
+  `connection.updated_at > request.created_at` comparison would discard a
+  perfectly good reconnect whose connection merely had a health-check timestamp
+  written while the user was at Google. Only an explicit disconnect supersedes
+  an authorization.
+- **The timestamp comparison is required, not optional.** "Status is
+  `DISCONNECTED` → discard" alone would break the legitimate
+  Connect-after-disconnect flow entirely, because `start_authorization`
+  deliberately preserves durable status (M3): during a valid reconnect *from*
+  `disconnected`, the status is still `disconnected` when the callback lands.
+  Comparing against `request.created_at` separates "disconnected before you
+  clicked Connect" (allow) from "disconnected while you were at Google"
+  (discard).
+- **Race D's check is scoped to (project, provider), not to the user.**
+  `start_authorization` supersedes per user+project+provider, because it is
+  protecting a user from their own abandoned tabs. Finalization is protecting
+  *the connection*, which is shared by every member of the workspace, so the
+  newest attempt wins regardless of who started it. The loser sees the ordinary
+  "that authorization link is no longer valid" message.
+
+**What this rests on, stated so it can be checked:** `connection.updated_at` is
+a usable proxy for "when the disconnect happened" only while nothing else
+writes to a disconnected connection. Today nothing does — a health check
+returns 409 without writing, resource selection returns 409, an idempotent
+disconnect writes no connection fields (§9.1), and `start_authorization` does
+not save an existing row. §14 pins this with a direct test.
+
+**If that invariant cannot be held**, the answer is a `lifecycle_generation`
+integer on `IntegrationConnection`, incremented by disconnect and captured in
+the authorization request — a real migration, proposed properly, not a weakened
+fence. This design does not need it, and says so on evidence rather than
+preference; implementation stops and proposes it if the evidence changes.
 
 ### 9.5 Race resolution table
 
@@ -575,10 +757,13 @@ stale callback cannot land on top of the new one either.
 |---|---|---|
 | A — stale 401 after reconnect | `credential_updated_at` (and `connection_updated_at`) | Discarded; connection stays `connected` |
 | B — stale 403 after resource change | `external_resource_id` (and `connection_updated_at`) | Discarded; connection stays `connected` on the new resource |
-| C — callback after disconnect | `consumed_at` set by disconnect | `InvalidState`; no credential written, no resurrection |
+| C — disconnect **before** the callback consumes its request | `consumed_at` set by disconnect (§9.1) | `InvalidState` at consumption; nothing written |
+| **C′ — disconnect *after* consumption, callback still running** | §9.4 finalization fence, `DISCONNECTED` + `updated_at > request.created_at` | Discarded at the write; no credential, no resurrection |
+| **D — older callback returns after a newer authorization completed** | §9.4 finalization fence, newer request exists | Discarded; R2's credentials and state survive |
 | Two concurrent health checks | `connection_updated_at` | The later one discards; losing a redundant health result costs nothing |
 | Two concurrent resource changes | Row lock, then fence | Serialized; the second discards rather than overwriting the first with a result about the old state |
 | Health check racing a resource change it started before | `external_resource_id` | Discarded |
+| Legitimate Connect **after** a disconnect | Not fenced — `updated_at < request.created_at` | Allowed, which is the point of the timestamp comparison |
 
 ### 9.6 Why this needs no migration — stated as a decision, not a preference
 
@@ -596,9 +781,14 @@ the reasoning rather than the conclusion:
 - The one genuine weakness — a future save that omits `updated_at` — is
   addressed by the two redundant fields in §9.3 *and* by a direct test (§14).
 
-If implementation finds a case the snapshot cannot express, that is the signal
-to stop and propose the column, with this section rewritten to say why. It is
-not a reason to weaken the fence.
+This reasoning covers the §9.3 fence. The §9.4 authorization fence rests on a
+different and narrower assumption — that nothing writes to a disconnected
+connection — which is stated there and tested, with `lifecycle_generation` named
+as its escape hatch.
+
+If implementation finds a case either fence cannot express, that is the signal
+to stop and propose the column, with the relevant section rewritten to say why.
+It is not a reason to weaken a fence.
 
 ## 10. Backend service boundaries
 
@@ -706,12 +896,34 @@ disconnected → 409 `credential_missing`; the request body is ignored (a posted
 `resource_id` for another resource is never called).
 
 **Reconnect** — from `reauth_required` with a valid stored resource →
-`connected`, same resource, no re-pick; with a resource that fails verification
-→ `awaiting_resource_selection` with the id **retained** and an error recorded;
-with no stored resource → `awaiting_resource_selection` (M3 behaviour intact);
-`prompt=consent` is sent from `reauth_required` and **not** from `connected`; a
-token response without a refresh token leaves the stored one intact; a missing
-scope → `error` `scope_not_granted`; one `INTEGRATION_RECONNECTED` row.
+`connected`, same resource, no re-pick; with no stored resource →
+`awaiting_resource_selection` (M3 behaviour intact); a token response without a
+refresh token leaves the stored one intact; a missing scope → `error`
+`scope_not_granted`; one `INTEGRATION_RECONNECTED` row.
+
+**Reconnect verification outcomes (§5.1.1)** — one test per row of that matrix,
+asserting status, retained resource, error code **and** the resulting primary
+action together, so a transient blip can never be shown to the user as a lost
+property.
+
+**Forced consent (§5.3.1)** — `prompt=consent` is sent from `REAUTH_REQUIRED`,
+from `ERROR` + `no_refresh_token`, and **from `DISCONNECTED`**; it is **not**
+sent for a first authorization, from `PENDING_AUTHORIZATION`, from
+`AWAITING_RESOURCE_SELECTION`, from `CONNECTED`, or from `ERROR` with any other
+code. Asserted by inspecting the built authorization URL, as M3 already does.
+
+**The disconnect → reconnect round trip** — disconnect, then authorize, with the
+token response carrying a **new** refresh token, then the remembered resource
+re-verifies: the connection reaches `connected` on the same resource, the new
+refresh token is stored, and the audit row is `integration.authorized` (not
+`reconnected`, per §8.1). This is the path §5.3.1 exists to make work on the
+first attempt.
+
+**Cancellation is non-destructive (§5.4)** — denial of an authorization on an
+integration that already has a credential leaves status, credential and resource
+untouched and records `access_denied`; denial of a first authorization removes
+the row; neither produces `error`. `ScopeNotGranted` still does produce `error`,
+asserted separately so the two are never conflated.
 
 **Disconnect** — deletes the `IntegrationCredential` row; leaves the resource id
 and label; leaves `last_successful_check_at`; status `disconnected`; one
@@ -742,18 +954,42 @@ the interleaving deterministically without threads:
 - *Race B* — a health check whose 403 for resource A arrives after the user
   changed to resource B: the connection stays `connected` on B, with B's label
   and metadata intact.
-- *Race C* — a disconnect between authorization start and callback: the callback
-  redirects with `invalid_state`, **no** `IntegrationCredential` row is created,
-  and the connection is still `disconnected`. Plus the direct unit assertion
-  that disconnect marks outstanding authorization requests consumed.
+- *Race C* — a disconnect **before** the callback consumes its request: the
+  callback redirects with `invalid_state`, **no** `IntegrationCredential` row is
+  created, and the connection is still `disconnected`. Plus the direct unit
+  assertion that disconnect marks outstanding authorization requests consumed.
+- *Race C′* — the ordering the first draft missed, reproduced explicitly:
+  **consume the request, then disconnect, then let the callback resume**. The
+  token exchange is stubbed to perform the disconnect before returning, so the
+  interleaving is deterministic. Assert no `IntegrationCredential` row exists,
+  the status is still `disconnected`, `granted_scopes` is unchanged, and no
+  `INTEGRATION_AUTHORIZED` or `INTEGRATION_RECONNECTED` event was written.
+- *Race D* — R1 consumes its request and begins its exchange; R2 is started and
+  completes; R1 then returns. Assert the stored credential is **R2's**, the
+  status is the one R2 produced, and R1 wrote nothing. Deterministic via the
+  same stub-performs-the-interleaving technique.
+- *The legitimate case the fence must not break* — disconnect, then Connect,
+  then complete the callback: it **succeeds**, because the disconnect predates
+  the authorization request. This is the counterpart that stops the C′ fence
+  from being implemented as "status is disconnected → always discard".
 - Two concurrent health checks: the later result discards.
 - A discarded result writes **nothing at all** — asserted field by field, since
   "discard but still stamp the timestamp" is the tempting wrong implementation.
 
 **The fence convention** — a test asserts that every service function which
 mutates `IntegrationConnection` or `IntegrationCredential` leaves `updated_at`
-strictly greater than it was. This is what makes the `updated_at` component of
-the fence trustworthy rather than conventional (§9.6).
+**different from** what it was. Deliberately not "strictly greater": §9.6's
+whole argument is that the fence compares for *equality* and therefore needs no
+monotonic clock, and a test demanding wall-clock ordering would quietly assert a
+property the design says it does not rely on — and could fail on a clock
+adjustment for reasons that have nothing to do with the fence.
+
+**The §9.4 invariant** — a test asserts that no service path writes to a
+connection in `DISCONNECTED` state: a health check returns 409 without touching
+`updated_at`, resource selection returns 409 without touching it, a repeat
+disconnect leaves it unchanged, and `start_authorization` on a disconnected
+connection leaves it unchanged. This is what makes `updated_at` a sound proxy
+for the disconnect time.
 
 **Recovery classes (§7.1)** — a backend test asserts the set of error codes that
 can persist on a connection equals the set the frontend map handles, and names
@@ -770,8 +1006,12 @@ unauthenticated 403.
 deleting the row; let a failed reconnect verification set `connected`; add a
 revoke call; **remove each of the three fence fields in turn**; let a discarded
 result still write `last_health_check_at`; **stop disconnect from consuming
-outstanding authorization requests**; and make `error` always offer the
-authorization action regardless of error class. Each must turn the suite red.
+outstanding authorization requests**; **remove `DISCONNECTED` from
+`_needs_forced_consent`**; **drop each half of the §9.4 finalization fence in
+turn** (the newer-request check, then the disconnect check); **collapse the
+§5.1.1 transient outcome into `resource_not_accessible`**; make denial set
+`error`; and make `error` always offer the authorization action regardless of
+error class. Each must turn the suite red.
 
 Frontend — **the §7.2 matrix asserted row by row**, `status` ×
 `last_error_code`, including that a `resource`-class error offers Change
