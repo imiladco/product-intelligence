@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -520,4 +522,106 @@ describe("IntegrationCard ending an integration", () => {
       ).not.toBeInTheDocument();
     },
   );
+});
+
+describe("IntegrationCard recovery states", () => {
+  it("offers Reconnect, and no check, when the grant is gone", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "credential_refresh_failed",
+            last_error_message: "Google access has expired.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+    // Checking a credential we already know Google rejects proves nothing.
+    expect(
+      screen.queryByRole("button", { name: "Test connection" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers Try again when the authorization itself failed", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "scope_not_granted",
+            last_error_message: "The required permission was not granted.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Change property" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a transient failure on a working integration as a muted note", () => {
+    // Nothing is broken: the last attempt did not land. A destructive alert
+    // would say otherwise (§7.5).
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "connected",
+          connection: connection({
+            last_error_code: "resource_unavailable",
+            last_error_message: "Google could not be reached.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("status-badge")).toHaveTextContent("Connected");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    const note = screen.getByTestId("integration-error-note");
+    expect(note).toHaveTextContent("Google could not be reached.");
+    expect(note.className).not.toContain("destructive");
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+  });
+
+  it("keeps the destructive treatment for states that need the user", () => {
+    render(
+      <IntegrationCard
+        projectId={1}
+        entry={entry({
+          status: "error",
+          connection: connection({
+            status: "error",
+            last_error_code: "resource_not_accessible",
+            last_error_message: "That property is not available.",
+          }),
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("That property is not available.");
+  });
+
+  it("branches on no provider anywhere in the action row", () => {
+    // The neutrality claim, checked rather than intended, extended to the two
+    // components this milestone adds.
+    for (const file of [
+      "components/integrations/integration-card.tsx",
+      "components/integrations/test-connection-button.tsx",
+      "components/integrations/disconnect-dialog.tsx",
+    ]) {
+      const source = readFileSync(file, "utf8");
+      for (const forbidden of ["Analytics", "GA4", "ga4", "sc-domain", "Search Console"]) {
+        expect(source).not.toContain(forbidden);
+      }
+    }
+  });
 });

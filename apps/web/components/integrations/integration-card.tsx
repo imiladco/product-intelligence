@@ -81,8 +81,20 @@ export function IntegrationCard({
           </dl>
         ) : null}
 
-        {connection?.last_error_message ? (
-          <p role="alert" className="text-sm text-destructive">
+        {/* How a recorded error reads comes from the recovery model, not from
+            the card: a transient failure on a working integration is a muted
+            note beside a still-green badge, and only the states that need the
+            user to do something get the destructive treatment (§7.5). */}
+        {connection?.last_error_message && presentation.errorTone ? (
+          <p
+            data-testid="integration-error-note"
+            {...(presentation.errorTone === "destructive" ? { role: "alert" } : {})}
+            className={
+              presentation.errorTone === "destructive"
+                ? "text-sm text-destructive"
+                : "text-sm text-muted-foreground"
+            }
+          >
             {connection.last_error_message}
           </p>
         ) : null}
