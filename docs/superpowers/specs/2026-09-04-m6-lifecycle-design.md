@@ -619,6 +619,27 @@ never by whether a credential row happens to exist:**
 | **`disconnected`** | **`INTEGRATION_AUTHORIZED`** | The user deliberately ended the integration. Authorizing again starts it, it does not repair it — the lifecycle ended and a new one began |
 | `connected` | `INTEGRATION_RECONNECTED` | A voluntary re-authorization of a working integration |
 
+**Where `previous_status` is read.** Stage 3 of the callback (§9.4.2) is itself
+what sets `awaiting_resource_selection`, so reading the field afterwards would
+make every authorization look like it came from that state and would collapse
+the whole table above into one row.
+
+The value is therefore captured **inside stage 3's transaction, under the row
+lock, on the row as re-read and before any mutation** — the same read that
+evaluates the generation fence. It is then carried forward in memory and used
+to choose the event, which is written in that same transaction. Nothing later
+in the callback can change the decision: stage 5 writes status and health
+fields but no authorization event, so there is no second place for the two to
+disagree.
+
+Concretely, the order inside stage 3 is: lock and re-read → check the
+generation → **read `previous_status`** → write credentials, scopes and status
+→ write the audit event chosen from the value just read → commit.
+
+No new column is needed for this. If implementation finds a path where the
+pre-mutation status is genuinely unavailable at the point the event is written,
+that is a signal to stop and revisit, not to substitute the post-mutation value.
+
 Credential existence is deliberately **not** the discriminator. It is an
 implementation detail that happens to correlate today — a disconnected
 connection has no credential row — and it would give the wrong answer the moment
@@ -952,11 +973,7 @@ row**, and the increment is inside the lock:
 ```python
 # start_authorization and disconnect share this shape
 with transaction.atomic():
-    connection = (
-        IntegrationConnection.objects
-        .select_for_update()
-        .get(project=project, provider=provider_key)
-    )
+    connection = _locked_connection(project, provider_key, user)   # §9.4.1a
     connection.lifecycle_generation += 1
     generation = connection.lifecycle_generation      # the exact value, in hand
     connection.save(update_fields=["lifecycle_generation", "updated_at"])
@@ -968,6 +985,90 @@ with transaction.atomic():
     # disconnect only: delete the credential, set status, consume outstanding
     # requests, write the audit event when the status actually changed
 ```
+
+`disconnect` only ever runs against an existing connection, so for it
+`_locked_connection` is a plain `select_for_update().get(...)`. **A first
+authorization has no row to lock**, and that case needs stating rather than
+assuming.
+
+#### 9.4.1a The creation race — the unique constraint is the lock
+
+`select_for_update()` cannot lock a row that does not exist. Two simultaneous
+*first* Connects for the same `(project, provider)` therefore have nothing to
+serialize on until one of them has inserted, and the design must say what
+happens in that window instead of pretending the lock covers it.
+
+**`IntegrationConnection` already carries
+`UniqueConstraint(fields=["project", "provider"])`** (M1). That index is the
+serialization point for the creation case, and the row lock takes over from the
+moment the row exists.
+
+```python
+def _locked_connection(project, provider_key, user) -> IntegrationConnection:
+    # The connection for this integration, locked, creating it if needed.
+    connection = (
+        IntegrationConnection.objects
+        .select_for_update()
+        .filter(project=project, provider=provider_key)
+        .first()
+    )
+    if connection is not None:
+        return connection
+
+    try:
+        # A savepoint: a unique violation must not poison the outer
+        # transaction, which still has a request to create.
+        with transaction.atomic():
+            return IntegrationConnection.objects.create(
+                project=project,
+                provider=provider_key,
+                status=ConnectionStatus.PENDING_AUTHORIZATION,
+                connected_by=user,
+                # lifecycle_generation defaults to 0; the caller bumps it, so
+                # created and existing connections share one code path.
+            )
+    except IntegrityError:
+        # Lost the insert race. Postgres blocked this INSERT on the unique
+        # index until the winner committed, so the row is visible now, and
+        # select_for_update serializes the rest.
+        return (
+            IntegrationConnection.objects
+            .select_for_update()
+            .get(project=project, provider=provider_key)
+        )
+```
+
+Walk the required invariant with two concurrent first Connects, R1 and R2:
+
+| Step | R1 | R2 |
+|---|---|---|
+| `filter().first()` | no row | no row |
+| `create()` | **inserts**, holding the new row's lock | **blocks** on the unique index |
+| bump, create request | generation `0 → 1`; request carries `1` | still blocked |
+| commit | committed | INSERT fails → `IntegrityError` |
+| recover | — | savepoint rolled back; `select_for_update().get()` now **sees and locks** the committed row |
+| bump, create request | — | generation `1 → 2`; request carries `2` |
+
+Outcome, matching the invariant exactly: **one** connection row; **distinct**
+generations `1` and `2`; the connection holds the **newest**, `2`; only R2's
+callback can finalize, because R1's `1 ≠ 2`; and no uncaught `IntegrityError`
+reaches the view, so neither user sees a 500 — R1 simply receives an
+authorization URL that is superseded if R2 proceeds.
+
+Three details that make this correct on Postgres specifically:
+
+- **The `create` is wrapped in its own `atomic()` block**, which Django
+  implements as a savepoint. Without it the unique violation would abort the
+  *outer* transaction, and the recovery `get()` would fail with "current
+  transaction is aborted" — taking the request creation down with it.
+- **The blocked INSERT is what makes the recovery `get()` sound.** Postgres
+  holds the second inserter on the unique index until the first transaction
+  ends, so by the time `IntegrityError` is raised the winner has committed and
+  the row is visible to a fresh statement under `READ COMMITTED`.
+- **`get_or_create` would also work**, because Django wraps its create in the
+  same kind of savepoint. It is not used here because the explicit form
+  *documents* the race and its recovery, rather than leaving correctness resting
+  on a library internal a reader has to already know about.
 
 Two properties this shape gives, and both are needed:
 
@@ -992,10 +1093,11 @@ before creating the request — at which point it buys nothing.
 
 **The two orderings this must satisfy**, both tested (§14):
 
-| | Race | Required outcome |
-|---|---|---|
-| **A** | Two concurrent `start_authorization` calls | They capture **distinct** generations; only the later one's callback can finalize |
-| **B** | `start_authorization` racing `disconnect` | The row lock defines the order; whichever **commits second** owns the connection's final generation, and the other side's attempt is thereby superseded |
+| | Race | Serialized by | Required outcome |
+|---|---|---|---|
+| **A** | Two concurrent `start_authorization` calls, connection **exists** | row lock | They capture **distinct** generations; only the later one's callback can finalize |
+| **B** | `start_authorization` racing `disconnect` | row lock | Whichever **commits second** owns the connection's final generation, and the other side's attempt is thereby superseded |
+| **C** | Two concurrent **first** `start_authorization` calls, **no row yet** | **unique index**, then row lock (§9.4.1a) | One row; distinct generations; connection holds the newest; no duplicate row and no uncaught `IntegrityError` |
 
 Ordering B is genuinely either-way, and that is correct rather than a gap: if
 the disconnect commits second, the in-flight authorization is superseded and
@@ -1287,11 +1389,16 @@ asserted separately so the two are never conflated.
 
 **Disconnect** — deletes the `IntegrationCredential` row; leaves the resource id
 and label; leaves `last_successful_check_at`; status `disconnected`; one
-`INTEGRATION_DISCONNECTED` row; a second disconnect is 200, writes nothing and
-records **no** second event; **no request is made to the revoke endpoint** —
-asserted explicitly, because this is a decision a future reader might otherwise
-"fix"; reconnect after disconnect restores `connected` with the remembered
-resource.
+`INTEGRATION_DISCONNECTED` row. A **second** disconnect returns 200 with the
+status unchanged, the credential still absent and **no** second
+`INTEGRATION_DISCONNECTED` event — but it is not inert: `lifecycle_generation`
+**advances**, `updated_at` therefore changes, and any outstanding authorization
+requests are consumed (§9.1). Asserted field by field, because "idempotent" and
+"writes nothing" read as the same sentence only until you look.
+
+**No request is made to the revoke endpoint** — asserted explicitly, because
+this is a decision a future reader might otherwise "fix". Reconnect after
+disconnect restores `connected` with the remembered resource.
 
 **Change resource** — a different resource while `connected` now succeeds and
 replaces id, label and metadata together; a failed verification leaves **all
@@ -1389,6 +1496,27 @@ leaves the connection at whichever committed second, with the other side's
 attempt superseded. Both asserted by driving the two operations against the same
 connection and inspecting the resulting request rows.
 
+**The creation race (§9.4.1a)** — two `start_authorization` calls when **no
+connection row exists**, which the test above does not cover because it starts
+from an existing row. Two complementary tests, because one alone proves the
+wrong thing:
+
+- *The recovery branch, deterministically*: `IntegrationConnection.objects.create`
+  is patched to raise `IntegrityError` once, so the `except` path runs on demand.
+  Assert it recovers by selecting the existing row, locks it, bumps its
+  generation, and creates a request carrying that value — and that the
+  `IntegrityError` never escapes to the view.
+- *The real race, concurrently*: two threads under
+  `pytest.mark.django_db(transaction=True)` each call `start_authorization` for
+  the same `(project, provider)` with no row present. Assert **exactly one**
+  `IntegrationConnection` exists, the two requests carry **distinct**
+  generations, the connection holds the **higher** of the two, only the request
+  matching it can finalize, and neither call raised.
+
+The threaded test is the one that proves the constraint actually serializes;
+the patched test is the one that keeps the recovery branch covered when the
+threading is too fast to lose the race.
+
 **Callback staging (§9.4.2)** — the interleaving the stage model exists for:
 credentials are persisted at stage 3, then a **disconnect lands**, then the
 stored-resource verification returns. Assert the verification result is
@@ -1407,6 +1535,13 @@ whole argument is that the fence compares for *equality* and therefore needs no
 monotonic clock, and a test demanding wall-clock ordering would quietly assert a
 property the design says it does not rely on — and could fail on a clock
 adjustment for reasons that have nothing to do with the fence.
+
+**Audit event selection (§8.1)** — one test per row of the previous-status
+table, plus the ordering that makes it work: a reconnect from `reauth_required`
+writes `INTEGRATION_RECONNECTED`, **not** `INTEGRATION_AUTHORIZED`, proving the
+decision used the status as it was *before* stage 3 set
+`awaiting_resource_selection` rather than after. An authorization from
+`disconnected` writes `INTEGRATION_AUTHORIZED`. Exactly one event either way.
 
 **Migration** — `makemigrations --check` is clean after the two `AddField`s;
 existing rows default to `0` on both sides; and an authorization request created
@@ -1437,7 +1572,10 @@ its `invalid_grant` arm, then only its success arm; **stop
 `disconnect` from incrementing it, then **stop only the already-disconnected
 path from incrementing it** (the revision-4 bug, restored deliberately);
 **compare generations with `>` instead of `!=`**; **move the increment outside
-`select_for_update`**; **drop the stage-3 generation check**, then the stage-5
+`select_for_update`**; **remove the savepoint around the create in
+`_locked_connection`**, and separately **remove its `IntegrityError`
+recovery**; **read `previous_status` after stage 3's mutation instead of
+before**; **drop the stage-3 generation check**, then the stage-5
 one; **collapse the §5.1.1 transient outcome into
 `resource_not_accessible`**; make denial set `error`; and make `error` always
 offer the authorization action regardless of error class. Each must turn the
@@ -1674,7 +1812,9 @@ truth. Recorded here so a reader can verify the sweep rather than trust it.
 | "unchanged" (other) | §4.1 denial rows, §10 provider modules, §15 invariants | **Correct as written.** Provider modules and `resources.py` genuinely do not change; the denial rows describe M3 behaviour M6 preserves |
 | "repeat disconnect" | §3.2, §9.1, §9.4, §9.5 (C″), §14 | **Reconciled.** Idempotent in result, never write-inert: it advances the generation and consumes outstanding requests. The revision-4 test asserting the generation was unchanged is **replaced** |
 | "exactly two places" | — | **Removed.** Replaced by "exactly two *operations*", with the explicit statement that every invocation counts, not only state-changing ones (§9.4) |
-| `lifecycle_generation` | §9.4, §9.4.1, §9.4.2, §9.5, §10, §11, §14, §16, §17 | **Consistent.** Defined in §9.4, atomicity in §9.4.1, placement in §9.4.2, migration in §11, rollback in §16 |
+| `lifecycle_generation` | §9.4, §9.4.1, §9.4.1a, §9.4.2, §9.5, §10, §11, §14, §16, §17 | **Consistent.** Defined in §9.4, atomicity in §9.4.1, creation race in §9.4.1a, placement in §9.4.2, migration in §11, rollback in §16 |
+| "writes nothing" / "write nothing" | §9.3, §9.4, §9.4.2, §14 | **Verified.** Every remaining occurrence refers to a stale-result **discard**, where writing nothing is the rule. The one that described *disconnect* was wrong and is replaced (§14) |
+| "previous_status" | §4.1, §8, §8.1, §14 | **Reconciled.** §8.1 now states it is read inside stage 3's transaction, under the lock, **before** the status is mutated |
 
 Two further statements worth pinning, because both were true in earlier
 revisions and are not now:
