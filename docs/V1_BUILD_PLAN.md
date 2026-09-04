@@ -132,13 +132,36 @@ shows *Reauthorization required* → **Reconnect** restores *Connected* with the
 prior selection re-verified; **Disconnect** destroys credentials.
 
 Adds: reconnect flow preserving a still-valid selection, disconnect with
-revocation + credential deletion, the on-demand `health-check/` endpoint and
-**Test connection** action (moved here from Milestone 4), changing an already
-selected resource, the full error taxonomy surfaced in the UI, audit events on
-reconnect/disconnect/resource-change, `AuditEvent` admin.
+credential deletion, the on-demand `health-check` endpoint and **Test
+connection** action (moved here from Milestone 4), changing an already selected
+resource, the full error taxonomy surfaced in the UI, audit events on
+reconnect/disconnect/resource-change.
 
 Tests: every transition in the state machine, disconnect leaves no credential
 row, audit rows written with no sensitive metadata.
+
+**Delivered.** Three things differ from the sketch above, each decided in the
+M6 design and approved before implementation:
+
+- **Disconnect does not revoke the Google grant.** The sketch said
+  "revocation + credential deletion". One consent can cover more than this
+  connection, so revoking on the user's behalf could break integrations this
+  project never touched. Disconnect deletes what we hold and says so plainly in
+  the confirmation, with a link to the user's Google account permissions.
+- **`AuditEvent` admin is not part of this milestone.** No new admin surface
+  was needed to deliver the lifecycle, and adding one for its own sake would be
+  scope nobody asked for.
+- **Three M3 behaviours change deliberately**, all in `complete_authorization`
+  and all covered by new tests: which audit event a completed authorization
+  writes now depends on `previous_status` rather than being
+  `INTEGRATION_AUTHORIZED` unconditionally; a callback no longer ends
+  unconditionally in `awaiting_resource_selection`, because a still-valid
+  selection is preserved by re-verifying it; and authorization no longer treats
+  a new `IntegrationConnection` row as proof of first Google consent — when no
+  trustworthy stored refresh token can be preserved, it forces
+  `prompt=consent`, because the same Google account may already have authorized
+  this application through another project and Google may then return no
+  refresh token at all.
 
 ## Milestone 7 — Production deployment
 

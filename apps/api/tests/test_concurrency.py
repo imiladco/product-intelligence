@@ -1044,3 +1044,194 @@ class TestFenceConvention:
         )
         connection.refresh_from_db()
         assert connection.updated_at not in seen
+
+
+class TestUpgradeAcrossTheMigration:
+    """§11.2. Rows that predate the counter must still complete their flow.
+
+    Both fields default to 0, so an authorization already in flight when the
+    migration lands still matches the connection it started against — the
+    upgrade does not strand it.
+    """
+
+    @responses.activate
+    def test_existing_rows_default_to_generation_zero(
+        self, make_user_with_workspace, make_project
+    ):
+        from integrations.oauth_service import complete_authorization, hash_state
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        # Written the way the migration leaves them: neither row was ever
+        # touched by code that knows about the counter.
+        connection = connected_connection(project, user)
+        assert connection.lifecycle_generation == 0
+
+        request = OAuthAuthorizationRequest.objects.create(
+            state_hash=hash_state("pre-migration-state"),
+            project=project,
+            provider=ProviderKey.GA4,
+            user=user,
+            code_verifier="verifier",
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        assert request.connection_generation == 0
+
+        stub_token()
+        stub_property()
+        complete_authorization(user=user, state="pre-migration-state", code="code-1")
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+
+
+class TestFenceFieldsAreIndividuallyLoadBearing:
+    """§9.6. The redundant-looking Fence fields earn their place here.
+
+    ``external_resource_id`` and ``credential_updated_at`` duplicate
+    ``connection_updated_at`` only *while* every save lists ``updated_at`` in
+    ``update_fields``. That is a convention, and one forgetful save would
+    otherwise disable the whole fence silently — so the fence is checked
+    against a write that skips ``updated_at`` exactly as such a save would.
+    """
+
+    @responses.activate
+    def test_a_resource_change_that_skips_updated_at_is_still_detected(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        from integrations import lifecycle_service
+        from integrations.google.errors import ResourceNotAccessible
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = connected_connection(project, user)
+
+        catalog = get_provider(ProviderKey.GA4).resources
+
+        def change_resource_then_reject(access_token, resource_id):
+            # queryset.update() bypasses auto_now: updated_at does not move,
+            # so only external_resource_id can reveal that the world changed.
+            IntegrationConnection.objects.filter(pk=connection.pk).update(
+                external_resource_id="properties/222"
+            )
+            raise ResourceNotAccessible
+
+        monkeypatch.setattr(catalog, "verify_resource", change_resource_then_reject)
+
+        lifecycle_service.health_check(project=project, provider_key=ProviderKey.GA4)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.last_error_code == ""
+
+    @responses.activate
+    def test_a_credential_replacement_that_skips_updated_at_is_still_detected(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        from integrations import lifecycle_service
+        from integrations.google.errors import CredentialRefreshFailed
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = connected_connection(project, user)
+
+        catalog = get_provider(ProviderKey.GA4).resources
+
+        def replace_credential_then_reject(access_token, resource_id):
+            # A reconnect replaces the credential row itself. Neither the
+            # connection's updated_at nor its resource id moves.
+            connection.credential.delete()
+            IntegrationCredential.objects.create(
+                connection=connection,
+                access_token="access-token-2",
+                refresh_token="refresh-token-2",
+                access_token_expires_at=timezone.now() + timedelta(hours=1),
+            )
+            raise CredentialRefreshFailed
+
+        monkeypatch.setattr(catalog, "verify_resource", replace_credential_then_reject)
+
+        lifecycle_service.health_check(project=project, provider_key=ProviderKey.GA4)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.CONNECTED
+        assert connection.last_error_code == ""
+
+
+class TestStageFiveGenerationCheckIsIndependent:
+    """§9.4.2. The generation check at stage 5 is not merely the Fence again.
+
+    In practice every intent change also moves ``updated_at``, so the two
+    guards usually fire together — which would let one be removed without a
+    single test noticing. The counter is what answers "is this still the
+    current intent", and it is checked here against an advance that leaves the
+    snapshot intact.
+    """
+
+    @responses.activate
+    def test_an_intent_change_that_moves_no_timestamp_still_discards(
+        self, monkeypatch, make_user_with_workspace, make_project
+    ):
+        from integrations.oauth_service import complete_authorization
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        connection = connected_connection(project, user)
+        state = begin(user, project)
+
+        catalog = get_provider(ProviderKey.GA4).resources
+        original = catalog.verify_resource
+
+        def advance_generation_then_verify(access_token, resource_id):
+            # A newer intent, written the way a save that forgot updated_at
+            # would leave it: the Fence sees nothing, the counter sees it.
+            IntegrationConnection.objects.filter(pk=connection.pk).update(
+                lifecycle_generation=connection.lifecycle_generation + 99
+            )
+            return original(access_token, resource_id)
+
+        monkeypatch.setattr(catalog, "verify_resource", advance_generation_then_verify)
+
+        stub_token()
+        stub_property()
+        complete_authorization(user=user, state=state, code="auth-code-1")
+
+        connection.refresh_from_db()
+        # Stage 3 committed credentials; stage 5 wrote nothing over the newer
+        # intent, which is the safe end of a discarded verification.
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        assert connection.last_health_check_at is None
+
+
+class TestNoCallbackPathResurrectsAConnection:
+    """Only an authorization *start* may bring a connection into existence.
+
+    A callback finalizes an intent that already has a row. If the row is gone
+    the intent is gone with it, and recreating it here would resurrect an
+    integration nobody asked for — with credentials attached.
+    """
+
+    @responses.activate
+    def test_a_callback_whose_connection_was_deleted_creates_nothing(
+        self, make_user_with_workspace, make_project
+    ):
+        from integrations.google.errors import InvalidState
+        from integrations.oauth_service import complete_authorization, hash_state
+
+        user, workspace = make_user_with_workspace()
+        project = make_project(workspace)
+        OAuthAuthorizationRequest.objects.create(
+            state_hash=hash_state("orphaned-state"),
+            project=project,
+            provider=ProviderKey.GA4,
+            user=user,
+            code_verifier="verifier",
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+
+        stub_token()
+        with pytest.raises(InvalidState):
+            complete_authorization(user=user, state="orphaned-state", code="code-1")
+
+        assert not IntegrationConnection.objects.filter(project=project).exists()
+        assert not IntegrationCredential.objects.exists()
