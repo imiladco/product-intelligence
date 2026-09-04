@@ -14,7 +14,11 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from audit.models import AuditEvent
-from integrations.models import IntegrationConnection, IntegrationCredential
+from integrations.models import (
+    IntegrationConnection,
+    IntegrationCredential,
+    OAuthAuthorizationRequest,
+)
 from integrations.providers import ProviderKey
 from integrations.status import ConnectionStatus
 
@@ -299,3 +303,160 @@ class TestHealthCheckTenancy:
         _client, _user, project, _connection = connected
         anonymous = APIClient(enforce_csrf_checks=True)
         assert anonymous.post(health_check_url(project.pk)).status_code == 403
+
+
+def disconnect_url(project_id, provider="ga4") -> str:
+    return f"/api/projects/{project_id}/integrations/{provider}/disconnect"
+
+
+class TestDisconnect:
+    """§3.2. Ends the connection here without touching the Google grant.
+
+    The grant belongs to the user's Google account, not to this application:
+    revoking it would also break any other authorization the same consent
+    covers. Disconnecting is local, and the revoke endpoint is never called.
+    """
+
+    @responses.activate
+    def test_the_credential_row_is_deleted_and_the_selection_remembered(
+        self, connected
+    ):
+        client, _user, project, connection = connected
+        before_success = connection.last_successful_check_at
+
+        response = client.post(disconnect_url(project.pk), {}, format="json")
+
+        assert response.status_code == 200
+        assert response.data["status"] == "disconnected"
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.DISCONNECTED
+        # Deleted, not blanked: an empty token row still looks like a credential.
+        assert not IntegrationCredential.objects.filter(connection=connection).exists()
+        # The selection is remembered so reconnecting can restore it.
+        assert connection.external_resource_id == GA4_RESOURCE
+        assert connection.external_resource_label == "poolino"
+        assert connection.last_successful_check_at == before_success
+        assert len(responses.calls) == 0
+
+    def test_one_audit_row_records_the_transition(self, connected):
+        client, user, project, connection = connected
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        events = AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_DISCONNECTED
+        )
+        assert events.count() == 1
+        event = events.get()
+        assert event.actor == user
+        assert event.metadata["previous_status"] == ConnectionStatus.CONNECTED
+        assert event.metadata["status"] == ConnectionStatus.DISCONNECTED
+
+    def test_the_lifecycle_generation_advances(self, connected):
+        client, _user, project, connection = connected
+        before = connection.lifecycle_generation
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        connection.refresh_from_db()
+        assert connection.lifecycle_generation == before + 1
+
+    def test_outstanding_authorization_requests_are_consumed(self, connected):
+        client, user, project, connection = connected
+        outstanding = OAuthAuthorizationRequest.objects.create(
+            state_hash="a" * 64,
+            project=project,
+            provider=ProviderKey.GA4,
+            user=user,
+            code_verifier="verifier",
+            connection_generation=connection.lifecycle_generation,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        outstanding.refresh_from_db()
+        assert outstanding.consumed_at is not None
+
+    def test_a_second_disconnect_is_inert_but_still_consumes(self, connected):
+        """§9.1. Idempotent in what it means, not in what it touches."""
+        client, user, project, connection = connected
+        client.post(disconnect_url(project.pk), {}, format="json")
+        connection.refresh_from_db()
+        before_generation = connection.lifecycle_generation
+        before_updated = connection.updated_at
+        outstanding = OAuthAuthorizationRequest.objects.create(
+            state_hash="b" * 64,
+            project=project,
+            provider=ProviderKey.GA4,
+            user=user,
+            code_verifier="verifier",
+            connection_generation=before_generation,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+
+        response = client.post(disconnect_url(project.pk), {}, format="json")
+
+        assert response.status_code == 200
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.DISCONNECTED
+        assert not IntegrationCredential.objects.filter(connection=connection).exists()
+        # No second event: nothing transitioned.
+        assert (
+            AuditEvent.objects.filter(
+                action=AuditEvent.Action.INTEGRATION_DISCONNECTED
+            ).count()
+            == 1
+        )
+        # But the generation still advances and the request is still consumed:
+        # a repeat disconnect must invalidate a callback started in between.
+        assert connection.lifecycle_generation == before_generation + 1
+        assert connection.updated_at > before_updated
+        outstanding.refresh_from_db()
+        assert outstanding.consumed_at is not None
+
+    @responses.activate
+    def test_the_google_revoke_endpoint_is_never_called(self, connected):
+        client, _user, project, _connection = connected
+        responses.add(responses.POST, "https://oauth2.googleapis.com/revoke", json={})
+
+        client.post(disconnect_url(project.pk), {}, format="json")
+
+        assert all("revoke" not in call.request.url for call in responses.calls)
+
+    def test_with_no_connection_row_it_creates_nothing(
+        self, signed_in_client, make_project
+    ):
+        """Already not connected: the meaningful result is true, so 200."""
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        response = client.post(disconnect_url(project.pk), {}, format="json")
+
+        assert response.status_code == 200
+        assert response.data["status"] == "not_connected"
+        assert not IntegrationConnection.objects.filter(project=project).exists()
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_DISCONNECTED
+        ).exists()
+
+    def test_foreign_project_is_not_found(
+        self, signed_in_client, make_user_with_workspace, make_project
+    ):
+        client, _user, _workspace = signed_in_client
+        _other, other_workspace = make_user_with_workspace(email="other@example.com")
+        foreign = make_project(other_workspace)
+
+        assert (
+            client.post(disconnect_url(foreign.pk), {}, format="json").status_code
+            == 404
+        )
+
+    def test_unknown_provider_is_not_found(self, connected):
+        client, _user, project, _connection = connected
+        assert (
+            client.post(
+                disconnect_url(project.pk, "not_a_provider"), {}, format="json"
+            ).status_code
+            == 404
+        )

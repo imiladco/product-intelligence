@@ -19,8 +19,11 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.utils import timezone
 
+from audit.models import AuditEvent
+from audit.services import record_event
+
 from . import verification
-from .concurrency import Fence, locked_existing_connection
+from .concurrency import Fence, advance_generation, locked_existing_connection
 from .google.credentials import access_token_for
 from .google.errors import (
     CredentialMissing,
@@ -30,7 +33,11 @@ from .google.errors import (
     ResourceSelectionUnsupported,
     ResourceUnavailable,
 )
-from .models import IntegrationConnection
+from .models import (
+    IntegrationConnection,
+    IntegrationCredential,
+    OAuthAuthorizationRequest,
+)
 from .providers import get_provider
 from .resources import ResourceCatalog
 from .status import ConnectionStatus
@@ -207,3 +214,71 @@ def apply_verification_outcome(
             ]
         )
     return locked
+
+
+def disconnect(*, user, project, provider_key: str) -> IntegrationConnection | None:
+    """End this integration locally, without touching the Google grant.
+
+    Google's revoke endpoint is deliberately never called (§3.2). The grant
+    belongs to the user's Google account and one consent can cover more than
+    this connection; revoking it here would silently break authorizations this
+    project knows nothing about. Disconnecting removes what *we* hold.
+
+    Idempotent in what it means, not in what it touches (§9.1). A second
+    disconnect finds the meaningful result already true — no credential, status
+    ``disconnected`` — and writes no audit event for a transition that did not
+    happen. It still advances the generation and consumes outstanding
+    authorization requests, because a callback may have started in between and
+    must not be allowed to land on a connection the user has since ended.
+
+    Returns None when there is no connection row: already not connected, with
+    nothing to end. Creating one in order to mark it disconnected would be a
+    row the user never asked for.
+    """
+    with transaction.atomic():
+        try:
+            connection = locked_existing_connection(project, provider_key)
+        except IntegrationConnection.DoesNotExist:
+            return None
+
+        previous_status = connection.status
+        advance_generation(connection)
+
+        # Deleted, not blanked: an all-empty credential row still reads as
+        # "a credential exists" to every caller that checks for one.
+        IntegrationCredential.objects.filter(connection=connection).delete()
+
+        # Unconditional, and the part of a repeat disconnect that is not inert.
+        OAuthAuthorizationRequest.objects.filter(
+            project=project,
+            provider=provider_key,
+            consumed_at__isnull=True,
+        ).update(consumed_at=timezone.now())
+
+        if previous_status != ConnectionStatus.DISCONNECTED:
+            connection.status = ConnectionStatus.DISCONNECTED
+            connection.last_error_code = ""
+            connection.last_error_message = ""
+            connection.save(
+                update_fields=[
+                    "status",
+                    "last_error_code",
+                    "last_error_message",
+                    "updated_at",
+                ]
+            )
+            # The selection and last_successful_check_at are deliberately kept:
+            # reconnecting restores what the user chose rather than asking
+            # again, and the history of the connection is not a secret to erase.
+            record_event(
+                action=AuditEvent.Action.INTEGRATION_DISCONNECTED,
+                actor=user,
+                project=project,
+                provider=provider_key,
+                metadata={
+                    "provider": provider_key,
+                    "status": ConnectionStatus.DISCONNECTED,
+                    "previous_status": previous_status,
+                },
+            )
+    return connection

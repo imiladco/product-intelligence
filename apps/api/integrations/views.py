@@ -13,7 +13,7 @@ from projects.selectors import get_project_for_user
 from common.errors import error_response
 
 from .google.errors import GoogleApiError, OAuthError
-from .lifecycle_service import health_check
+from .lifecycle_service import disconnect, health_check
 from .oauth_service import complete_authorization, start_authorization
 from .providers import get_provider
 from .resource_service import discover_resources, select_resource
@@ -216,5 +216,27 @@ class IntegrationHealthCheckView(GoogleApiErrorMixin, APIView):
             raise Http404("Unknown provider.")
 
         health_check(project=project, provider_key=provider)
+        entry = integration_entry_for_provider(project, provider)
+        return Response(IntegrationEntrySerializer(entry).data)
+
+
+class IntegrationDisconnectView(GoogleApiErrorMixin, APIView):
+    """POST /api/projects/{project_id}/integrations/{provider}/disconnect
+
+    Ends the integration here. The Google grant is never revoked: it belongs to
+    the user's Google account, and one consent can cover more than this
+    connection.
+
+    Answers 200 even when there was nothing to disconnect. The result the
+    caller asked for — not connected, no credential — is already true, and the
+    response carries the same entry the page renders either way.
+    """
+
+    def post(self, request, project_id, provider):
+        project = get_project_for_user(request.user, project_id)
+        if get_provider(provider) is None:
+            raise Http404("Unknown provider.")
+
+        disconnect(user=request.user, project=project, provider_key=provider)
         entry = integration_entry_for_provider(project, provider)
         return Response(IntegrationEntrySerializer(entry).data)
