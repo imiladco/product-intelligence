@@ -17,6 +17,17 @@ observe the *expected* failure, then implements the minimum that makes them
 pass. **A task is not complete until the full backend suite is green** — which
 means no task may knowingly land a commit that breaks an existing path.
 
+> **Revision 3 (execution only).** Review found three more execution
+> contradictions and no design contradiction. `locked_connection` could create a
+> connection for *any* caller, so `disconnect` and callback finalization could
+> have brought back a row they are meant to end — split into two explicitly
+> named functions (§T02). `apply_verification_outcome` was specified to write
+> selection fields on success, which is broader than the design allows —
+> selection fields are now never written outside the selection path (§T07).
+> And `access_token_for` can fail *before* `verify()` runs, so the conversion of
+> lifecycle errors into outcomes is now defined for that path too, with the
+> "only place" claim corrected (§T07).
+
 > **Revision 2 (execution only).** Review found six execution defects and no
 > design contradiction. Former T02 changed `start_authorization` to use a
 > `locked_connection` that could not handle a missing row, so a first
@@ -156,11 +167,11 @@ ls apps/api/integrations/migrations/     # 0001, 0002, 0003, __init__ only
 ## T02 — Concurrency primitives, atomic generation, and the creation race
 
 Implements §9.4.1 **and** §9.4.1a. **Merged from the former T02 and T03**: the
-former T02 routed `start_authorization` through a `locked_connection` that
-could only handle an existing row, so a first authorization — the most common
+former T02 routed `start_authorization` through a single `locked_connection`
+that could only handle an existing row, so a first authorization — the most common
 path there is — would have raised `DoesNotExist` until the former T03 landed.
 That commit could not have met its own full-suite gate. Both halves of
-`locked_connection` therefore land together.
+the connection-acquisition path therefore land together.
 
 **Files**
 - Created: `apps/api/integrations/concurrency.py`
@@ -171,14 +182,30 @@ That commit could not have met its own full-suite gate. Both halves of
 ```python
 # integrations/concurrency.py
 
-def _existing_locked(project, provider_key) -> IntegrationConnection | None
-# Locked lookup of an existing row, or None. A named seam so a test can force
-# the no-row branch deterministically (see the recovery test below).
+# --- Two functions, because creation capability must be explicit. ------------
+# Only an authorization start may bring an IntegrationConnection into
+# existence. Every other lifecycle operation acts on a row that already exists,
+# and must fail rather than create one: a disconnect that creates the thing it
+# is ending, or a stale callback that resurrects a deleted connection, would
+# both be defects the type system should make hard to write.
 
-def locked_connection(project, provider_key, *, user=None) -> IntegrationConnection
+def locked_existing_connection(project, provider_key) -> IntegrationConnection
+# select_for_update().get(...). NEVER creates. Raises
+# IntegrationConnection.DoesNotExist, which each caller maps to its own
+# contract (see the usage table below).
+
+def _existing_locked(project, provider_key) -> IntegrationConnection | None
+# The same lookup returning None instead of raising. A named seam so a test can
+# force the no-row branch deterministically (see the recovery test below).
+
+def locked_or_create_connection_for_authorization(
+    project, provider_key, *, user
+) -> IntegrationConnection
+# The ONLY creating entry point, and its name says so.
 # Existing row -> locked and returned.
 # No row -> created inside a savepoint; on IntegrityError, recovered with
 # select_for_update().get(). Never raises IntegrityError to its caller.
+# §9.4.1a.
 
 def advance_generation(connection) -> int
 # Increments in Python under the caller's lock, saves
@@ -201,6 +228,20 @@ class Fence:                       # defined here; first used in T06
 `select_for_update`, the existing
 `UniqueConstraint(fields=["project", "provider"])` from M1.
 
+### Which lifecycle operation may create a connection
+
+| Caller | Function | May create? |
+|---|---|---|
+| `start_authorization` | `locked_or_create_connection_for_authorization` | **Yes** — the only one |
+| `disconnect` (T08) | `locked_existing_connection` | No |
+| Callback stage 3 (T04) | `locked_existing_connection` | No |
+| Callback stage 5 / `apply_verification_outcome` (T07, T09) | `locked_existing_connection` | No |
+| Credential refresh finalization (T05) | `locked_existing_connection` | No |
+| `select_resource` / `_persist_selection` (T06, T10) | `locked_existing_connection` | No |
+
+A test in T18 asserts that `locked_or_create_connection_for_authorization`
+appears in exactly one call site across `apps/api/integrations/`.
+
 ### Failing tests first
 
 Existing-row path:
@@ -214,6 +255,8 @@ Existing-row path:
 Creation path:
 - `test_first_authorization_creates_the_connection_and_advances_generation` —
   **the path the former split would have broken**; it must pass at this commit
+- `test_locked_existing_connection_never_creates` — on a missing row it raises
+  `DoesNotExist` and leaves the table empty
 - `test_creation_race_recovery_branch` — see below
 - `test_two_first_authorizations_race` — two threads under
   `@pytest.mark.django_db(transaction=True)`; assert **exactly one**
@@ -231,7 +274,8 @@ the initial lookup down the no-row branch.
 Setup:   a connection for (project, provider) genuinely EXISTS in the database
 Patch:   concurrency._existing_locked -> returns None on its first call,
          then delegates to the real implementation
-Effect:  locked_connection observes "no row" and calls create()
+Effect:  locked_or_create_connection_for_authorization observes "no row"
+         and calls create()
          -> the REAL unique constraint raises a REAL IntegrityError
          -> the savepoint rolls back
          -> select_for_update().get() finds the row that was there all along
@@ -259,12 +303,14 @@ with an uncaught `IntegrityError`; the threaded test fails with two connection
 rows or a 500.
 
 **Minimal implementation**
-1. `concurrency.py` with `_existing_locked`, `locked_connection` (both
-   branches), `advance_generation`, and the `Fence` dataclass (unused for now).
-2. `start_authorization`: obtain the connection through `locked_connection`,
-   call `advance_generation` in the same `transaction.atomic()`, create the
-   `OAuthAuthorizationRequest` in that transaction carrying the returned value.
-   The existing `get_or_create` call is **replaced**, not wrapped.
+1. `concurrency.py` with `_existing_locked`, `locked_existing_connection`,
+   `locked_or_create_connection_for_authorization`, `advance_generation`, and
+   the `Fence` dataclass (unused for now).
+2. `start_authorization`: obtain the connection through
+   `locked_or_create_connection_for_authorization`, call `advance_generation`
+   in the same `transaction.atomic()`, create the `OAuthAuthorizationRequest`
+   in that transaction carrying the returned value. The existing
+   `get_or_create` call is **replaced**, not wrapped.
 3. Preserve M3's rule that starting an authorization does not destroy durable
    state: only `lifecycle_generation` and `updated_at` are written on an
    existing row.
@@ -337,6 +383,10 @@ def _finalize_credentials(*, request, connection, result) -> str
 - `test_no_database_lock_is_held_across_the_token_exchange` — the exchange stub
   performs an independent write to the same connection and neither blocks nor
   deadlocks
+- `test_callback_does_not_recreate_a_deleted_connection` — the connection is
+  deleted between consumption and finalization; assert the callback fails with
+  `InvalidState`, **no** `IntegrationConnection` row is created, **no**
+  `IntegrationCredential` is created, and no audit event is written
 
 ```bash
 cd apps/api && ../../.venv/bin/python -m pytest tests/test_oauth.py tests/test_concurrency.py -q
@@ -345,8 +395,10 @@ cd apps/api && ../../.venv/bin/python -m pytest tests/test_oauth.py tests/test_c
 
 **Minimal implementation:** keep stage 1 (`_consume_request`) unchanged; keep
 the token exchange outside any transaction; wrap persistence in
-`transaction.atomic()` + `locked_connection`; compare generations; read
-`previous_status` before mutation.
+`transaction.atomic()` + **`locked_existing_connection`**; compare
+generations; read `previous_status` before mutation. A callback whose
+connection no longer exists raises `DoesNotExist`, which stage 3 converts to
+`InvalidState` — never a recreated row.
 
 **Verification:** `cd apps/api && ../../.venv/bin/python -m pytest -q`
 
@@ -483,14 +535,95 @@ class VerificationContext(StrEnum):
     RECONNECT = "reconnect"           # §5.1.1 status table
 
 
+def outcome_from_lifecycle_error(error: GoogleApiError) -> VerificationOutcome
+# THE single conversion table from a lifecycle error to an outcome:
+#   ResourceNotAccessible  -> RESOURCE_NOT_ACCESSIBLE
+#   CredentialRefreshFailed -> CREDENTIAL_REJECTED
+#   ResourceUnavailable     -> TRANSIENT
+#   GoogleApiError (base)   -> TRANSIENT
+# Carries the error's own code and message. Contains no provider branch: it
+# switches on our error classes, which are already provider-neutral.
+# CredentialMissing is deliberately NOT in this table -- see below.
+
 def verify(*, catalog, access_token: str, resource_id: str) -> VerificationOutcome
-# THE ONLY place provider errors are caught and converted. Catches
-# ResourceNotAccessible / CredentialRefreshFailed / ResourceUnavailable /
-# GoogleApiError and maps each to a VerificationResult, carrying the error's own
-# code and message. Never raises for those four. Never inspects a provider
-# response -- it catches our error classes, which are provider-neutral, so this
-# function contains no provider branch.
+# Calls catalog.verify_resource and converts any of the four errors above
+# through outcome_from_lifecycle_error. Never raises for them. Never inspects a
+# provider response.
 ```
+
+#### Where errors are converted — the precise claim
+
+An earlier revision said `verify()` is "the only place provider errors are
+converted". **That cannot be literally true**, because `health_check` must call
+`access_token_for(connection)` *before* `verify()`, and that call can itself
+raise. The accurate statement, and the one the implementation must satisfy:
+
+> **`verification.py` is the only module that turns a lifecycle error into a
+> `VerificationOutcome`, and `outcome_from_lifecycle_error` is the only table
+> that does it.** `verify()` is one caller of that table; `health_check` is
+> another, for the failures that happen before verification can begin.
+
+There is therefore **one** taxonomy implementation, used from two points.
+
+#### `access_token_for` failures during a health check
+
+`access_token_for` (M4, fenced in T05) raises three things, and they do **not**
+all mean the same thing for the §3.1 contract:
+
+| Raised | Health-check handling | HTTP |
+|---|---|---|
+| `CredentialMissing` | **Propagates.** §3.1 makes this a `409 credential_missing`: the check never began, so there is no outcome to report | **409** |
+| `CredentialRefreshFailed` | Converted via `outcome_from_lifecycle_error` → `CREDENTIAL_REJECTED`. The check *completed*, with the answer "this credential is dead" | **200** entry, `reauth_required` |
+| `ResourceUnavailable` | Converted → `TRANSIENT`. The check completed with "could not reach Google" | **200** entry, status unchanged |
+
+A completed check always returns `200` carrying the resulting state (§3.1); only
+a check that could not start is a `409`.
+
+#### `health_check` — the exact flow
+
+```
+1. resolve the connection (unlocked read)
+     no row / no credential            -> raise CredentialMissing        (409)
+     no external_resource_id           -> raise ResourceMissing          (409)
+
+2. try:
+       access_token = access_token_for(connection)
+   except CredentialMissing:
+       raise                                                             # 409
+   except (CredentialRefreshFailed, ResourceUnavailable, GoogleApiError) as exc:
+       access_token = None
+       outcome = verification.outcome_from_lifecycle_error(exc)
+
+3. connection.refresh_from_db()
+   # A failed refresh may already have written status via mark_reauth_required,
+   # which is T05's own fenced write. Re-read before capturing, so the Fence
+   # describes the state as it is now.
+   fence = Fence.capture(connection)
+
+4. if access_token is not None:
+       outcome = verification.verify(
+           catalog=catalog,
+           access_token=access_token,
+           resource_id=connection.external_resource_id,   # from the DB, never the request
+       )
+
+5. return apply_verification_outcome(
+       connection=connection, outcome=outcome, fence=fence,
+       context=VerificationContext.HEALTH_CHECK,
+   )
+```
+
+Notes that matter:
+- **The Fence is captured after step 2, whatever its outcome** — success or
+  failure — so it always describes post-token-acquisition state. Uniform for
+  both branches, and it means a refresh that wrote `reauth_required` is inside
+  the snapshot rather than fencing out the very check that caused it.
+- **Stale-refresh behaviour stays T05's.** `RefreshFence` governs whether a
+  refresh result is applied at all; by the time `access_token_for` returns or
+  raises, that question is settled. The two fences do not overlap and are not
+  merged.
+- **No provider branch anywhere in this flow**, and no second copy of the
+  taxonomy.
 
 ```python
 # integrations/lifecycle_service.py
@@ -512,15 +645,46 @@ def apply_verification_outcome(
 
 **The (context, result) status table** — the single place §4.3 and §5.1.1 live:
 
-| `result` | `HEALTH_CHECK` status | `RECONNECT` status | Resource | `last_health_check_at` | `last_successful_check_at` |
-|---|---|---|---|---|---|
-| `SUCCESS` | `connected` | `connected` | from outcome | set | **set** |
-| `RESOURCE_NOT_ACCESSIBLE` | `error` | `awaiting_resource_selection` | **retained** | set | untouched |
-| `CREDENTIAL_REJECTED` | `reauth_required` | `reauth_required` | **retained** | set | untouched |
-| `TRANSIENT` | **unchanged** | `awaiting_resource_selection` | **retained** | set | untouched |
+| `result` | `HEALTH_CHECK` status | `RECONNECT` status | `last_health_check_at` | `last_successful_check_at` |
+|---|---|---|---|---|
+| `SUCCESS` | `connected` | `connected` | set | **set** |
+| `RESOURCE_NOT_ACCESSIBLE` | `error` | `awaiting_resource_selection` | set | untouched |
+| `CREDENTIAL_REJECTED` | `reauth_required` | `reauth_required` | set | untouched |
+| `TRANSIENT` | **unchanged** | `awaiting_resource_selection` | set | untouched |
 
 Errors are cleared only on `SUCCESS`; otherwise `error_code`/`error_message` are
 written from the outcome.
+
+#### `apply_verification_outcome` never writes selection fields
+
+There is deliberately **no resource column** in that table.
+`external_resource_id`, `external_resource_label` and `external_resource_meta`
+are **never written** by this function, in either context and on every result
+including `SUCCESS`:
+
+- **A health check is not a selection.** It answers "does the stored selection
+  still work", and the design gives it status, the two health timestamps and
+  error clearing — nothing else.
+- **A reconnect success proves the remembered selection is still valid**, and
+  returns to `connected` on **that same stored selection**. There is nothing to
+  replace.
+- The design's boundary that provider-authoritative selection metadata is
+  persisted **only through the selection path** (M4's rule, carried into M5)
+  therefore survives: `_persist_selection` remains the single writer of those
+  three fields.
+
+`VerificationOutcome.resource` still exists — it is the evidence the provider
+returned, and its presence is what makes a result `SUCCESS` — but
+`apply_verification_outcome` reads it only to know that, never to write it. The
+save's `update_fields` list simply does not contain the three selection fields,
+which makes the guarantee structural rather than a matter of care.
+
+**Tests (T07 for health check, T09 for reconnect)**
+- `test_health_check_success_leaves_selection_fields_unchanged` — id, label and
+  metadata compared byte-for-byte before and after, including the case where the
+  provider returns a *different* label than the one stored
+- `test_reconnect_success_leaves_selection_fields_unchanged` — status becomes
+  `connected` and both timestamps advance while the three fields do not move
 
 **Both callers use the same two functions.** T07's `health_check` calls
 `verify(...)` then `apply_verification_outcome(..., context=HEALTH_CHECK)`. T09's
@@ -554,6 +718,20 @@ New error class `ResourceMissing` (`resource_missing`, 409) in `google/errors.py
 - a posted `resource_id` for another resource is ignored — the identifier comes
   from the database
 - tenancy: foreign project 404, unknown provider 404, unauthenticated 403
+
+**Token-acquisition failures (fix 3), each asserting the endpoint returns 200
+with the correct persisted entry:**
+- `test_health_check_credential_refresh_failure_returns_200_reauth_required` —
+  `access_token_for` raises `CredentialRefreshFailed`; response is **200**, the
+  entry reads `reauth_required` with `credential_refresh_failed`,
+  `last_health_check_at` is set, `last_successful_check_at` untouched, and **no
+  provider call was made**
+- `test_health_check_transient_token_failure_returns_200_status_unchanged` —
+  `access_token_for` raises `ResourceUnavailable`; response is **200**, status
+  **unchanged**, `resource_unavailable` recorded, `last_health_check_at` set,
+  `last_successful_check_at` untouched
+- `test_health_check_without_a_credential_is_409` — `CredentialMissing`
+  propagates; the check never began
 
 **Races A and B**, in `tests/test_concurrency.py`, now that the call path exists:
 - `test_stale_provider_401_after_reconnect_is_discarded` (A) — the health
@@ -605,13 +783,39 @@ POST /api/projects/{project_id}/integrations/{provider}/disconnect → 200 | 404
   requests consumed (§9.1) — asserted field by field
 - **no request is made to the revoke endpoint**
 - tenancy: foreign project 404, unknown provider 404
+- **`test_disconnect_with_no_connection_row_creates_nothing`** — POST disconnect
+  for a known provider that has never been connected: **no**
+  `IntegrationConnection` is created, no credential, no audit row, and the
+  response is **200 carrying the synthesized `not_connected` entry** (see the
+  contract note below)
+
+#### Disconnect when no connection row exists
+
+`locked_existing_connection` raises `DoesNotExist` here, and the plan must say
+what the endpoint does with it. §3.2 enumerates only `200` and `404`, and `404`
+is reserved there for an unknown project or provider — which this is not.
+
+The resolution, consistent with §9.1's idempotency principle: **200 with the
+synthesized `not_connected` entry, creating nothing and writing nothing.**
+Disconnect's externally meaningful result — not connected, no credential, no
+audit event — is already true, which is exactly the §9.1 definition of an
+idempotent disconnect. The row is simply absent rather than `disconnected`.
+
+The one part of §9.1 that is *not* inert — consuming outstanding authorization
+requests — has nothing to do here: an `OAuthAuthorizationRequest` is always
+created alongside its connection, and the only path that deletes a connection
+(denial of a first authorization) consumes the request first. No unconsumed
+request can outlive its connection, and a test asserts that.
+
+This fills a gap §3.2 did not enumerate rather than contradicting it; it is
+listed as an ambiguity in the self-review.
 
 ```bash
 cd apps/api && ../../.venv/bin/python -m pytest tests/test_lifecycle.py -q -k disconnect
 ```
 **Expected failure:** 404 on the route.
 
-**Minimal implementation:** one transaction — `locked_connection`,
+**Minimal implementation:** one transaction — **`locked_existing_connection`**,
 `advance_generation`, delete credential, set status and clear errors *only when
 the status changes*, consume outstanding requests unconditionally, audit only on
 a real transition.
@@ -924,6 +1128,14 @@ cd apps/api && ../../.venv/bin/python -m pytest -q
 - `test_no_revoke_request_is_ever_made`
 - the provider-vocabulary source scan extended to `lifecycle_service.py`,
   `concurrency.py`, `verification.py`, and the two new components
+- **`test_only_authorization_start_can_create_a_connection`** — a source scan
+  asserting `locked_or_create_connection_for_authorization` appears in exactly
+  one call site under `apps/api/integrations/`, and that
+  `IntegrationConnection.objects.create` / `get_or_create` appear nowhere in
+  `lifecycle_service.py`, `resource_service.py` or `verification.py`
+- **`test_apply_verification_outcome_never_writes_selection_fields`** — a
+  parametrized check over every `(context, result)` pair asserting the three
+  selection fields are byte-for-byte unchanged
 
 **Verification:** `cd apps/api && ../../.venv/bin/python -m pytest -q`
 
@@ -946,11 +1158,11 @@ ls apps/api/integrations/migrations/                                            
   created **before** the migration both default to `0`, and a callback across
   that boundary completes normally (§11.2)
 
-### Mutation checks — executable (review fix 4)
+### Mutation checks — executable (review fix 4; 31 rows)
 
 Each row: apply the mutation, run the **targeted** command, confirm the named
 failure, then **`git checkout -- <file>` before the next mutation**. The full
-suite runs once at the end, after every mutation has been restored — not 27
+suite runs once at the end, after every mutation has been restored — not 31
 times.
 
 Shorthand: `PY=../../.venv/bin/python`, run from `apps/api`.
@@ -984,6 +1196,10 @@ Shorthand: `PY=../../.venv/bin/python`, run from `apps/api`.
 | 25 | Collapse the §5.1.1 transient outcome into `resource_not_accessible` | `$PY -m pytest tests/test_lifecycle.py -k reconnect_transient -q` | `last_error_code` expected `resource_unavailable` |
 | 26 | Denial sets `error` | `$PY -m pytest tests/test_oauth.py -k denied -q` | status expected unchanged, got `error` |
 | 27 | `error` always offers the authorization action | `cd apps/web && npm run test` (no targeted runner; the suite is 3s) | the §7.2 resource-class row fails |
+| 28 | `disconnect` uses the creating acquirer instead of `locked_existing_connection` | `$PY -m pytest tests/test_lifecycle.py -k no_connection_row -q` | a connection row is created by a disconnect |
+| 29 | Callback stage 3 uses the creating acquirer | `$PY -m pytest tests/test_oauth.py -k deleted_connection -q` | a deleted connection is recreated by a stale callback |
+| 30 | `apply_verification_outcome` writes `external_resource_label` from the outcome | `$PY -m pytest tests/test_lifecycle.py -k selection_fields_unchanged -q` | stored label replaced by the provider's |
+| 31 | `health_check` lets `CredentialRefreshFailed` propagate to the view | `$PY -m pytest tests/test_lifecycle.py -k reauth_required -q` | 409 where 200 with a persisted entry was expected |
 
 ### Full green gate — once, after all mutations are restored
 
@@ -1004,7 +1220,7 @@ this plan never claims it.
 
 ---
 
-## Self-review (re-run after revision 2)
+## Self-review (re-run after revision 3)
 
 | Check | Result |
 |---|---|
@@ -1017,6 +1233,9 @@ this plan never claims it.
 | **Provider-specific logic** | No task modifies `ga4.py`, `search_console.py` or `resources.py`. `verify()` catches the project's own provider-neutral error classes, never a provider response. T18 extends the source scan to all three new modules |
 | **Scope expansion** | None. Mutation 4 asserts the revoke endpoint stays unused |
 | **Migration discipline** | One migration (T01, explicit A–G sequence), re-verified in T19 |
+| **Creation capability is explicit** | **Fixed in revision 3.** A single `locked_connection` let any caller create a row, so `disconnect` could have created the connection it was ending and a stale callback could have resurrected a deleted one. Split into `locked_existing_connection` (never creates) and `locked_or_create_connection_for_authorization` (the only creating entry point, named so). T02 carries the caller table; T18 asserts the creating function has exactly one call site |
+| **Selection fields written only by the selection path** | **Fixed in revision 3.** `apply_verification_outcome`'s table had a resource column writing the outcome's resource on success, which is broader than the design allows. The column is gone, the three fields are absent from its `update_fields`, and T07/T09 assert byte-for-byte stability — including when the provider returns a different label than the one stored |
+| **Pre-verification failures have a defined path** | **Fixed in revision 3.** `access_token_for` can raise before `verify()` runs. `CredentialMissing` propagates as 409 (the check never began); `CredentialRefreshFailed` and `ResourceUnavailable` convert through the same single table and return 200 with the persisted state. The "only place errors are converted" claim is corrected to name the table rather than the function |
 
 ### Design ambiguities
 
@@ -1033,4 +1252,15 @@ discovered**:
    visible together, while `RefreshFence` is *used* only inside
    `google/credentials.py` as §9.3.1 requires.
 
-Both are placement choices within the design's rules, not semantic changes.
+3. **Disconnect when no connection row exists.** §3.2 enumerates `200` and
+   `404`, with `404` reserved for an unknown project or provider — which this is
+   not. The plan resolves it as **200 with the synthesized `not_connected`
+   entry, creating and writing nothing**, because disconnect's externally
+   meaningful result is already true, which is §9.1's own definition of an
+   idempotent disconnect. This fills a gap the design did not enumerate rather
+   than contradicting it. If review prefers `409`, it is a one-line change to
+   T08.
+
+The first two are placement choices within the design's rules; the third is an
+unenumerated case resolved by the design's own idempotency principle. **No
+semantic change, and no design contradiction was found in any revision.**
