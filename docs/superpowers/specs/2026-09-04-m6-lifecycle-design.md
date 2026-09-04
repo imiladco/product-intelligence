@@ -2,6 +2,17 @@
 
 Design draft. 2026-09-04. Revised after review; not implemented; not approved.
 
+**Revision 4 — what the third review found, and the decision it forced:**
+credential refresh is itself an unfenced mutating outbound call, so it needs
+its own optimistic concurrency and `google/credentials.py` can no longer be
+listed as unchanged (§9.3.1); forced consent cannot be keyed on "first
+connection", because a new row does not prove a first authorization of that
+Google account for this application — it is keyed on whether we hold a refresh
+token we can preserve (§5.3.1); and the authorization fence's cross-row
+timestamp ordering is genuinely ambiguous, so **M6 now introduces a
+`lifecycle_generation` column and a migration** (§9.4, §11). "No migration" is
+no longer a goal of this design.
+
 **Revision 3 — what the second review found:** forced consent is required
 after a disconnect, because the local refresh token is gone while Google's
 authorization is not (§5.3); the Race C fence only covered callbacks that had
@@ -330,18 +341,65 @@ fails for a reason we designed in is not acceptable when one predicate fixes it.
 `DISCONNECTED` is *precisely* the state where a new refresh token is required:
 we deliberately destroyed ours while leaving Google's authorization intact.
 
-The full predicate after M6, with what each case must keep doing:
+### 5.3.2 The predicate is local capability, not "is this the first time"
 
-| Connection state | Force consent? | Why |
+M3's rule rested on an assumption that is false: *"Google issues a refresh
+token on the first authorization anyway, so a new connection need not force
+consent."* A brand-new `IntegrationConnection` row proves nothing of the kind.
+It proves this **project** has not connected this provider. The same Google
+account may already have authorized this same application through **another
+project or another workspace**, in which case Google sees existing consent and
+may return no `refresh_token` at all — and a first connection then fails on
+`NoRefreshToken` exactly as a post-disconnect one does.
+
+This system deliberately holds no Google identity (§0), so it cannot ask "has
+this account authorized us before?". It does not need to. The question it can
+always answer is local, and it is the one that matters:
+
+> **Can this authorization preserve an existing refresh token? If not, it must
+> guarantee acquiring a new one.**
+
+So the predicate is: **force consent unless we hold a refresh token we have no
+reason to distrust.**
+
+```python
+def _needs_forced_consent(connection) -> bool:
+    if connection is None:
+        return True                      # nothing stored: nothing to preserve
+    if connection.status in (REAUTH_REQUIRED, DISCONNECTED):
+        return True                      # stored token is dead, or deleted
+    credential = stored_credential(connection)
+    if credential is None or not credential.refresh_token:
+        return True                      # nothing to preserve
+    if connection.status == ERROR and connection.last_error_code == NO_REFRESH_TOKEN:
+        return True                      # the previous attempt proved it
+    return False                         # a live token we can carry forward
+```
+
+| Situation | Force consent? | Reasoning |
 |---|---|---|
-| No connection row (first authorization) | **No** | Google issues a refresh token on first authorization anyway; forcing consent is user-hostile for no gain |
-| `PENDING_AUTHORIZATION` | No | Same as a first authorization; nothing has been stored |
-| `AWAITING_RESOURCE_SELECTION` | No | A refresh token is already stored |
-| `CONNECTED` (voluntary re-authorization) | **No** | The stored refresh token still works; a response without one preserves it |
+| **Brand-new connection, account never authorized this app** | **Yes** | Consent would be shown anyway for new scopes; `prompt=consent` changes nothing the user sees, and guarantees the refresh token |
+| **Brand-new connection, same account already authorized this app elsewhere** | **Yes** | The case M3 could not see. Without forcing, Google may omit `refresh_token` and the first connection fails |
+| `PENDING_AUTHORIZATION` with no credential stored | Yes | Nothing to preserve |
+| `AWAITING_RESOURCE_SELECTION` with a stored refresh token | **No** | We hold a token; a response omitting one preserves it |
+| `CONNECTED` (voluntary re-authorization) | **No** | The stored refresh token works; preserving it is correct and re-consent is noise |
 | `ERROR` + `no_refresh_token` | Yes | Unchanged from M3 |
-| `ERROR` (other codes) | No | The credential is not the problem |
+| `ERROR`, other codes, credential intact | No | The credential is not the problem |
 | `REAUTH_REQUIRED` | Yes | Unchanged from M3 |
-| **`DISCONNECTED`** | **Yes (new)** | Our refresh token is gone and Google's consent is not |
+| **`DISCONNECTED`** | **Yes** | Our token is gone; Google's consent is not |
+
+The two `DISCONNECTED` and status checks are redundant with the credential
+check — disconnect deletes the row — and are kept deliberately, so that a future
+change to *how* disconnect clears credentials cannot silently remove forced
+consent.
+
+**What this costs.** A genuinely first authorization now carries
+`prompt=consent`. Google shows a consent screen for newly requested scopes
+regardless, so for that case the parameter changes nothing the user experiences.
+The saving M3 was protecting turns out to be mostly imaginary, and the failure
+it exposes is real. Old behaviour is not preserved merely for being old when it
+cannot guarantee offline access — and offline access *is* a hard requirement
+here, because the backend must reach the provider with no user present.
 
 ### 5.4 Cancellation is non-destructive
 
@@ -662,11 +720,87 @@ fence, and these two fields keep the specific races covered even then. §14 adds
 a test that asserts the convention directly, so the redundancy is a backstop
 rather than the plan.
 
-### 9.4 The authorization finalization fence
+### 9.3.1 The refresh is itself a fenced operation
+
+§9.3 says to capture the snapshot *after* any token refresh, so an operation
+does not fence out its own refresh. That instruction is right and insufficient:
+**`access_token_for` is itself an outbound, state-mutating operation**, and by
+the time the caller captures its snapshot the damage is already committed.
+
+```python
+access_token_for(connection):
+    ...refresh call to Google...          # outbound, slow, blockable
+    on success        -> _persist(credential, refreshed)      # WRITE
+    on invalid_grant  -> mark_reauth_required(connection)     # WRITE
+```
+
+Two races, and the second is the more dangerous because it looks like success:
+
+> **A1 — stale `invalid_grant`.** Health check refreshes with token A → the call
+> is in flight → a reconnect stores credential B and the connection is repaired
+> → A's refresh returns `invalid_grant` → `mark_reauth_required` writes
+> `reauth_required` over a connection that is working perfectly.
+
+> **A2 — stale success.** A's refresh is in flight → a reconnect stores
+> credential B → A's refresh *succeeds* → `_persist` overwrites B's access
+> token and expiry with ones derived from the superseded refresh token A. The
+> connection now holds a credential nobody asked for, and B's rotation is lost.
+
+Neither is reachable by the caller's fence, because both writes happen inside
+`access_token_for` before the caller ever takes a snapshot.
+
+**So the refresh gets its own optimistic concurrency**, the same shape as §9.3
+and one level down:
+
+```python
+@dataclass(frozen=True)
+class RefreshFence:
+    """The credential state this refresh is derived from."""
+    credential_id: int | None        # None once a disconnect deleted it
+    credential_updated_at: datetime | None
+```
+
+```
+1. read the credential; if the access token is still usable, return it
+2. capture RefreshFence
+3. call Google  — no database lock held across the network
+4. open a transaction, select_for_update the connection, re-read the credential
+5. if RefreshFence changed:
+       DISCARD.  Persist nothing.  Do not mark_reauth_required, whatever
+       Google said — that verdict belongs to a credential that no longer
+       exists.  Then:
+         - if the current stored token is usable, return it
+         - else retry from step 1, at most once
+         - if the retry is also superseded, raise ResourceUnavailable
+6. else: apply the result — persist on success, mark_reauth_required on
+   invalid_grant — and return
+```
+
+Three points this turns on:
+
+- **`invalid_grant` is a verdict about a specific refresh token, not about the
+  connection.** Once that token has been replaced, the verdict is
+  meaningless and must not be applied to its replacement. This is the whole of
+  race A1.
+- **The retry is bounded at one.** State churning under us twice in a row is a
+  reason to report a transient failure, not to loop. `ResourceUnavailable` is
+  the honest code: nothing is proven broken.
+- **`credential_id` is in the fence alongside the timestamp** because disconnect
+  *deletes* the row. A refresh that returns after a disconnect finds no
+  credential, which is a fence mismatch and a discard — not a crash, and not a
+  resurrection.
+
+Only once the refresh has **committed** does the caller capture its §9.3
+snapshot, which is what makes that instruction meaningful rather than a hope.
+
+**`google/credentials.py` therefore changes.** §10 lists it as modified; the
+previous revision was wrong to call it unchanged.
+
+### 9.4 The authorization finalization fence — a generation, not a timestamp
 
 The first draft fenced Race C by having disconnect consume outstanding
-authorization requests. **That is necessary but not sufficient**, and the gap is
-in the callback's own ordering:
+authorization requests. That is necessary but not sufficient, because the
+callback consumes its request *before* the token exchange:
 
 ```
 _consume_request()          # consumed_at committed, transaction closed
@@ -674,121 +808,132 @@ _consume_request()          # consumed_at committed, transaction closed
 _store_credentials(); status = …     # the write
 ```
 
-Once the request is consumed, disconnect can no longer see it. So:
+Once consumed, disconnect can no longer see it. Two orderings slip through:
 
 > **Race C′** — callback consumes its request → token exchange is slow → user
-> disconnects (finds nothing unconsumed to invalidate) → callback resumes and
-> writes credentials → the explicitly disconnected connection is resurrected.
+> disconnects (finds nothing unconsumed) → callback resumes and writes
+> credentials → the explicitly disconnected connection is resurrected.
 
-And the same window admits a second case that supersession-at-start also
-misses, because `start_authorization` only supersedes *unconsumed* requests:
-
-> **Race D** — callback R1 consumes its request and begins the token exchange →
-> the user starts R2 → R2 completes → R1 returns late and overwrites R2's
+> **Race D** — callback R1 consumes its request and begins its exchange → the
+> user starts R2 → R2 completes → R1 returns late and overwrites R2's
 > credentials and state with older ones.
 
-Both are the same question asked at the same moment: **at the instant of
-writing, is this authorization attempt still the user's current intent?** So
-both get one fence, evaluated inside the finalization transaction, under
-`select_for_update` on the connection.
+Revision 3 answered both with timestamp comparisons. **That answer was wrong,
+and the review is right about why.** Both comparisons were *orderings*, not
+equalities, and §9.3's argument — that the fence needs no monotonic clock
+because it only ever tests equality — did not extend to them:
+
+- `created_at > request.created_at` compares two rows in the same table, so a
+  tie is at least resolvable by adding `id`. Survivable, but still an ordering.
+- `connection.updated_at > request.created_at` compares **two different tables**.
+  Equal timestamps are genuinely ambiguous: nothing in the data says whether a
+  disconnect stamped at exactly T happened before or after an authorization
+  request stamped at exactly T. No amount of tie-breaking within one row fixes a
+  comparison across two.
+
+This is precisely the escape hatch the previous revision named, and the
+condition for taking it has been met.
+
+#### The decision: `lifecycle_generation`
+
+**M6 introduces a generation counter and a migration.** Both fence checks become
+integer equality, exactly like §9.3.
+
+| Model | Field | Meaning |
+|---|---|---|
+| `IntegrationConnection` | `lifecycle_generation` (`PositiveIntegerField`, default `0`) | Bumped whenever the connection's authorization intent changes |
+| `OAuthAuthorizationRequest` | `connection_generation` (`PositiveIntegerField`, default `0`) | The generation this attempt was started against |
+
+**It increments in exactly two places**, both of which are "the user expressed a
+new intent for this integration":
+
+1. **`start_authorization`** — a new attempt supersedes any older one.
+2. **`disconnect`** — an explicit end supersedes any attempt in flight.
+
+**Finalization is one comparison:**
 
 ```python
-def _authorization_is_superseded(connection, request) -> bool:
-    # D — a newer attempt exists for this integration.
-    if OAuthAuthorizationRequest.objects.filter(
-        project_id=request.project_id,
-        provider=request.provider,
-        created_at__gt=request.created_at,
-    ).exists():
-        return True
-
-    # C′ — the integration was disconnected after this attempt began.
-    if (
-        connection.status == ConnectionStatus.DISCONNECTED
-        and connection.updated_at > request.created_at
-    ):
-        return True
-
-    return False
+if connection.lifecycle_generation != request.connection_generation:
+    raise InvalidState        # superseded; write nothing
 ```
 
-Superseded → **write nothing**: no credential, no status, no scopes, no audit
-event beyond the existing failure record. The callback redirects with
-`invalid_state`, the same terminal the user already sees for a stale link.
+Walk the four cases, and note that every one is an equality test with no clock
+involved:
 
-Three details that make this correct rather than merely plausible:
+| Scenario | Generations | Outcome |
+|---|---|---|
+| Ordinary authorization | start bumps 0→1, request captures 1; callback sees 1 | `1 == 1` → **proceed** |
+| **C′** — disconnect mid-flight | request captures 1; disconnect bumps to 2; callback sees 2 | `2 ≠ 1` → **discard** |
+| **D** — newer attempt wins | R1 captures 1; R2 bumps to 2 and captures 2; R1's callback sees 2 | R1 `2 ≠ 1` → **discard**; R2 `2 == 2` → proceed |
+| **Connect after disconnect** (must work) | disconnect bumps to 2; start bumps to 3 and captures 3; callback sees 3 | `3 == 3` → **proceed** |
 
-- **The disconnect check is specific to `DISCONNECTED`.** A blanket
-  `connection.updated_at > request.created_at` comparison would discard a
-  perfectly good reconnect whose connection merely had a health-check timestamp
-  written while the user was at Google. Only an explicit disconnect supersedes
-  an authorization.
-- **The timestamp comparison is required, not optional.** "Status is
-  `DISCONNECTED` → discard" alone would break the legitimate
-  Connect-after-disconnect flow entirely, because `start_authorization`
-  deliberately preserves durable status (M3): during a valid reconnect *from*
-  `disconnected`, the status is still `disconnected` when the callback lands.
-  Comparing against `request.created_at` separates "disconnected before you
-  clicked Connect" (allow) from "disconnected while you were at Google"
-  (discard).
-- **Race D's check is scoped to (project, provider), not to the user.**
-  `start_authorization` supersedes per user+project+provider, because it is
-  protecting a user from their own abandoned tabs. Finalization is protecting
-  *the connection*, which is shared by every member of the workspace, so the
-  newest attempt wins regardless of who started it. The loser sees the ordinary
-  "that authorization link is no longer valid" message.
+The fourth row is the one that killed every simpler rule: a legitimate
+Connect-after-disconnect still has `status == DISCONNECTED` when the callback
+lands, because `start_authorization` deliberately preserves durable status (M3).
+A generation distinguishes it from Race C′ without consulting status or a clock
+at all.
 
-**What this rests on, stated so it can be checked:** `connection.updated_at` is
-a usable proxy for "when the disconnect happened" only while nothing else
-writes to a disconnected connection. Today nothing does — a health check
-returns 409 without writing, resource selection returns 409, an idempotent
-disconnect writes no connection fields (§9.1), and `start_authorization` does
-not save an existing row. §14 pins this with a direct test.
+#### Consequences worth stating
 
-**If that invariant cannot be held**, the answer is a `lifecycle_generation`
-integer on `IntegrationConnection`, incremented by disconnect and captured in
-the authorization request — a real migration, proposed properly, not a weakened
-fence. This design does not need it, and says so on evidence rather than
-preference; implementation stops and proposes it if the evidence changes.
+- **`start_authorization` now writes the connection row**, which it does not do
+  today for an existing connection. It writes exactly two fields —
+  `lifecycle_generation` and `updated_at` — and touches neither `status` nor any
+  resource field, so M3's "do not destroy durable state on start" property
+  holds.
+- That write bumps `connection.updated_at`, so an in-flight **health check** is
+  fenced out by §9.3 when a user starts an authorization. Correct, and cheap:
+  a discarded health result costs nothing.
+- The **consume-on-disconnect** behaviour from revision 3 is *kept*. It stops a
+  not-yet-started callback earlier and more cheaply, at consumption rather than
+  finalization, and it is what makes an idempotent disconnect non-inert (§9.1).
+  Generation is the backstop for the window consumption cannot see.
+- Scoping is settled by construction: the generation lives on the connection,
+  so the newest intent for **the connection** wins regardless of which member
+  started it. No separate per-user reasoning is needed.
 
 ### 9.5 Race resolution table
 
-| Race | Fenced by | Result |
-|---|---|---|
-| A — stale 401 after reconnect | `credential_updated_at` (and `connection_updated_at`) | Discarded; connection stays `connected` |
-| B — stale 403 after resource change | `external_resource_id` (and `connection_updated_at`) | Discarded; connection stays `connected` on the new resource |
-| C — disconnect **before** the callback consumes its request | `consumed_at` set by disconnect (§9.1) | `InvalidState` at consumption; nothing written |
-| **C′ — disconnect *after* consumption, callback still running** | §9.4 finalization fence, `DISCONNECTED` + `updated_at > request.created_at` | Discarded at the write; no credential, no resurrection |
-| **D — older callback returns after a newer authorization completed** | §9.4 finalization fence, newer request exists | Discarded; R2's credentials and state survive |
-| Two concurrent health checks | `connection_updated_at` | The later one discards; losing a redundant health result costs nothing |
-| Two concurrent resource changes | Row lock, then fence | Serialized; the second discards rather than overwriting the first with a result about the old state |
-| Health check racing a resource change it started before | `external_resource_id` | Discarded |
-| Legitimate Connect **after** a disconnect | Not fenced — `updated_at < request.created_at` | Allowed, which is the point of the timestamp comparison |
+| Race | Fenced by | Comparison | Result |
+|---|---|---|---|
+| **A1 — stale `invalid_grant` after reconnect** | `RefreshFence` (§9.3.1) | equality | Discarded inside the refresh; `reauth_required` never written |
+| **A2 — stale *successful* refresh after reconnect** | `RefreshFence` (§9.3.1) | equality | Discarded; the newer credential is not overwritten |
+| A — stale 401 from the *provider* after reconnect | `credential_updated_at` | equality | Discarded; connection stays `connected` |
+| B — stale 403 after resource change | `external_resource_id` | equality | Discarded; connection stays `connected` on the new resource |
+| C — disconnect **before** the callback consumes its request | `consumed_at` set by disconnect | n/a | `InvalidState` at consumption; nothing written |
+| **C′ — disconnect *after* consumption, callback still running** | `lifecycle_generation` (§9.4) | **equality** | Discarded at finalization; no credential, no resurrection |
+| **D — older callback returns after a newer authorization completed** | `lifecycle_generation` (§9.4) | **equality** | Discarded; the newer attempt's state survives |
+| Two concurrent health checks | `connection_updated_at` | equality | The later one discards |
+| Two concurrent resource changes | Row lock, then fence | equality | Serialized; the second discards |
+| Health check racing a resource change it started before | `external_resource_id` | equality | Discarded |
+| Legitimate Connect **after** a disconnect | `lifecycle_generation` matches | **equality** | **Allowed** — the case that ruled out every status- or clock-based rule |
 
-### 9.6 Why this needs no migration — stated as a decision, not a preference
+Every row is now an equality test. No fence in this design compares two
+timestamps for ordering, and none depends on a monotonic clock.
 
-The review's instruction was to propose a version column if correctness needs
-one rather than preserve "no migration" artificially. It does not, and here is
-the reasoning rather than the conclusion:
+### 9.6 Why the fences use what they use
 
-- A dedicated `version` integer would be a strictly better *token* — monotonic,
-  immune to clock questions, impossible to forget in `update_fields` if the
-  save path increments it deliberately.
-- But `updated_at` already has every property the fence needs here: it changes
-  on every write, it is compared only for **equality** (never ordering, so
-  clock skew and monotonicity do not arise), and the whole comparison happens
-  inside one transaction on one row.
-- The one genuine weakness — a future save that omits `updated_at` — is
-  addressed by the two redundant fields in §9.3 *and* by a direct test (§14).
+Two different mechanisms, chosen for two different situations, and it is worth
+being explicit that this is not inconsistency.
 
-This reasoning covers the §9.3 fence. The §9.4 authorization fence rests on a
-different and narrower assumption — that nothing writes to a disconnected
-connection — which is stated there and tested, with `lifecycle_generation` named
-as its escape hatch.
+**§9.3 and §9.3.1 use `updated_at` snapshots.** The comparison is equality, made
+inside one transaction, on rows just re-read under a lock. Ordering, monotonicity
+and clock skew never enter, so a dedicated version column would add a migration
+and buy nothing. The one real weakness — a future `save()` that omits
+`updated_at` — is covered by redundant fields in the snapshot and by a direct
+test (§14).
 
-If implementation finds a case either fence cannot express, that is the signal
-to stop and propose the column, with the relevant section rewritten to say why.
-It is not a reason to weaken a fence.
+**§9.4 uses an explicit generation.** Here a snapshot could not work, because
+the question spans two tables and two lifetimes: *did an explicit end-of-life
+happen after this attempt began?* There is no pair of existing columns whose
+equality answers that, and the ordering comparison that seemed to was ambiguous
+on a tie. A counter that only the two intent-changing operations increment
+answers it exactly, in one integer comparison.
+
+**"No migration" is no longer a goal of this design.** It was a happy property
+of M4 and M5 because those milestones genuinely needed no new state. M6 needs
+one piece of state that no existing column expresses, and inventing a fragile
+proxy for it would be the wrong trade. The migration is small, additive,
+defaulted, and reversible (§11).
 
 ## 10. Backend service boundaries
 
@@ -798,7 +943,9 @@ integrations/
   resource_service.py    MODIFIED  guard lifted; ERROR admitted; shared result mapper
   oauth_service.py       MODIFIED  terminal status preserves a valid selection (§5.1)
   google/errors.py       MODIFIED  ResourceChangeNotSupported retired; one code added (§12)
-  google/credentials.py  UNCHANGED
+  google/credentials.py  MODIFIED  the refresh becomes a fenced operation (§9.3.1)
+  models.py              MODIFIED  lifecycle_generation, connection_generation (§9.4)
+  migrations/0003_…      NEW       two additive columns (§11)
   google/ga4.py          UNCHANGED
   google/search_console.py UNCHANGED
   resources.py           UNCHANGED — the catalog stays at three methods
@@ -815,25 +962,69 @@ about its state.
 No provider module changes at all. That is the M5 abstraction paying for itself
 a second time.
 
+The second most important boundary decision: **the refresh fence lives in
+`credentials.py`, not in its callers.** Every caller would otherwise need to
+know that obtaining a token can mutate two tables, and each would implement the
+same discard logic slightly differently. One fence, at the boundary that owns
+the credential, is the only version of this that stays correct.
+
 ---
 
 ## 11. Migration impact
 
-**None required.** Every field M6 writes already exists (finding 2), and no
-field changes type, width, nullability or default. `makemigrations --check`
-must stay clean, and that is an acceptance criterion.
+**One migration, and it is required.** M4 and M5 needed none; M6 needs one piece
+of state no existing column expresses (§9.4, §9.6). Preserving a
+"no migration" streak by substituting a fragile proxy would be the wrong trade.
 
-Considered and rejected as unnecessary:
+### 11.1 The migration
+
+```python
+# integrations/migrations/0003_lifecycle_generation.py
+migrations.AddField(
+    model_name="integrationconnection",
+    name="lifecycle_generation",
+    field=models.PositiveIntegerField(default=0),
+)
+migrations.AddField(
+    model_name="oauthauthorizationrequest",
+    name="connection_generation",
+    field=models.PositiveIntegerField(default=0),
+)
+```
+
+Two additive, defaulted, non-null integer columns. No data migration, no
+backfill, no index, no constraint, nothing dropped or renamed.
+
+### 11.2 Why it is safe to deploy
+
+- **Additive with a constant default.** PostgreSQL 11+ adds such a column
+  without rewriting the table, so the lock is brief even if the table were
+  large — and here it holds a handful of rows.
+- **Existing rows get `0` on both sides.** An authorization already in flight
+  across the deploy captured no generation, so its request row defaults to `0`
+  and the connection defaults to `0`: `0 == 0`, and the callback completes
+  normally instead of being spuriously discarded. That is the correct outcome —
+  the deploy is not a lifecycle event and must not invalidate a user's
+  in-progress consent.
+- **Ordering is the usual one**, already automated: the API container's
+  entrypoint runs `migrate` before Gunicorn starts, so the columns exist before
+  any code reads them.
+- **Reversible.** `RemoveField` is generated automatically and loses only the
+  counters, which are meaningful solely to code that is being rolled back
+  anyway (§16).
+
+### 11.3 Still rejected as unnecessary
 
 | Candidate | Why not |
 |---|---|
-| `disconnected_at` | The audit event carries who and when; a second copy could disagree |
+| `disconnected_at` | The audit event carries who and when; a second copy could disagree — and the generation already answers the question that timestamp was wanted for |
 | `health_check_count` / failure streaks | Nothing in V1 consumes it; that is retry policy, and V1 has no scheduler |
 | A separate `last_transient_error` | `last_error_code` plus the status already distinguishes the classes (§4.3) |
+| A version column for the §9.3 fence | That fence tests equality inside one transaction; `updated_at` already does the job (§9.6) |
 | `google_account_email` backfill | Would need an identity scope; §0 explains why it is wanted and §13 why it is still deferred |
 
-If implementation finds a schema change unavoidable, it stops and returns here
-for approval rather than writing one.
+Beyond the two columns above, implementation stops and returns here rather than
+adding schema.
 
 ---
 
@@ -906,11 +1097,18 @@ asserting status, retained resource, error code **and** the resulting primary
 action together, so a transient blip can never be shown to the user as a lost
 property.
 
-**Forced consent (§5.3.1)** — `prompt=consent` is sent from `REAUTH_REQUIRED`,
-from `ERROR` + `no_refresh_token`, and **from `DISCONNECTED`**; it is **not**
-sent for a first authorization, from `PENDING_AUTHORIZATION`, from
-`AWAITING_RESOURCE_SELECTION`, from `CONNECTED`, or from `ERROR` with any other
-code. Asserted by inspecting the built authorization URL, as M3 already does.
+**Forced consent (§5.3.1–5.3.2)** — one test per row of the capability table,
+asserted by inspecting the built authorization URL as M3 already does.
+`prompt=consent` **is** sent when no connection row exists, when no credential
+is stored, when the stored refresh token is empty, from `DISCONNECTED`, from
+`REAUTH_REQUIRED`, and from `ERROR` + `no_refresh_token`. It is **not** sent
+from `CONNECTED`, from `AWAITING_RESOURCE_SELECTION` with a stored refresh
+token, or from `ERROR` with any other code while the credential is intact.
+
+The case that motivates the change gets its own test: a **brand-new connection
+in a second project**, where a credential for the same provider already exists
+in another project, still forces consent — because the predicate reads *this*
+connection's credential, not the database at large.
 
 **The disconnect → reconnect round trip** — disconnect, then authorize, with the
 token response carrying a **new** refresh token, then the remembered resource
@@ -958,6 +1156,18 @@ the interleaving deterministically without threads:
   callback redirects with `invalid_state`, **no** `IntegrationCredential` row is
   created, and the connection is still `disconnected`. Plus the direct unit
   assertion that disconnect marks outstanding authorization requests consumed.
+- *Race A1 — stale `invalid_grant`* (§9.3.1): the refresh call is stubbed to
+  perform a reconnect (storing a new credential) before returning
+  `invalid_grant`. Assert the connection is **still `connected`**,
+  `last_error_code` is empty, and the newer credential is intact — the verdict
+  about the superseded token is never applied.
+- *Race A2 — stale successful refresh* (§9.3.1): the refresh call is stubbed to
+  perform a reconnect before returning **success**. Assert the stored access
+  token and expiry are the **reconnect's**, not the stale refresh's, and that
+  the stale refresh token was not written back.
+- *Refresh retry budget*: a fence mismatch whose re-read yields a usable token
+  returns it without a second Google call; a mismatch twice in a row raises
+  `ResourceUnavailable` rather than looping.
 - *Race C′* — the ordering the first draft missed, reproduced explicitly:
   **consume the request, then disconnect, then let the callback resume**. The
   token exchange is stubbed to perform the disconnect before returning, so the
@@ -969,9 +1179,28 @@ the interleaving deterministically without threads:
   status is the one R2 produced, and R1 wrote nothing. Deterministic via the
   same stub-performs-the-interleaving technique.
 - *The legitimate case the fence must not break* — disconnect, then Connect,
-  then complete the callback: it **succeeds**, because the disconnect predates
-  the authorization request. This is the counterpart that stops the C′ fence
-  from being implemented as "status is disconnected → always discard".
+  then complete the callback: it **succeeds**, because `start_authorization`
+  captured the post-disconnect generation. This is the counterpart that stops
+  the C′ fence from being implemented as "status is disconnected → always
+  discard".
+
+**Tie cases — the reason the fence is a generation and not a clock.** Each of
+these runs with time frozen so every row carries an **identical** timestamp,
+and each must still resolve correctly:
+
+- Disconnect and an authorization request created at the same frozen instant,
+  disconnect second: the callback is **discarded** (generations differ), where a
+  `updated_at > created_at` comparison would have allowed it.
+- Disconnect and an authorization request at the same frozen instant, disconnect
+  **first**: the callback **succeeds**, where the same comparison would also
+  have allowed it — asserting the fence is not merely stricter but *correct* in
+  both directions.
+- R1 and R2 created at the same frozen instant: exactly one succeeds, and it is
+  R2 — the one whose generation the connection holds.
+- A generation counter test proving the increment happens in exactly the two
+  places §9.4 names, and nowhere else: a health check, a resource change and a
+  repeat disconnect on an already-disconnected connection all leave
+  `lifecycle_generation` unchanged.
 - Two concurrent health checks: the later result discards.
 - A discarded result writes **nothing at all** — asserted field by field, since
   "discard but still stamp the timestamp" is the tempting wrong implementation.
@@ -984,12 +1213,11 @@ monotonic clock, and a test demanding wall-clock ordering would quietly assert a
 property the design says it does not rely on — and could fail on a clock
 adjustment for reasons that have nothing to do with the fence.
 
-**The §9.4 invariant** — a test asserts that no service path writes to a
-connection in `DISCONNECTED` state: a health check returns 409 without touching
-`updated_at`, resource selection returns 409 without touching it, a repeat
-disconnect leaves it unchanged, and `start_authorization` on a disconnected
-connection leaves it unchanged. This is what makes `updated_at` a sound proxy
-for the disconnect time.
+**Migration** — `makemigrations --check` is clean after the two `AddField`s;
+existing rows default to `0` on both sides; and an authorization request created
+**before** the migration (generation `0`) completes successfully against a
+connection at generation `0`, which is the in-flight-across-deploy case from
+§11.2.
 
 **Recovery classes (§7.1)** — a backend test asserts the set of error codes that
 can persist on a connection equals the set the frontend map handles, and names
@@ -1007,11 +1235,15 @@ deleting the row; let a failed reconnect verification set `connected`; add a
 revoke call; **remove each of the three fence fields in turn**; let a discarded
 result still write `last_health_check_at`; **stop disconnect from consuming
 outstanding authorization requests**; **remove `DISCONNECTED` from
-`_needs_forced_consent`**; **drop each half of the §9.4 finalization fence in
-turn** (the newer-request check, then the disconnect check); **collapse the
-§5.1.1 transient outcome into `resource_not_accessible`**; make denial set
-`error`; and make `error` always offer the authorization action regardless of
-error class. Each must turn the suite red.
+`_needs_forced_consent`**; **make `_needs_forced_consent` return False when no
+credential is stored**; **remove the §9.3.1 refresh fence**, then remove only
+its `invalid_grant` arm, then only its success arm; **stop
+`start_authorization` from incrementing the generation**, then stop
+`disconnect` from incrementing it; **compare generations with `>` instead of
+`!=`**; **collapse the §5.1.1 transient outcome into
+`resource_not_accessible`**; make denial set `error`; and make `error` always
+offer the authorization action regardless of error class. Each must turn the
+suite red.
 
 Frontend — **the §7.2 matrix asserted row by row**, `status` ×
 `last_error_code`, including that a `resource`-class error offers Change
@@ -1079,19 +1311,33 @@ invariant above:
 
 ## 16. Rollback
 
-No schema change, so rollback is `git revert` of the merge commit plus a
-redeploy — no data migration, no cleanup.
+M6 carries a migration, so rollback has an ordering rule it did not have in M4
+or M5. The rule is the ordinary one, stated so nobody has to derive it under
+pressure:
 
-What survives a rollback, and is safe:
+**Revert the code first; the columns can stay.** `git revert` of the merge
+commit plus a redeploy restores M5 behaviour completely. The two generation
+columns are simply unread by M5 code — an unused integer with a default harms
+nothing, and leaving them in place keeps the rollback a single, fast step.
+
+**Only drop the columns if the rollback is permanent**, and only after the
+reverted code is running. `RemoveField` in both directions is generated by
+Django; dropping them while M6 code is still live would break every
+authorization.
+
+What survives a rollback, and is safe under M5 code:
 
 - Connections that reached `disconnected` stay `disconnected` with no
-  credential. Reverted code renders them as "Disconnected" and offers Connect,
-  which is exactly right — M5 already knows that state.
-- Connections whose resource was *changed* keep the new resource. Reverted code
-  treats it as the selection it is.
+  credential. M5 renders that as "Disconnected" and offers Connect — correct,
+  and a state it already knows.
+- Connections whose resource was *changed* keep the new resource. M5 treats it
+  as the selection it is.
 - A connection left in `awaiting_resource_selection` with a retained resource id
-  (§5.2) renders under reverted code as "Select a property" with the old
-  property shown. Slightly odd, entirely harmless, and one selection fixes it.
+  (§5.2) renders under M5 as "Select a property" with the old property shown.
+  Slightly odd, harmless, and one selection fixes it.
+- Non-zero `lifecycle_generation` values are ignored by M5 code. If M6 is later
+  re-applied, counters resume from where they were, which is fine: the fence
+  only ever compares a captured value against the current one.
 
 Nothing M6 writes is unreadable by M5 code, which is what makes the revert safe
 rather than merely possible.
@@ -1101,7 +1347,9 @@ rather than merely possible.
 ## 17. Staging acceptance checklist
 
 Preconditions: staging on merged `main`, both containers healthy, no `.env`
-change (M6 introduces no setting), and the two live connections from M4/M5 —
+change (M6 introduces no setting), **the `0003_lifecycle_generation` migration
+applied by the entrypoint on deploy** (§11.2), and the two live connections from
+M4/M5 —
 GA4 on `properties/549483499` (*poolino*) and Search Console on
 `sc-domain:poolinogroup.com` (`siteFullUser`).
 
@@ -1184,7 +1432,11 @@ step 18. The "unaffected" claim belongs to step 11 and to disconnect alone.
 21. API log leak check over the whole session returns **0** for `ya29.`,
     `1//`, `client_secret`, `"access_token"`, `"refresh_token"`.
 22. Both credentials Fernet-encrypted; no plaintext tokens in the database.
-23. `makemigrations --check` reports no changes.
+23. The migration applied cleanly on deploy (`0003_lifecycle_generation` in
+    `showmigrations`), and `makemigrations --check` reports no further changes.
+24. Both pre-existing connections still work after the migration — they were
+    created before `lifecycle_generation` existed and default to `0`, which is
+    the §11.2 case, and Phase 1 already proved it before any M6 action.
 
 **Optional observation** — with a spare GA4 property, delete it in Google and
 run **Test connection**, to record what `properties.get` actually returns for a
