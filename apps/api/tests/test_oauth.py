@@ -1581,3 +1581,128 @@ class TestCallbackFailurePathsAreGenerationFenced:
         assert "oauth_error=invalid_state" in response.url
         self._assert_untouched_and_no_failure_audit(project, before)
         assert not IntegrationCredential.objects.exists()
+
+
+class TestAuthorizationEventSelection:
+    """§8.1. Exactly one event per completed authorization, chosen by state.
+
+    "Authorized" and "reconnected" are now both reachable, and the choice is
+    made from where the connection *was* — never from whether a credential row
+    happens to exist, and never from the status stage 3 has just written.
+    """
+
+    def _in_state(self, project, user, status, *, with_credential=True):
+        connection = IntegrationConnection.objects.create(
+            project=project,
+            provider=ProviderKey.GA4,
+            status=status,
+            granted_scopes=[GA4_SCOPE],
+            connected_by=user,
+        )
+        if with_credential:
+            IntegrationCredential.objects.create(
+                connection=connection,
+                access_token="access-token-0",
+                refresh_token="refresh-token-0",
+                access_token_expires_at=timezone.now() + timedelta(hours=1),
+            )
+        return connection
+
+    def _complete(self, client, project):
+        state = start_flow(client, project)
+        stub_token()
+        client.get(CALLBACK, {"state": state, "code": "auth-code-1"})
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "previous_status",
+        [
+            ConnectionStatus.REAUTH_REQUIRED,
+            ConnectionStatus.ERROR,
+            ConnectionStatus.CONNECTED,
+        ],
+    )
+    def test_repairing_a_live_integration_is_a_reconnection(
+        self, signed_in_client, make_project, previous_status
+    ):
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._in_state(project, user, previous_status)
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        ).count() == 1
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).exists()
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "previous_status",
+        [
+            ConnectionStatus.PENDING_AUTHORIZATION,
+            ConnectionStatus.AWAITING_RESOURCE_SELECTION,
+            # The user deliberately ended the integration: authorizing again
+            # starts a new lifecycle rather than repairing the old one.
+            ConnectionStatus.DISCONNECTED,
+        ],
+    )
+    def test_starting_an_integration_is_an_authorization(
+        self, signed_in_client, make_project, previous_status
+    ):
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        self._in_state(
+            project,
+            user,
+            previous_status,
+            with_credential=previous_status != ConnectionStatus.DISCONNECTED,
+        )
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).count() == 1
+        assert not AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        ).exists()
+
+    @responses.activate
+    def test_a_first_authorization_with_no_row_is_an_authorization(
+        self, signed_in_client, make_project
+    ):
+        client, _user, workspace = signed_in_client
+        project = make_project(workspace)
+
+        self._complete(client, project)
+
+        assert AuditEvent.objects.filter(
+            action=AuditEvent.Action.INTEGRATION_AUTHORIZED
+        ).count() == 1
+
+    @responses.activate
+    def test_previous_status_is_read_before_stage_three_mutates_it(
+        self, signed_in_client, make_project
+    ):
+        """Stage 3 writes awaiting_resource_selection itself.
+
+        Reading the field afterwards would make every authorization look like
+        it came from that state and collapse the whole §8.1 table into one row.
+        This is the case that catches it: reauth_required must not be read back
+        as awaiting_resource_selection.
+        """
+        client, user, workspace = signed_in_client
+        project = make_project(workspace)
+        connection = self._in_state(project, user, ConnectionStatus.REAUTH_REQUIRED)
+
+        self._complete(client, project)
+
+        connection.refresh_from_db()
+        assert connection.status == ConnectionStatus.AWAITING_RESOURCE_SELECTION
+        event = AuditEvent.objects.get(
+            action=AuditEvent.Action.INTEGRATION_RECONNECTED
+        )
+        assert event.metadata["previous_status"] == ConnectionStatus.REAUTH_REQUIRED

@@ -373,14 +373,43 @@ def _finalize_credentials(*, request, result, user) -> str:
         )
 
         record_event(
-            action=AuditEvent.Action.INTEGRATION_AUTHORIZED,
+            action=_authorization_event(previous_status),
             actor=user,
             project=request.project,
             provider=request.provider,
-            metadata={"provider": request.provider, "status": connection.status},
+            metadata={
+                "provider": request.provider,
+                "status": connection.status,
+                "previous_status": previous_status,
+            },
         )
 
     return previous_status
+
+
+#: The states a completed authorization *repairs* rather than starts (§8.1).
+#: Everything else — a first authorization, one that never finished, and a
+#: deliberate disconnect the user is now undoing — begins a lifecycle rather
+#: than restoring one, and reads as "authorized".
+_REPAIRED_STATUSES = frozenset(
+    {
+        ConnectionStatus.REAUTH_REQUIRED,
+        ConnectionStatus.ERROR,
+        ConnectionStatus.CONNECTED,
+    }
+)
+
+
+def _authorization_event(previous_status: str) -> str:
+    """Which event one completed authorization writes.
+
+    Exactly one, chosen from where the connection *was* — never from whether a
+    credential row happens to exist, which would say "reconnected" for a first
+    authorization that had merely failed halfway.
+    """
+    if previous_status in _REPAIRED_STATUSES:
+        return AuditEvent.Action.INTEGRATION_RECONNECTED
+    return AuditEvent.Action.INTEGRATION_AUTHORIZED
 
 
 def complete_authorization(*, user, state: str, code: str, error: str = "") -> OAuthAuthorizationRequest:
