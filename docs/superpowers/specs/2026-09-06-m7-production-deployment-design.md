@@ -32,6 +32,9 @@ for a user, with one small exception argued for in §10.4.
   scripts, no Docker group membership, no arbitrary shell.
 - A minimal root-owned release ledger recording candidate / current / previous
   per environment.
+- A hard separation between the privileged control plane, which only an admin
+  with root installs, and release data, which is all an automatic deploy may
+  supply or write (§12.6).
 - Explicit migration and `collectstatic` as a one-shot release step, out of the
   API container's normal startup.
 - Bounded health gating and automatic **image** rollback.
@@ -224,7 +227,9 @@ preserve, nothing to migrate, no existing workflow semantics to respect.
 | D9 | A release declares whether its migrations are backward compatible; incompatible releases forbid automatic rollback | The honest form of D8 |
 | D10 | `GUNICORN_WORKERS=1` in both environments | One core, two stacks, plus unrelated workloads |
 | D11 | No application ports are published to the host in either environment | Shared Caddy reaches both over Docker networks. Removes a whole class of port collisions and a public-exposure risk |
-| D12 | The compose files, Caddyfile and deploy scripts are installed as a versioned **config bundle**, not by a Git checkout on the server | Ordinary deploys need no Git on the box; config changes are still explicit and auditable |
+| D12 | Compose files, Caddyfile and deploy scripts are **control plane**: installed by an explicit root-authenticated infrastructure procedure, never by CI and never by an ordinary release | Ordinary deploys need no Git on the box, and the automatic path cannot rewrite its own guardrails (§12.6) |
+| D13 | Staging deploys **by digest** from the first release; production takes no image identity from any client | A tag can move between push and pull. Identity must not depend on a mutable pointer (§8.2) |
+| D14 | Production **refuses** any release not labelled backward-compatible, with no override | The previous app serves traffic *during* the migration, so an incompatible one breaks production before the candidate starts (§11.2) |
 
 ---
 
@@ -242,15 +247,19 @@ preserve, nothing to migrate, no existing workflow semantics to respect.
                    ghcr.io (PRIVATE)
                     api@sha256:… · web@sha256:…
                             │
-        auto (staging)      │      manual workflow_dispatch (production)
-        ────────────────────┼──────────────────────────────────────────
+  auto: staging, digests from CI  │  manual dispatch: production, SHA only;
+                                  │  digests come from the staging ledger
+        ──────────────────────────┼───────────────────────────────────────
                             ▼
    SSH forced command, per-environment key, to user `deploy`
+   (grammar: deploy <sha> [<api-digest> <web-digest>] | status — nothing else)
                             │
                 sudo → root-owned /usr/local/sbin/pi-deploy-<env>
                             │
-   flock → preflight → pull by digest → one-shot migrate+collectstatic
-        → recreate app → health gate → ledger update (or rollback)
+   flock → preflight (production: refuse unless the image declares
+        backward-compatible migrations) → pull by digest
+        → one-shot migrate+collectstatic → recreate app → health gate
+        → ledger update (or image-only rollback)
                             │
 ╔═══════════════════════════▼════════════════════════════════════════════╗
 ║ VPS (Ubuntu · 1 vCPU · ~2 GiB) — unrelated services untouched          ║
@@ -281,24 +290,27 @@ Postgres is reachable from an edge network, from the host, or from the internet.
 ```
 /opt/product-intelligence/
 ├── staging/
-│   ├── compose.staging.yaml        # installed from the config bundle
+│   ├── compose.staging.yaml        # CONTROL PLANE — admin-installed only
 │   ├── .env                        # root:root 0600, never in Git
-│   └── .release/                   # rendered per-deploy image digests
+│   └── .release/                   # release data — digests written per deploy
 ├── production/
-│   ├── compose.production.yaml
+│   ├── compose.production.yaml     # CONTROL PLANE — admin-installed only
 │   ├── .env                        # root:root 0600, distinct secrets
 │   └── .release/
 ├── shared/
 │   └── caddy/
-│       ├── compose.yaml
-│       └── Caddyfile               # both site blocks
-├── state/                          # root-owned release ledger
-│   ├── staging.json
-│   ├── production.json
-│   └── history/                    # append-only deploy records
-└── config-bundles/                 # unpacked, SHA-named config snapshots
-    └── <sha>/
+│       ├── compose.yaml            # CONTROL PLANE
+│       └── Caddyfile               # CONTROL PLANE — both site blocks
+└── state/                          # root-owned release ledger
+    ├── staging.json
+    ├── production.json
+    ├── control-plane.json          # which commit the control plane came from
+    └── history/                    # append-only deploy records
 ```
+
+Everything marked **CONTROL PLANE** is installed and updated only by the
+explicit infrastructure procedure in §12.6, never by a deployment. The only
+paths an ordinary release writes are `<env>/.release/` and `state/` (§12.6).
 
 Ownership: everything `root:root`. `deploy` needs **no** write access anywhere
 under `/opt/product-intelligence` (§12). `.env` files are `0600 root:root` and
@@ -457,26 +469,121 @@ failure mode that cannot produce an empty database.**
 The `pgdata_staging` key and its doubled-up name are kept exactly as-is (D3).
 Renaming would mean copying a live database for cosmetics.
 
-### 6.4 Sequence
+### 6.4 The single relocation and Caddy cutover runbook
 
-1. Snapshot the counts and volume list (§6.1). Copy `.env` to the new path with
-   `install -m 600 -o root -g root`, and verify it is byte-identical.
-2. `docker compose -f compose.staging.yaml stop` **in the old directory**
-   (`stop`, not `down`: no network or volume removal). Caddy is handled in §7 and
-   may keep running through this step.
-3. Install the config bundle into `/opt/product-intelligence/staging/`.
-4. Create the four external networks and confirm the external volumes resolve:
-   `docker compose -f compose.staging.yaml config` must succeed and
-   `docker compose … config --format json | jq -r .name` must still print
-   `product-intelligence-staging`.
-5. `docker compose -f compose.staging.yaml up -d` from the **new** directory.
-6. Re-run the count query. The numbers must match §6.1 **exactly**. A zero where
-   there was a non-zero means the wrong volume was mounted: stop, do not
-   "re-seed", and reattach the correct volume.
-7. Sign in through the browser and confirm one existing integration still reads
-   `Connected` on its remembered resource — proof that
-   `CREDENTIAL_ENCRYPTION_KEYS` still decrypts what is stored, which is the real
-   test of credential preservation.
+**This is the only cutover sequence in this document.** §7 explains *why* Caddy
+adopts the volumes it does; the ordered steps live here, once, so the two cannot
+drift apart. Relocation and the Caddy handoff are one operation: the relocated
+stack lands on new networks that the old Caddy is not attached to, so the proxy
+must move in the same window.
+
+Two facts set the shape of it:
+
+- **The old and new stacks can never run at the same time.** They mount the same
+  external `pgdata_staging` volume, and two Postgres containers on one data
+  directory is corruption, not redundancy. The swap is strictly serial.
+- **Only one process can bind `:80`/`:443`.** Old Caddy must be stopped before
+  shared Caddy starts.
+
+#### Phase 0 — preparation (no downtime; staging keeps serving)
+
+1. Snapshot the counts, project name and volume list (§6.1).
+2. `install -m 600 -o root -g root` the existing `.env` to
+   `/opt/product-intelligence/staging/.env`; verify byte-identical (`cmp`).
+3. Install the control plane for staging and shared Caddy (§12.6) — compose
+   manifests and the Caddyfile. Start nothing.
+4. **Create the storage and network skeleton** — the four external networks
+   (§5.1) *and* the two static volumes shared Caddy mounts:
+
+   ```bash
+   docker network create product-intelligence-staging-edge
+   docker network create product-intelligence-staging-internal
+   docker network create product-intelligence-production-edge
+   docker network create product-intelligence-production-internal
+   docker volume create product-intelligence-production_static   # empty, on purpose
+   ```
+
+   The production **static** volume is created here rather than at production
+   bootstrap because shared Caddy declares it `external: true` and would refuse
+   to start without it (§7). It is empty until the first production release
+   populates it; nothing serves from it until the `app.arkav.lol` site block
+   exists, which is itself gated on DNS. The production **database** volume is
+   deliberately *not* created here — nothing before §15 references it, and
+   creating it at bootstrap keeps "production starts empty" a single, checkable
+   step. No production data of any kind is created or copied.
+5. Pre-pull the candidate images by digest so the downtime window contains no
+   network transfer.
+6. Validate the Caddyfile offline, without binding ports:
+   `docker run --rm -v …/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile`.
+7. Render the relocated manifest and assert the project name is still
+   `product-intelligence-staging` and every external volume resolves
+   (§6.2, §6.3).
+
+#### Phase 1 — cutover (downtime begins)
+
+8. **T0 — stop old Caddy**, then the old application services, in one
+   project-scoped command naming the services explicitly:
+
+   ```bash
+   cd /opt/product-intelligence-staging
+   docker compose -f compose.staging.yaml stop caddy api web postgres
+   ```
+
+   `stop`, never `down`: no network, volume or container removal. Caddy first, so
+   the window is a refused connection rather than a stream of 502s.
+9. **Start the relocated stack** from `/opt/product-intelligence/staging/`
+   (`up -d`), and wait for `api` and `web` to report healthy.
+10. **Start shared Caddy** from `/opt/product-intelligence/shared/caddy/`
+    (`up -d`) — same `caddy_data`/`caddy_config` volumes, same certificate.
+11. **T1 — downtime ends** when `https://staging.arkav.lol/api/health` returns
+    200 through shared Caddy.
+
+**Downtime window:** T0 → T1, containing only container starts and health waits
+— no image pull (step 5), no build (there are none), no certificate issuance
+(the volumes are adopted, §7). Expect roughly 30–90 seconds on this host; the
+API `start_period` is the dominant term. It is a real outage, deliberately taken
+once, on staging only.
+
+#### Phase 2 — verification (before anything else happens)
+
+12. Re-run the count query. The numbers must match §6.1 **exactly**. A zero
+    where there was a non-zero means the wrong volume was mounted: stop, do not
+    "re-seed", and reattach the correct volume.
+13. Sign in through the browser and confirm one existing integration still reads
+    `Connected` on its remembered resource — proof that
+    `CREDENTIAL_ENCRYPTION_KEYS` still decrypts what is stored, which is the real
+    test of credential preservation.
+14. Only now consider the relocation complete. `app.arkav.lol` is added to the
+    Caddyfile later, and only after its DNS resolves (§15).
+
+#### Phase 3 — reverse handoff, if relocation fails
+
+Restarting the old directory is **not** sufficient once Caddy has moved: shared
+Caddy holds `:80`/`:443`, and the old project's Caddy cannot bind them. Reversing
+is therefore also a two-part operation, in this order:
+
+```bash
+# 1. Free the ports and release the shared proxy.
+cd /opt/product-intelligence/shared/caddy && docker compose stop
+
+# 2. Release the pgdata volume from the relocated stack.
+cd /opt/product-intelligence/staging && docker compose -f compose.staging.yaml stop
+
+# 3. Bring the original project back, Caddy included.
+cd /opt/product-intelligence-staging
+docker compose -f compose.staging.yaml --profile caddy --env-file .env up -d
+```
+
+Step 3 restores public staging because the old manifest's Caddy service binds
+the ports again and its volume keys resolve to the same existing volumes — the
+data, the static files and the certificate are all still there, untouched by the
+attempt. Two caveats to check before relying on it: the old manifest still
+contains `build:` sections, so the previously built local images must still be
+present (`docker image ls`) or Compose will try to build on the host; and the old
+Caddy reaches `api`/`web` over the old project's `internal` network, which the
+`stop` in Phase 1 left intact.
+
+No volume is removed at any point in either direction.
 
 ### 6.5 What is preserved
 
@@ -491,8 +598,10 @@ No volume is created, renamed, copied, or removed during the relocation.
 
 ### 6.6 Old directory
 
-Left in place and stopped. It is the fastest rollback for the relocation itself.
-Removal is a separate, later, explicit decision — never part of a deploy.
+Left in place and stopped. With the reverse Caddy handoff in §6.4 Phase 3 it is
+the fastest rollback for the relocation itself — on its own, after Caddy has
+moved, it restores nothing publicly, which is why Phase 3 exists. Removal is a
+separate, later, explicit decision — never part of a deploy.
 
 ---
 
@@ -555,26 +664,30 @@ Django admin and DRF assets keep working in both environments — the current
 architecture is preserved, not dropped, and each environment serves its own
 build of them.
 
-**Cutover sequence** (staging downtime measured in seconds):
+**The production static volume must exist before shared Caddy starts.** Because
+it is declared `external: true`, a missing volume stops Caddy from starting at
+all — which would mean shared Caddy could not run until production bootstrap, a
+circular dependency. §6.4 Phase 0 therefore creates the empty
+`product-intelligence-production_static` as part of the storage skeleton, well
+before cutover. An empty volume is harmless: nothing serves from it until the
+`app.arkav.lol` site block is added, and that is gated on DNS.
 
-1. Install the shared Caddy directory and Caddyfile. Do **not** start it.
-2. Validate the config without binding ports:
-   `docker run --rm -v …/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile`.
-3. Ensure the relocated staging stack is up on the new networks (§6.4) so the
-   aliases resolve.
-4. `docker compose -f compose.staging.yaml stop caddy` in the **old** project —
-   scoped to one service of one project; ports free.
-5. `docker compose -f shared/caddy/compose.yaml up -d` — same volumes, same
-   certificate, now serving `staging.arkav.lol` from the shared project.
-6. Verify staging over public HTTPS before doing anything else.
-7. `app.arkav.lol` is added to the Caddyfile **only after its DNS A record
-   resolves to the VPS** (§15). Caddy obtains that certificate on first request;
-   until DNS is valid, adding the site block produces repeated ACME failures.
+**Cutover steps are not repeated here.** The ordered runbook — what stops, when,
+what starts, the downtime window, and how to reverse it — is §6.4, which covers
+relocation and this handoff as the single operation they are. Two properties
+that belong to this section:
 
-The old Caddy service is stopped, never `down`-ed with volume removal, and the
-old project's other services are already stopped from §6.4. `cloudflared`, n8n,
-Portainer and x-ui are never addressed by any command here — every command names
-a project or a single service.
+- `app.arkav.lol` is added to the Caddyfile **only after its DNS A record
+  resolves to the VPS** (§15). Caddy obtains that certificate on first request;
+  adding the site block earlier produces repeated ACME failures against a
+  hostname that does not resolve.
+- Adding a site block later is a **reload**, not a recreate, so it does not
+  disturb the running staging site.
+
+The old Caddy service is stopped, never `down`-ed with volume removal.
+`cloudflared`, n8n, Portainer and x-ui are never addressed by any command in
+this operation — every command names a project or an explicit list of that
+project's services.
 
 **Independence.** From this point Caddy is its own Compose project. Deploying
 staging or production touches only that environment's project, so Caddy is never
@@ -600,21 +713,31 @@ short SHA. The VPS never builds application source after M7; neither
 `compose.staging.yaml` nor `compose.production.yaml` contains a `build:` section
 in the final architecture.
 
-### 8.2 Digests are the real identity
+### 8.2 Digests are the real identity — from the first deploy onward
 
-A tag is a mutable pointer. The design therefore treats the **digest** as
-identity:
+A tag is a mutable pointer, so the **digest** is identity everywhere. The tag
+exists for humans reading `docker image ls`; nothing deploys by it.
 
-- CI records the digests emitted by `docker buildx build --push`
-  (`docker/build-push-action` exposes them) into a release manifest attached to
-  the workflow run.
-- The staging deploy pulls by tag once, immediately resolves what it pulled
-  (`docker image inspect --format '{{index .RepoDigests 0}}'`), and writes those
-  digests into the staging ledger entry.
-- **Production pulls by digest**, taken from the staging ledger entry for that
-  SHA — not by tag, and never rebuilt. If someone force-pushes a tag between
-  staging and production, production still runs the exact bytes staging
-  validated, and the pull simply fails if those bytes are gone.
+- CI already knows both digests the moment `docker/build-push-action` completes
+  (its `digest` output). It passes them to the staging deploy.
+- **Staging deploys by digest from the start** —
+  `…/api@sha256:…` and `…/web@sha256:…`. There is no
+  pull-the-tag-then-discover-what-arrived step: between a tag push and a tag
+  pull, a tag can move, and a design that resolves the digest afterwards is
+  trusting a pointer it did not have to trust.
+- The staging deploy records those digests in the ledger on success.
+- **Production ignores every client-supplied image identity.** It reads the
+  digests from the successful staging ledger entry for that SHA and pulls
+  those. If a tag was force-pushed in between, production still runs the exact
+  bytes staging validated; if those bytes are gone, the pull fails and the
+  deploy aborts before mutating anything.
+
+**The server constructs the image reference; the client never supplies one.**
+The deploy script holds the repository prefix as a hard-coded constant
+(`ghcr.io/imiladco/product-intelligence/{api,web}`) and appends a validated
+digest. A caller therefore cannot point a deploy at another registry,
+another repository, or another account's image — not because the prefix is
+validated, but because no prefix is ever accepted.
 
 Each environment's `.release/` directory holds a small generated env file
 (`API_IMAGE=…@sha256:…`, `WEB_IMAGE=…@sha256:…`) that its compose file
@@ -622,12 +745,23 @@ interpolates, so the manifest itself stays free of hard-coded digests.
 
 ### 8.3 GHCR credential on the VPS
 
-A GitHub personal access token with **`read:packages` only** — no repo scope, no
-`write:packages`, no `delete:packages`. Stored at
-`/etc/product-intelligence/ghcr.env`, `0600 root:root`, used by the root-owned
-deploy script to `docker login ghcr.io` on the root Docker context. The `deploy`
-user cannot read it (§12). It is never committed, never passed as a command
-argument, and never echoed. Rotation is a documented manual step.
+The requirement is **least privilege, stated as properties rather than as a
+token mechanism**, because the exact mechanism is settled by what actually works
+against GHCR during implementation:
+
+1. It can pull the two private images — **demonstrated**, not assumed, as a
+   bootstrap step.
+2. It has **no package write and no package delete** capability, and no
+   repository scope.
+3. It is stored at `/etc/product-intelligence/ghcr.env`, `0600 root:root`, and
+   used only by the root-owned deploy script to `docker login ghcr.io`. The
+   `deploy` user cannot read it (§12.1).
+4. It is never committed, never passed as a command argument, never echoed.
+5. Rotation is a documented manual step.
+
+Implementation picks the narrowest credential that satisfies (1) and (2) and
+records which it used. Over-specifying it here would be guessing at a registry's
+current behaviour from a design document.
 
 ---
 
@@ -674,8 +808,24 @@ recreated. `--rm` leaves nothing behind; `--no-deps` avoids restarting Postgres.
 `--clear` is dropped from `collectstatic`. With a shared, per-environment static
 volume and a live Caddy serving from it, `--clear` empties the directory before
 repopulating it, creating a window where the running site has no admin CSS. The
-default overwrite behaviour is correct here. (Stale files accumulate only across
-asset renames; that is a cosmetic, bounded cost.)
+default overwrite behaviour is correct here.
+
+**This step is not atomic, and the design says so rather than implying
+otherwise.** `collectstatic` writes into the live volume file by file, so a
+failure part-way leaves a mix of the previous and candidate builds, and an
+aborted deploy does **not** restore the previous assets. The bounded reality:
+filenames are stable across builds (the project uses Django's default
+`StaticFilesStorage` — no hashed manifest names), so every asset path still
+resolves and the site keeps rendering; the exposure is a subset of assets being
+from a build that was never promoted. §17.5 records it as an accepted M7 risk.
+
+An atomic alternative — collect into a sibling directory inside the volume and
+swap a symlink that Caddy's `root` points at — was considered and **rejected for
+M7**: it adds a directory-lifecycle scheme, a symlink Caddy must be configured
+to follow, and cleanup of superseded generations, which is a static-release
+subsystem for a failure mode whose worst case is a slightly stale stylesheet. If
+`ManifestStaticFilesStorage` is ever adopted, content-hashed names make the
+question disappear entirely; that is the natural time to revisit it.
 
 ### 9.3 Ordering, and why migrations run first
 
@@ -716,22 +866,31 @@ still work without publishing artifacts for unmerged code.
 ### 10.2 `main` only — publish and deploy staging
 
 After every gate passes: build both images with buildx and GitHub Actions cache,
-push by full-SHA tag, capture digests, then invoke the staging deploy over SSH.
-A red gate publishes nothing and deploys nothing.
+push by full-SHA tag, take both digests from the build action's own `digest`
+output, and invoke the staging deploy over SSH **passing those digests**
+(§8.2, §12.3). A red gate publishes nothing and deploys nothing.
+
+The workflow supplies release data only. It cannot install a compose file, a
+Caddyfile, a script, or anything else on the server (§12.6).
 
 ### 10.3 Production — `workflow_dispatch` only
 
-Inputs: the full 40-character SHA, and a typed confirmation string. The workflow
-verifies the SHA passed staging by reading the ledger through the deploy path
-(the server is the authority, not the workflow), then invokes the production
-deploy. It never builds. There is no `push` trigger on the production workflow —
-production cannot be reached by merging anything.
+Input: the full 40-character SHA. Nothing else — no digests (the server reads
+them from the staging ledger, §8.2), and **no confirmation or override input**,
+because there is nothing for one to unlock: an ineligible release is refused
+outright (§11.2).
+
+The workflow invokes the production deploy; the server verifies that the SHA
+passed staging and that the pulled image declares backward-compatible
+migrations. The server is the authority for both, not the workflow. It never
+builds. There is no `push` trigger — production cannot be reached by merging
+anything.
 
 ### 10.4 The one application change M7 requires
 
-§23 of the brief requires proving that each hostname routes to the correct
-environment. Container health cannot prove that; a public request that reveals
-which release answered can. The design adds a `release` field to the existing
+The approved brief's health-gating requirement includes proving that each
+hostname routes to the correct environment. Container health cannot prove that;
+a public request that reveals which release answered can. The design adds a `release` field to the existing
 `/api/health` payload, sourced from a `RELEASE_SHA` environment variable set by
 the deploy script, defaulting to `"unknown"`:
 
@@ -756,7 +915,7 @@ code: add columns nullable or defaulted, do not drop or rename in the same
 release that stops using them, split destructive changes across two releases.
 Automatic image rollback is only meaningful under that discipline.
 
-### 11.2 Declaring an incompatible release
+### 11.2 Declaring compatibility — and failing closed
 
 A repository file — `deploy/release-metadata.json` — carries one field:
 
@@ -764,18 +923,39 @@ A repository file — `deploy/release-metadata.json` — carries one field:
 { "migrations_backward_compatible": true }
 ```
 
-CI reads it at build time and copies the value into the release manifest, so the
-claim travels with the artifact rather than living in someone's memory. When it
-is `false`:
+CI reads it at build time and stamps it onto the **API image** as an OCI label
+(`org.arkav.pi.migrations-backward-compatible`). The claim therefore travels
+with the artifact and is fixed by the same digest the deploy pulls: the server
+reads it back from the pulled image with `docker image inspect`, rather than
+trusting whatever the transport said. A client cannot assert compatibility it
+does not have.
 
-- the staging deploy proceeds normally (staging is where you find out);
-- the production workflow requires an extra explicit confirmation input;
-- **automatic rollback is disabled for that release**. A failed health gate stops
-  and reports `MANUAL RECOVERY REQUIRED`, naming the previous SHA, rather than
-  rolling images back onto a schema they cannot read.
+**The contract fails closed.** For automated *production* deployment:
 
-This is one boolean and one CI step. It is deliberately not a migration
-framework.
+| Label value on the pulled API image | Production deploy |
+|---|---|
+| exactly `true` | **eligible** |
+| `false` | **refused** |
+| missing, empty, malformed, or unreadable | **refused** |
+
+There is no override, no confirmation input, and no force flag anywhere in the
+M7 automated deploy system. The deploy-command grammar (§12.3) contains no token
+that could express one. A backward-incompatible production migration is a
+**separate, future, manual maintenance procedure** — outside ordinary M7
+deployment automation — and the automation's job is to refuse it clearly rather
+than to offer a way through.
+
+Staging is unaffected: it deploys either value normally, because staging is
+where an incompatible migration is supposed to be discovered.
+
+**Why refusal, and not merely "no automatic rollback".** The rollback argument
+is the lesser one. The deploy runs migrations *while the previous release is
+still serving traffic* (§9.3): the old application keeps handling requests
+against the new schema for the whole interval between the one-shot migration and
+the candidate becoming healthy. An incompatible migration therefore breaks the
+**currently serving application** before the candidate has started — an outage
+caused during the deploy, not merely an unrecoverable one afterwards. Refusing
+before the migration runs is the only point at which that is preventable.
 
 ### 11.3 No automatic database downgrade, ever
 
@@ -791,9 +971,10 @@ never claims database rollback exists. §17.1 records the accepted consequence.
 | Principal | Has | Explicitly does not have |
 |---|---|---|
 | `deploy` (Unix user) | An SSH key with a forced command; `sudo` for exactly two root scripts | Docker group membership; write access under `/opt/product-intelligence`; read access to any `.env` or the GHCR token; an interactive shell |
-| root scripts | Docker socket, `.env` files, the ledger | Nothing from the client except a validated SHA |
-| GitHub Actions (staging) | The staging deploy key | Any way to name `production` |
-| GitHub Actions (production) | The production deploy key | Any way to build or push a new image at deploy time |
+| root scripts | Docker socket, `.env` files, the ledger | Nothing from the client except a validated SHA and, for staging, two validated digests |
+| GitHub Actions (staging) | The staging deploy key | Any way to name `production`; **any way to modify the control plane** (§12.6) |
+| GitHub Actions (production) | The production deploy key | Any way to build or push a new image at deploy time; any way to supply an image identity or an override |
+| Human admin with root | The infrastructure update procedure (§12.6) | — this is the only principal that can change deployment code |
 
 `deploy` is **not** in the `docker` group. Docker group membership is
 root-equivalent; granting it would make every other control cosmetic.
@@ -817,20 +998,39 @@ forwarding, agent forwarding, X11 and PTY allocation.
 This answers "what prevents the auto-staging credential from deploying
 production" structurally rather than by convention.
 
-### 12.3 Input validation
+### 12.3 Input validation and the command grammar
 
-The wrapper accepts one of two shapes and nothing else:
+The wrapper accepts these shapes and nothing else. Which one is permitted
+depends on the environment baked into the forced command, not on the client:
 
 ```
-deploy <40-hex-sha>
-status
+staging:      deploy <40-hex-sha> <api-digest> <web-digest>
+production:   deploy <40-hex-sha>
+either:       status
 ```
 
-Parsing is strict — `[[ "$sha" =~ ^[0-9a-f]{40}$ ]]` — before any other use, and
-the SHA is never interpolated into a shell string. No user-supplied text ever
-reaches `eval`, a shell `-c`, a compose file, or a docker argument other than as
-a validated tag or a ledger key. Anything else exits non-zero with a fixed
-message.
+Staging carries the digests because CI already knows them and deploying by tag
+would trust a mutable pointer (§8.2). Production takes **no** image identity
+from the client at all — it reads the digests recorded by the successful staging
+deploy.
+
+Validation happens before any other use, on every field:
+
+| Field | Rule |
+|---|---|
+| SHA | `^[0-9a-f]{40}$` — full length, lowercase hex |
+| digest | `^sha256:[0-9a-f]{64}$` |
+| repository | **never accepted from the client.** The script appends the validated digest to a hard-coded prefix constant (§8.2) |
+| anything else | rejected, non-zero exit, fixed message |
+
+There is no token in this grammar for forcing, confirming, overriding, or
+selecting a config bundle, an image repository, a compose file, or a path. The
+grammar is the surface, and it is deliberately three words wide.
+
+Nothing from `SSH_ORIGINAL_COMMAND` reaches `eval`, a shell `-c`, a compose
+file, a filename, or any docker argument other than as a validated digest or a
+ledger key. Arguments are passed as array elements, never as an interpolated
+string.
 
 ### 12.4 sudoers
 
@@ -849,6 +1049,65 @@ or logged. `.env` files are `0600 root:root`, generated on the server by the
 same non-echoing technique `docs/STAGING.md` already establishes. GitHub stores
 only the two SSH private keys and the host/user, as repository secrets. The GHCR
 read-only token lives only on the server. This design adds **no** secret-manager.
+
+### 12.6 The control plane does not update itself
+
+The privileged deployment code is what enforces every rule above. If automatic
+staging CI could replace it, a compromised staging credential — or an ordinary
+mistake merged to `main` — would rewrite the rules it is supposed to be bound
+by, including the production refusal in §11.2 and the environment binding in
+§12.2. So the two are separated by what may write them, not merely by intent.
+
+**Tier A — control plane. Admin-installed only.**
+
+| Artifact | Location |
+|---|---|
+| Forced commands | `~deploy/.ssh/authorized_keys` |
+| sudoers rule | `/etc/sudoers.d/pi-deploy` |
+| Wrapper | `/usr/local/bin/pi-deploy-wrapper` |
+| Deploy scripts | `/usr/local/sbin/pi-deploy-{staging,production}` |
+| Shared privileged library | `/usr/local/lib/pi-deploy/` |
+| Compose manifests, Caddyfile | `/opt/product-intelligence/{staging,production,shared/caddy}/` |
+| `.env` files | as above |
+
+All `root:root`, in root-owned directories, not writable by `deploy`. **No
+deployment of either environment reads, writes, downloads, unpacks, or executes
+anything that would change these.**
+
+**Tier B — release data. The only thing a deploy supplies or writes.**
+
+| Datum | Source | Written to |
+|---|---|---|
+| Release SHA | validated CLI argument | ledger, `.release/`, `RELEASE_SHA` |
+| API digest, Web digest | staging: validated arguments; production: the staging ledger | `.release/` |
+| Migration compatibility | the pulled image's OCI label (§11.2) | ledger |
+| Deploy outcome, timestamps | the deploy itself | ledger, `history/` |
+
+That is the complete list. It is data, not code: nothing in Tier B is executed,
+sourced, or interpreted as configuration.
+
+**How deployment infrastructure changes are applied.** Tier A changes — a new
+compose manifest, a Caddyfile edit, a change to a deploy script — are reviewed
+and merged in Git like any other change, then installed by a human with root
+running an explicit **infrastructure update procedure** (documented in
+`docs/DEPLOY.md`): check out or fetch the reviewed commit to an admin working
+copy, `install` the files to their Tier A locations with explicit ownership and
+mode, record the commit in `state/control-plane.json`, and — for a Caddy change —
+`caddy reload`. It is deliberately a manual, occasional, root-authenticated
+operation. Rolling one back means installing the previous reviewed commit the
+same way (§19).
+
+**This closes the transport gap in the earlier draft**, which claimed CI
+delivered a config bundle while the SSH grammar permitted only `deploy` and
+`status`. Per-release config-bundle delivery is **removed** rather than given a
+transport: it was the more complex option and the one that put privileged code
+on the automatic path. The ordinary release path now carries release data only,
+and the grammar in §12.3 has no shape that could carry anything else.
+
+**The consequence, stated plainly:** a release whose compose manifest must
+change is not an ordinary release. It needs an infrastructure update first, then
+the release. That is a small, deliberate friction on a rare event, and it is the
+price of the automatic path being unable to alter its own guardrails.
 
 ---
 
@@ -874,7 +1133,8 @@ blocks a production promotion.
 Abort with a clear reason, having changed nothing, if any of these fail:
 
 1. Environment is one of the two known values (from the forced command).
-2. SHA matches `^[0-9a-f]{40}$`.
+2. SHA matches `^[0-9a-f]{40}$`; on staging, both digests match
+   `^sha256:[0-9a-f]{64}$` (§12.3).
 3. `/opt/product-intelligence/<env>/.env` exists, is `0600 root:root`, and
    contains every required key with a non-empty value (names only — never
    values — are reported).
@@ -882,11 +1142,14 @@ Abort with a clear reason, having changed nothing, if any of these fail:
 5. `docker compose config` validates and the resolved project name equals the
    expected constant (§6.2).
 6. The four external networks and this environment's external volumes exist.
-7. Both images exist and pull successfully (staging: by tag; production: by
-   digest from the ledger).
-8. **Production only:** the ledger records this SHA as a successful staging
-   release, and — if `migrations_backward_compatible` is false — the extra
-   confirmation was supplied.
+7. Both images exist and pull successfully — **by digest in both environments**
+   (staging: the digests CI supplied; production: the digests recorded in the
+   staging ledger).
+8. **Production only, and fail-closed:** the ledger records this SHA as a
+   successful staging release, **and** the pulled API image's
+   compatibility label reads exactly `true` (§11.2). `false`, missing,
+   malformed or unreadable → refuse, with a message naming the reason. There is
+   no input that changes this outcome.
 9. Free disk on the Docker filesystem is above a floor (a few GiB), since a pull
    that fills the disk is a way to damage unrelated services.
 10. **Production only, first deploy:** `app.arkav.lol` resolves to this host and
@@ -939,34 +1202,47 @@ GitHub never asserts it.
 
 | # | Failure point | Schema touched? | Automatic action | End state |
 |---|---|---|---|---|
-| 1 | Preflight (any of §13.2) | No | Abort | Current release untouched and serving |
+| # | Failure point | Schema touched? | Automatic action | End state |
+|---|---|---|---|---|
+| 0 | **Production**, compatibility label is not exactly `true` (false, missing, malformed, unreadable) | No | **Refuse before pulling or migrating.** No override exists | Current release untouched and serving. Reported as ineligible, naming the reason; needs the separate manual maintenance procedure |
+| 1 | Preflight (any other of §13.2) | No | Abort | Current release untouched and serving |
 | 2 | Image pull fails | No | Abort | Current release untouched and serving |
 | 3 | Migration one-shot fails | **Partially — possibly** | Abort. Candidate app is **never started** | Previous app still running. Django migrations are per-migration atomic on PostgreSQL, so a failed migration leaves the earlier ones applied; with expand/contract the old code tolerates that. Reported loudly |
-| 4 | `collectstatic` fails | No | Abort | Previous app still running; its static files untouched |
+| 4 | `collectstatic` fails | No (schema); **the static volume may be partially updated** | Abort | Previous app still running. Some assets may already have been overwritten with the candidate's versions — see §17.5. Filenames are stable, so the site keeps serving; a subset of assets may be from the newer build |
 | 5 | Container start / health fails, migrations compatible | Yes, applied | Roll images back to `previous` digests, re-run health gate | Previous images on new schema — the expand/contract case |
-| 6 | Container start / health fails, migrations **in**compatible | Yes, applied | **No rollback.** Stop, dump `docker compose ps` and last log lines, mark the attempt failed | `MANUAL RECOVERY REQUIRED`, previous SHA named |
+| 6 | Container start / health fails on a release that reached this point despite an unreadable label (staging only) | Yes, applied | **No rollback.** Stop, dump `docker compose ps` and last log lines, mark the attempt failed | `MANUAL RECOVERY REQUIRED`, previous SHA named. On production this row is unreachable: row 0 refused it before the migration ran |
 | 7 | Rollback itself fails | Yes | Stop. No retry loop | `CRITICAL`: ledger records both failures, diagnostics preserved, exit non-zero. A human decides next |
 | 8 | Public health passes but the wrong `release` answers | Yes | Treated as a health failure → row 5 or 6 | Routing error surfaces as a failed deploy, not a silent cross-wire |
 | 9 | Lock held | No | Exit 75 immediately | Other deploy continues undisturbed |
 
-Rows 5 and 6 are the whole point of §11.2: **automatic image rollback is safe
-only when the candidate's migrations were declared backward compatible.**
+Row 0 is where §11.2 does its work, and it is deliberately the **first** row:
+production refuses an incompatible or unverifiable release before the migration
+runs, because the previous application is still serving traffic while it does
+(§9.3, §11.2). Rows 5 and 6 then cover only what remains — and on production,
+row 6 is unreachable by construction.
 
 ---
 
 ## 15. Production bootstrap (one-time, manual, approval-gated)
+
+**Prerequisite already satisfied:** the two production **networks** and the
+production **static** volume were created in §6.4 Phase 0, before shared Caddy
+started, because Caddy mounts that volume as external. This section does not
+re-create them; `docker volume create` and `docker network create` are
+idempotent-by-inspection here (check first, create only if absent).
 
 Ordered so that nothing irreversible happens before its prerequisite:
 
 1. **DNS.** `app.arkav.lol` A record → VPS IP, Cloudflare **DNS-only** (grey
    cloud). Verify with `dig +short app.arkav.lol`. No Cloudflare proxy in M7 —
    Caddy terminates TLS directly, and an orange cloud would break HTTP-01.
-2. **Directories.** Create `/opt/product-intelligence/production/` and
-   `state/`, root-owned.
-3. **Networks and volumes.** Create the two production networks and the
-   production volumes explicitly by name, so the external declarations resolve:
-   `docker volume create product-intelligence-production_pgdata` and
-   `…_static`.
+2. **Directories.** Create `/opt/product-intelligence/production/`, root-owned,
+   and install its control plane (§12.6): `compose.production.yaml`.
+3. **Database volume.** Create the one volume deliberately left until now:
+   `docker volume create product-intelligence-production_pgdata`. It is created
+   here, empty, so that "production starts empty" is a single checkable step
+   rather than a claim about something made earlier. Confirm the networks and
+   static volume from §6.4 Phase 0 still exist.
 4. **Secrets.** Generate a **new** `DJANGO_SECRET_KEY`,
    `CREDENTIAL_ENCRYPTION_KEYS` and `POSTGRES_PASSWORD` straight into
    `/opt/product-intelligence/production/.env` using the non-echoing generator
@@ -1012,10 +1288,25 @@ Conservative V1 settings:
 | Web | standalone Node server, no build tooling | Already the case |
 | Deploys | serialized per environment by `flock` | Two simultaneous pulls would thrash a small box |
 
-Memory limits are set from measured idle usage during implementation, with
-headroom — not guessed here. If the host proves too small, the honest options are
-a bigger VPS or scaling staging down between tests; the design does not pretend
-otherwise, and does not add swap silently.
+**Capacity is designed for, not established.** This design does not claim that
+production "fits" this host — that is a measurement, and no measurement has been
+taken. What can be said now is only this:
+
+- The architecture is **designed conservatively to fit**: no server-side
+  application build ever again (the single largest memory spike, and the one
+  most likely to be OOM-killed here, moves to CI); one gunicorn worker in both
+  environments; modest Postgres buffers; deploys serialized per environment.
+- Runtime **memory limits will be chosen from measured usage** during
+  implementation, with headroom — not guessed in this document.
+- **Host capacity is an implementation acceptance gate.** Before production is
+  declared live, measured headroom must be recorded with both environments
+  running alongside the unrelated services.
+
+If the measured headroom is unsafe — if running production would put n8n,
+cloudflared, Portainer, x-ui or any unrelated database at risk of OOM — the
+correct action is to **stop and report**, not to proceed and hope. The honest
+remedies at that point are a larger VPS, or keeping staging stopped except when
+in use. The design does not add swap silently to make a number look better.
 
 ---
 
@@ -1041,17 +1332,48 @@ A locked decision. Revoking the grant, or the client being suspended, affects
 both environments simultaneously — the same combined-authorization blast radius
 M6 documented.
 
-### 17.4 HSTS preload spans the parent domain
+### 17.4 HSTS scope — corrected
 
-`SECURE_HSTS_INCLUDE_SUBDOMAINS` + `preload` with a one-year max-age is sent for
-`arkav.lol` subdomains. Any future sibling subdomain must be HTTPS-capable
-before it is used. Noted, not changed.
+An earlier draft said HSTS on `staging.arkav.lol` "spans the parent domain".
+**That is wrong**, and the correction matters because the mistaken version would
+have implied production inherits a policy it does not.
 
-### 17.5 Stale static files
+HSTS applies to the host that sent the header, plus — with
+`includeSubDomains` — that host's *own* subdomains. So the header
+`staging.arkav.lol` sends covers `staging.arkav.lol` and `*.staging.arkav.lol`.
+It does **not** cover the sibling `app.arkav.lol`, and it does not cover
+`arkav.lol`. Sibling-wide enforcement would require **`arkav.lol` itself** to
+send `includeSubDomains` (or to be on the preload list with it).
 
-Dropping `collectstatic --clear` (§9.2) lets superseded assets accumulate in the
-static volume. Bounded and cosmetic; cleaned by an occasional manual step, not
-by a window where the live site has no CSS.
+Practical consequences, none of which need an application change:
+
+- `app.arkav.lol` gets HSTS from its own responses once it serves them — the
+  same Django settings apply to both hosts because it is the same image.
+- Its very first request before any HSTS header is seen is unprotected, as with
+  any new host. Caddy's HTTP→HTTPS redirect covers it in practice.
+- `preload` is *sent* by the application but has no effect unless the domain is
+  actually submitted to the preload list. If `arkav.lol` is ever submitted with
+  `includeSubDomains`, **every** subdomain must be HTTPS-capable from that
+  moment — including any unrelated service on this host.
+
+`SECURE_HSTS_*` settings are **unchanged** by M7. This entry corrects the
+design's statement, not the application.
+
+### 17.5 Static collection is not atomic — accepted for M7
+
+Two consequences of §9.2, both accepted rather than engineered away:
+
+- Dropping `--clear` lets superseded assets accumulate in the volume. Bounded
+  and cosmetic; cleaned by an occasional manual step, not by a window where the
+  live site has no CSS.
+- A failed or aborted `collectstatic` can leave the live volume **partially
+  updated**, and nothing restores the previous assets. Because filenames are
+  stable (no hashed manifest storage), every path still resolves and the site
+  keeps rendering; the exposure is that some assets may come from a build that
+  was never promoted.
+
+The atomic swap that would remove the second point is rejected for M7 with
+reasons in §9.2. Revisit if `ManifestStaticFilesStorage` is ever adopted.
 
 ---
 
@@ -1097,12 +1419,18 @@ failure stops before anything harder to undo.
     **same digests**, verified against the staging ledger entry.
 16. Production refuses a SHA that never passed staging (expected failure).
 17. The staging deploy key cannot deploy production (expected failure).
-18. Rollback proof, if practical safely: promote a candidate whose health gate
-    is made to fail by a controlled, reversible means (for example an
-    intentionally wrong `RELEASE_SHA` for the gate, or a candidate that fails the
-    login-route check) and observe automatic image rollback to the previous
-    digests followed by a passing health gate. **Never** by shipping a
-    deliberately broken migration.
+18. Rollback proof — **only if a safe failure is naturally available**. If a
+    candidate can be made to fail the health gate by ordinary, reversible
+    application means (a route that does not respond, a deliberately mismatched
+    `RELEASE_SHA` for the gate), observe automatic image rollback to the previous
+    digests followed by a passing health gate. Otherwise mark this item **NOT
+    EXECUTED** and say so in the report.
+
+    **Never** weaken production to test rollback: no deliberately broken
+    migration, no test-only dangerous migration behaviour, no disabling of a
+    guard to see what happens. The rollback path is covered by the failure
+    matrix and by staging; an unproven-but-safe production is better than a
+    proven-by-damage one.
 19. Unrelated services untouched: n8n, cloudflared, Portainer and x-ui show
     uptimes predating the deployment window.
 
@@ -1115,11 +1443,11 @@ No Google grant revocation is required for M7 acceptance.
 | Situation | Procedure |
 |---|---|
 | Bad production release, migrations compatible | Automatic (§14 row 5). Manual equivalent: promote the previous SHA — its digests are in the ledger |
-| Bad production release, migrations incompatible | No automatic rollback. Fix forward with a new release, or restore manually — accepting §17.1 |
-| Caddy misconfigured | Revert the Caddyfile from the previous config bundle and reload. Certificates are in the adopted volumes and survive |
-| Staging relocation went wrong | Old `/opt/product-intelligence-staging` still exists and is stopped, with the same external volumes; start it there again |
-| Config bundle broke a deploy | Install the previous bundle by SHA and redeploy |
-| Total loss of `CREDENTIAL_ENCRYPTION_KEYS` | Unrecoverable stored credentials; users must reconnect. This is why the key is backed up off-server (§15.4) |
+| A release needs a backward-incompatible migration | It cannot be deployed by this automation at all (§11.2, §14 row 0). It requires the separate manual maintenance procedure, planned as its own operation — not a deploy with a flag |
+| Caddy misconfigured | Install the previous reviewed Caddyfile through the infrastructure procedure (§12.6) and `caddy reload`. Certificates live in the adopted volumes and survive |
+| Staging relocation went wrong | §6.4 **Phase 3**: stop shared Caddy, stop the relocated stack, then start the old project **with its Caddy profile**. Restarting the old directory alone is not enough once Caddy has moved |
+| A control-plane change broke deploys | Install the previous reviewed commit's control plane the same way it was installed (§12.6); `state/control-plane.json` records which commit is live |
+| Total loss of `CREDENTIAL_ENCRYPTION_KEYS` | Unrecoverable stored credentials; users must reconnect. This is why the key is backed up off-server (§15 step 4) |
 
 ---
 
@@ -1133,8 +1461,11 @@ Nothing below is being changed now.
 - `compose.production.yaml`; `deploy/caddy/compose.yaml`
 - `deploy/scripts/pi-deploy-wrapper`, `pi-deploy-staging`, `pi-deploy-production`,
   and a shared library implementing preflight, lock, health gate, ledger,
-  rollback
-- `deploy/release-metadata.json`
+  rollback — **control plane**, installed by the §12.6 procedure, never by CI
+- `deploy/scripts/pi-install-control-plane` — the infrastructure update
+  procedure itself (root-run, from a reviewed commit)
+- `deploy/release-metadata.json` — the compatibility declaration CI stamps onto
+  the API image as an OCI label (§11.2)
 - `.env.production.example`
 - `docs/DEPLOY.md` — bootstrap, runbooks, the legacy volume names, acceptance
 
@@ -1177,17 +1508,21 @@ Nothing below is being changed now.
    per-network aliases `staging-api` / `production-api` (and `-web`), each
    resolvable on one edge network only; the Caddyfile never says plain `api`
    (§5.2).
-6. **Deploy without a Git checkout?** Compose files, Caddyfile and scripts are
-   installed as a SHA-named config bundle under `/opt/product-intelligence/`; a
-   release is images-by-digest plus that bundle. No `git` on the deploy path
-   (D12, §4).
-7. **How is config installed and updated then?** The bundle is produced by CI
-   from the repository and delivered over the same restricted SSH path, unpacked
-   into `config-bundles/<sha>/` and installed by the root script. Previous
-   bundles remain for rollback (§19).
-8. **How is a build identified and later promoted?** By full commit SHA as tag,
-   and by **image digest** as identity. Production pulls the digests recorded in
-   the staging ledger for that SHA and never rebuilds (§8.2).
+6. **Deploy without a Git checkout?** A release is images-by-digest plus a
+   validated SHA. The compose files and Caddyfile already sit on the host as
+   control plane; nothing is fetched from Git at deploy time (D12, §4, §12.6).
+7. **How is config installed and updated then?** By an explicit,
+   root-authenticated **infrastructure update procedure** run by a human from a
+   reviewed commit — separate from ordinary releases, never performed by CI, and
+   recorded in `state/control-plane.json` (§12.6). Per-release config-bundle
+   delivery was removed rather than given a transport: it was the only part of
+   the earlier draft that put privileged code on the automatic path, and the
+   SSH grammar never permitted it anyway.
+8. **How is a build identified and later promoted?** By **image digest**, from
+   the first deploy onward. CI passes both digests to the staging deploy; the
+   ledger records them on success; production pulls exactly those and takes no
+   image identity from any client. The full-SHA tag exists for humans (§8.2,
+   D13).
 9. **How do we prove a SHA passed staging?** A root-owned ledger entry written
    only by the staging deploy script after its health gate passed, carrying the
    SHA and the digests (§13.4). The server is the authority; the workflow cannot
@@ -1204,8 +1539,11 @@ Nothing below is being changed now.
     `0600 root:root`, `read:packages` only, readable by root — therefore by the
     root deploy scripts and not by `deploy` (§8.3).
 13. **What prevents command injection over SSH?** A forced command; a strict
-    grammar of `deploy <40-hex>` or `status`; regex validation before use; no
-    `eval`, no shell interpolation of client input (§12.3).
+    three-word grammar (`deploy <sha> [<api-digest> <web-digest>]` or `status`);
+    per-field regex validation before use; a hard-coded image repository prefix
+    so no registry or path is ever accepted; arguments passed as array elements;
+    no `eval`, no shell interpolation of client input (§12.3). The grammar has
+    no token for an override, a path, or a config bundle.
 14. **How are concurrent deploys prevented?** Per-environment `flock -n`; a
     second deploy exits 75 immediately with a clear message (§13.1).
 15. **Image pull fails?** Preflight aborts before anything mutates; the current
@@ -1215,9 +1553,13 @@ Nothing below is being changed now.
 17. **Startup/health fails after migration?** Automatic image rollback to the
     previous digests, then the health gate again — if the release declared
     backward-compatible migrations (§14 row 5).
-18. **When is image rollback safe?** Only under expand/contract, asserted per
-    release by `migrations_backward_compatible`. When false, rollback is refused
-    and manual recovery is demanded (§11.2, §14 row 6).
+18. **When is image rollback safe?** Only under expand/contract. On production
+    the question barely arises, because a release that does not declare
+    backward-compatible migrations — including one whose label is missing or
+    malformed — is **refused before the migration runs** (§11.2, §14 row 0),
+    both because rollback would be unsafe and because the previous app serves
+    traffic during the migration. Where rollback does run, it restores images
+    only (§11.3, §14 row 5).
 19. **If rollback fails?** Stop. No retry loop. Preserve `ps` output and recent
     logs, write both failures to the ledger, exit non-zero, report CRITICAL
     (§14 row 7).
@@ -1225,11 +1567,14 @@ Nothing below is being changed now.
     project or a single service. No `docker system prune`, no bare `docker
     stop`, no global network or volume cleanup, no `compose down` outside the
     two application projects, no restart of anything not owned by this project
-    (§29 of the brief; enforced in §6, §7, §13).
-21. **Does production fit the host?** Yes, on the strength of no server-side
-    builds, `GUNICORN_WORKERS=1` in both environments, modest Postgres buffers
-    and explicit memory limits — with the honest caveat in §16 that this is the
-    binding constraint and evidence, not optimism, should settle it.
+    (the brief's existing-services protection rule; enforced in §6, §7, §13).
+21. **Does production fit the host?** **Unknown until measured, and this design
+    does not claim it.** The architecture is *designed conservatively to fit* —
+    no server-side builds, one gunicorn worker per environment, modest Postgres
+    buffers, serialized deploys — and runtime memory limits will be set from
+    measured usage. Host capacity is an implementation **acceptance gate**: if
+    measured headroom is unsafe for the unrelated services, stop and report
+    rather than proceed (§16).
 22. **What is out of M7?** §0: the whole observability/orchestration list,
     automated backups, blue/green, server builds, secret platforms, and any
     product feature.
@@ -1245,13 +1590,17 @@ Each risk the brief named, checked against the design as written.
 | Data loss on relocation | **Addressed.** External-by-exact-name volumes turn a name drift into a startup error, not an empty database (§6.3); counts verified before and after |
 | Compose project-name change | **Addressed.** `name:` retained verbatim; `-p` never used; `COMPOSE_PROJECT_NAME` unset and the resolved name asserted (§6.2) |
 | Docker volume renaming | **Avoided entirely.** Legacy names kept, including the awkward `_pgdata_staging`, and documented as intentional (D3) |
-| Caddy certificate loss | **Addressed.** Volumes adopted, not recreated; config validated offline; cutover is stop-then-start on the same volumes (§7) |
+| Caddy certificate loss | **Addressed.** Volumes adopted, not recreated; config validated offline; cutover is stop-then-start on the same volumes (§6.4, §7) |
+| Relocation/cutover contradiction | **Fixed in revision 1.** One runbook (§6.4) with an explicit downtime window and a reverse handoff; §7 no longer carries a competing sequence |
+| Shared Caddy blocked by a missing production volume | **Fixed in revision 1.** The production static volume is created in the §6.4 Phase 0 skeleton, before cutover; §15 no longer owns that ordering |
+| Privileged code updated by automatic CI | **Fixed in revision 1.** Tier A control plane is admin-installed only; per-release config-bundle delivery removed; the SSH grammar cannot express it (§12.6) |
 | Staging/production crossover | **Addressed.** Separate edge and internal networks, distinct aliases, and a health gate that fails the deploy if a hostname reports the wrong release (§5, §13.3 row 3 and row 6) |
 | Static volume collision | **Addressed.** Two volumes, two mount points, two roots (§7) |
 | Arbitrary sudo or Docker access | **Addressed.** No Docker group; two exact sudo paths; forced commands; strict input grammar (§12) |
 | Staging credential deploying production | **Addressed.** Environment bound to the key, not to client input (§12.2) |
-| Mutable tag assumptions | **Addressed.** Digests are identity; production pulls the digests staging validated (§8.2) |
-| Automatic DB rollback assumed | **Rejected explicitly.** Images only; incompatible releases refuse rollback (§11, §14) |
+| Mutable tag assumptions | **Addressed, and tightened in revision 1.** Both environments deploy by digest from the first release; no step resolves a tag after pulling it (§8.2, D13) |
+| Automatic DB rollback assumed | **Rejected explicitly.** Images only. Production refuses an incompatible or unverifiable release outright rather than rolling back onto a schema it cannot read (§11, §14 row 0) |
+| An override path around the compatibility gate | **Removed in revision 1.** No confirmation input, no force flag, no grammar token; missing/malformed metadata fails closed (§11.2, §12.3) |
 | Migrations hidden in normal startup | **Fixed at the root cause.** `serve` does nothing but serve; the entrypoint's silent argument-swallowing (§1.4) is repaired (§9.1) |
 | Accidental server builds | **Addressed.** No `build:` in either deployment manifest; CI builds and pushes; PRs build without pushing (§8.1, §10.1) |
 | Secret exposure | **Addressed.** No secret in an image, a build arg, a command argument, a log line or the repository; `.env` `0600 root:root`; GHCR token root-only; the only new payload field is a commit SHA (§8.3, §10.4, §12.5) |
@@ -1268,8 +1617,11 @@ Each risk the brief named, checked against the design as written.
    environment values untouched.
 2. *`collectstatic --clear` in a one-shot.* Carrying `--clear` over would empty
    the live static volume before repopulating it, briefly serving the running
-   site without admin CSS. Resolved by dropping `--clear` and accepting bounded
-   staleness (§9.2, §17.5).
+   site without admin CSS. Resolved by dropping `--clear`. Revision 1 also
+   corrected the overstatement that a failed `collectstatic` leaves previous
+   static files "untouched" — it does not; the volume can be left partially
+   updated, which is now documented and accepted with its bound (§9.2, §14 row
+   4, §17.5).
 3. *"Verify the host routes to the right environment" versus "no application
    changes".* Container health cannot prove routing. Resolved by adding one
    non-secret `release` field to the health payload and stating it as the single
@@ -1287,22 +1639,48 @@ Each risk the brief named, checked against the design as written.
    contradicts the deferred-backup decision. Reconciling that text is listed in
    §20 rather than left to be discovered.
 
+**Contradictions resolved in revision 1** (each from an external review finding):
+
+7. *Two competing cutover sequences.* §6.4 stopped every staging service while
+   claiming Caddy could keep running, and §7 then stopped Caddy a second time.
+   Resolved by making §6.4 the single runbook — phased, with an explicit
+   downtime window and a reverse handoff — and reducing §7 to the adoption
+   rationale it uniquely owns.
+8. *A bootstrap ordering deadlock.* Shared Caddy mounts
+   `product-intelligence-production_static` as external, but §15 created it
+   later, so Caddy could not have started until production bootstrap. Resolved
+   structurally by creating the empty volume in the §6.4 Phase 0 skeleton; §15
+   now creates only the database volume, which nothing earlier references.
+9. *An override on a fail-closed gate.* An extra confirmation input would have
+   let a backward-incompatible migration through — and because the previous app
+   serves traffic while migrations run, that risks breaking production *during*
+   the deploy, not merely leaving it unrollbackable. Resolved by refusing
+   outright, with no override anywhere in the grammar, and by moving the
+   compatibility claim onto the image as an OCI label so the server reads it
+   from the artifact rather than trusting the caller.
+10. *A transport that did not exist.* The draft had CI deliver a config bundle
+    while the SSH grammar allowed only `deploy` and `status` — and that bundle
+    would have let automatic staging CI replace privileged deploy code.
+    Resolved by removing per-release config delivery entirely and splitting
+    control plane (admin-installed) from release data (§12.6).
+11. *A tag-then-resolve step for staging.* Resolved by deploying by digest from
+    the first release, since CI already knows both digests (§8.2).
+12. *An HSTS claim that was simply incorrect.* `includeSubDomains` on
+    `staging.arkav.lol` does not cover the sibling `app.arkav.lol`; only the
+    parent domain sending or preloading it would. Corrected in §17.4 without
+    touching application settings.
+13. *A capacity claim ahead of measurement.* "Does production fit? Yes" was
+    replaced by a designed-to-fit statement plus an implementation acceptance
+    gate, with an instruction to stop rather than endanger unrelated services
+    (§16, §21 answer 21).
+
 **Residual risks, stated rather than solved:** §17.1 (no backup — the largest),
-§17.2 (single host), §17.3 (shared OAuth client), and §16 (host capacity, to be
-settled by measurement during implementation).
+§17.2 (single host), §17.3 (shared OAuth client), §17.5 (non-atomic static
+collection), and §16 (host capacity — designed for, not established, and an
+acceptance gate during implementation).
 
----
-
-## 23. Open questions for the user
-
-None block writing the implementation plan. Two want a decision before
-implementation begins:
-
-1. **GHCR token type.** A classic PAT with `read:packages` is simplest and is
-   what §8.3 assumes; a fine-grained token scoped to the package is tighter but
-   needs the package to exist first, which is a chicken-and-egg on the first
-   push. Recommendation: classic `read:packages` for V1, noted for revisit.
-2. **Rollback proof in acceptance (item 18).** It needs a *safe* induced
-   failure. Recommendation: fail the login-route check on a candidate rather
-   than anything involving migrations. Confirm this is acceptable, or mark the
-   item NOT EXECUTED.
+**No open questions remain.** The two carried by the first draft are resolved in
+place: the GHCR credential is specified by required properties and demonstrated
+during bootstrap rather than by naming a token type (§8.3), and the rollback
+acceptance item runs only if a safe application-level failure is naturally
+available, and is otherwise reported NOT EXECUTED (§18 item 18).
