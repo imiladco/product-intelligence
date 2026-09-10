@@ -76,6 +76,36 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The digest half of the chain, and the only place it can be established:
+      # pull the digest the build step reported — proving it is real and
+      # fetchable, not merely announced — then verify the labels on that digest
+      # reference rather than on a tag, which could have moved.
+      - name: Verify artifact provenance by digest
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+          COMPAT: ${{ steps.metadata.outputs.compat }}
+        run: |
+          API_REF="ghcr.io/imiladco/product-intelligence/api@${API_DIGEST}"
+          WEB_REF="ghcr.io/imiladco/product-intelligence/web@${WEB_DIGEST}"
+
+          docker pull "$API_REF"
+          docker pull "$WEB_REF"
+
+          deploy/scripts/verify-image-provenance.sh "$API_REF" "$SHA" "$COMPAT"
+          deploy/scripts/verify-image-provenance.sh "$WEB_REF" "$SHA"
+
+          # The digest the build reported must be the digest the registry
+          # actually stores for what we just pulled.
+          for ref in "$API_REF" "$WEB_REF"; do
+            stored="$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref")"
+            case "$stored" in
+              *"@${ref##*@}") ;;
+              *) echo "digest mismatch: reported ${ref##*@}, stored ${stored}" >&2; exit 1 ;;
+            esac
+          done
+
       - name: Prepare SSH
         run: |
           install -d -m 700 ~/.ssh

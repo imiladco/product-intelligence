@@ -34,6 +34,53 @@ def load(path: Path) -> dict:
     return data
 
 
+PROVENANCE_SCRIPT = "deploy/scripts/verify-image-provenance.sh"
+
+
+def provenance_blocks(workflow: dict) -> list[str]:
+    """Every run-step that invokes the provenance verifier.
+
+    Whole blocks, not lines: the staging step pulls, verifies and compares
+    digests across several lines, and each assertion here needs the block.
+    """
+    return [
+        str(step["run"])
+        for job in workflow.get("jobs", {}).values()
+        for step in (job.get("steps") or [])
+        if "run" in step and PROVENANCE_SCRIPT in str(step["run"])
+    ]
+
+
+def provenance_refs(block: str) -> list[str]:
+    """The image reference each invocation of the verifier is pointed at.
+
+    Shell variables assigned earlier in the same block are substituted, so a
+    step that builds `API_REF` and then verifies `"$API_REF"` is reported as
+    verifying the reference it actually resolves to. Without that the digest
+    assertions below would pass on the literal string `$API_REF`, which proves
+    nothing.
+    """
+    assignments: dict[str, str] = {}
+    refs = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if line.startswith(PROVENANCE_SCRIPT):
+            parts = line.split()
+            assert len(parts) >= 3, f"verifier called without an expected sha: {line}"
+            refs.append(expand(parts[1].strip('"'), assignments))
+            continue
+        name, sep, value = line.partition("=")
+        if sep and name.isidentifier():
+            assignments[name] = expand(value.strip().strip('"'), assignments)
+    return refs
+
+
+def expand(value: str, assignments: dict[str, str]) -> str:
+    for name, resolved in assignments.items():
+        value = value.replace("${" + name + "}", resolved).replace("$" + name, resolved)
+    return value
+
+
 def all_run_steps(workflow: dict) -> str:
     """Everything a step actually carries: its command, its action, its inputs
     and its environment.
@@ -103,6 +150,26 @@ class TestCiGates:
     def test_its_permissions_are_read_only(self, ci):
         assert ci["permissions"] == {"contents": "read"}
 
+    def test_it_verifies_provenance_for_both_images(self, ci):
+        """The first link of the chain, checked on a real build.
+
+        Every other provenance test in this suite reads a Dockerfile or stubs
+        `docker image inspect`. Only this step can show that the label a
+        Dockerfile declares is the label a built image carries — so it must
+        cover both images, not just the API one.
+        """
+        blocks = provenance_blocks(ci)
+        assert blocks, "no provenance verification step in ci.yml"
+        refs = [ref for block in blocks for ref in provenance_refs(block)]
+        assert len(refs) == 2, f"expected an api and a web verification, got {refs}"
+        assert "pi-api:ci" in refs, refs
+        assert "pi-web:ci" in refs, refs
+
+    def test_it_checks_the_api_image_compatibility_label(self, ci):
+        """The web image has no such label; the API image's is a deploy gate."""
+        text = "\n".join(provenance_blocks(ci))
+        assert "release-metadata.json" in text, text
+
 
 class TestStagingPublishAndDeploy:
     @pytest.fixture(scope="class")
@@ -163,6 +230,49 @@ class TestStagingPublishAndDeploy:
         text = all_run_steps(staging)
         assert "StrictHostKeyChecking=yes" in text
         assert "DEPLOY_KNOWN_HOSTS" in str(staging)
+
+    def test_it_verifies_provenance_by_digest_for_both_images(self, staging):
+        """Labels are read off the digest reference, never off a tag.
+
+        A tag can be moved between the push and the check; a digest cannot.
+        This is the only place in the repository where the digest half of the
+        chain can be established, so it is asserted precisely.
+        """
+        blocks = provenance_blocks(staging)
+        assert blocks, "no provenance verification step in deploy-staging.yml"
+        refs = [ref for block in blocks for ref in provenance_refs(block)]
+        assert len(refs) == 2, f"expected one api and one web verification, got {refs}"
+        for ref in refs:
+            assert "@" in ref, f"provenance checked against a non-digest reference: {ref}"
+            assert ":" not in ref.split("@", 1)[0], f"tag reference: {ref}"
+        assert any(ref.startswith("ghcr.io/") and "/api@" in ref for ref in refs), refs
+        assert any(ref.startswith("ghcr.io/") and "/web@" in ref for ref in refs), refs
+
+    def test_it_pulls_each_digest_before_verifying(self, staging):
+        """Pulling proves the digest is real and fetchable, not merely reported."""
+        for block in provenance_blocks(staging):
+            assert "docker pull" in block, block
+
+    def test_it_compares_the_reported_digest_against_the_stored_one(self, staging):
+        text = "\n".join(provenance_blocks(staging))
+        assert "RepoDigests" in text, "the reported digest is never checked against the registry"
+
+    def test_the_provenance_check_precedes_the_deploy_step(self, staging):
+        """An unverified image must never reach the server."""
+        for job in staging["jobs"].values():
+            steps = job.get("steps") or []
+            names = [str(step.get("name", "")) for step in steps]
+            verify = next(
+                (i for i, step in enumerate(steps) if PROVENANCE_SCRIPT in str(step.get("run", ""))),
+                None,
+            )
+            deploy = next(
+                (i for i, step in enumerate(steps) if "ssh " in str(step.get("run", ""))),
+                None,
+            )
+            if verify is None or deploy is None:
+                continue
+            assert verify < deploy, f"provenance is verified after deploying: {names}"
 
     def test_it_is_the_only_workflow_with_packages_write(self, staging):
         assert staging["permissions"]["packages"] == "write"
@@ -230,6 +340,18 @@ class TestNoWorkflowTouchesTheControlPlane:
             text = workflow.read_text()
             for token in forbidden:
                 assert token not in text, f"{workflow.name} touches the control plane: {token}"
+
+    def test_the_provenance_script_is_not_part_of_the_control_plane(self):
+        """It runs in CI, on the runner, against images CI itself built.
+
+        That is only safe because it is a read-only helper living in the
+        repository like any other tested script — not something installed on,
+        or copied to, a deploy host.
+        """
+        script = REPO_ROOT / PROVENANCE_SCRIPT
+        assert script.exists(), PROVENANCE_SCRIPT
+        control_plane = (REPO_ROOT / "deploy" / "scripts" / "pi-install-control-plane").read_text()
+        assert "verify-image-provenance" not in control_plane
 
     def test_no_workflow_writes_a_compose_manifest_to_the_server(self):
         for workflow in sorted(WORKFLOWS.glob("*.yml")):

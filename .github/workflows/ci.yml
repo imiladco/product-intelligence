@@ -130,6 +130,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The provenance chain's first link, on a real image: the label a
+      # Dockerfile declares must be the label a built image carries. The digest
+      # half is checked in deploy-staging.yml, where images are actually pushed.
+      - name: Verify image provenance
+        run: |
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          COMPAT="$(python3 -c "import json;print(str(json.load(open('deploy/release-metadata.json'))['migrations_backward_compatible']).lower())")"
+          deploy/scripts/verify-image-provenance.sh pi-api:ci "$SHA" "$COMPAT"
+          deploy/scripts/verify-image-provenance.sh pi-web:ci "$SHA"
+
       # `caddy validate` needs a Docker daemon. CI has one; the development
       # environment does not, so this is where the real check happens before
       # the live cutover depends on it.
