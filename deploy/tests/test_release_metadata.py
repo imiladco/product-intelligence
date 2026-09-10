@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -144,3 +145,105 @@ class TestBothImagesCarryTheRevision:
         for dockerfile in (API_DOCKERFILE, WEB_DOCKERFILE):
             text = dockerfile.read_text()
             assert f"LABEL {REVISION_LABEL}=$GIT_SHA" in text, dockerfile
+
+
+class TestProductionEnvExample:
+    """The template that ships in the repository must never carry a real value.
+
+    An example file is the easiest place for a secret to be committed by
+    accident, because it looks like documentation rather than configuration.
+    """
+
+    SECRETS = (
+        "DJANGO_SECRET_KEY",
+        "CREDENTIAL_ENCRYPTION_KEYS",
+        "POSTGRES_PASSWORD",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_CLIENT_ID",
+        "ACME_EMAIL",
+        "DATABASE_URL",
+    )
+
+    @property
+    def path(self) -> Path:
+        return REPO_ROOT / ".env.production.example"
+
+    def test_it_exists(self):
+        assert self.path.exists()
+
+    def test_every_secret_is_present_and_empty(self):
+        values = {}
+        for line in self.path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            values[name] = value
+        for name in self.SECRETS:
+            assert name in values, f"{name} is missing from the template"
+            assert values[name] == "", f"{name} carries a value: {values[name]!r}"
+
+    def test_it_names_the_production_host_and_database(self):
+        text = self.path.read_text()
+        assert "APP_DOMAIN=app.arkav.lol" in text
+        assert "POSTGRES_DB=product_intelligence_production" in text
+        assert "staging" not in text.lower().split("# ---")[0]
+
+    def test_it_is_tracked_rather_than_ignored(self):
+        """`.gitignore` ignores `.env.*`, so the template needs an explicit
+        negation or it silently never gets committed.
+
+        Checked with `-q`: `git check-ignore -v` exits 0 when *any* pattern
+        matches, including the negating one, so only the quiet form answers
+        the question actually being asked.
+        """
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", ".env.production.example"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+        )
+        assert result.returncode != 0, ".env.production.example is git-ignored"
+
+
+class TestDeploymentDocumentation:
+    def test_the_build_plan_no_longer_promises_a_backup_script(self):
+        text = (REPO_ROOT / "docs" / "V1_BUILD_PLAN.md").read_text()
+        assert "scripts/backup.sh" not in text
+        assert "scripts/deploy.sh" not in text
+
+    def test_the_build_plan_records_that_backups_are_deferred(self):
+        text = (REPO_ROOT / "docs" / "V1_BUILD_PLAN.md").read_text()
+        assert "Backups are explicitly deferred" in text
+
+    def test_deploy_md_states_there_is_no_database_rollback(self):
+        """The most dangerous thing an operator could assume."""
+        # Whitespace-normalised: these phrases are line-wrapped in the prose,
+        # and a reflow must not turn this test red.
+        text = " ".join((REPO_ROOT / "docs" / "DEPLOY.md").read_text().lower().split())
+        assert "no database rollback" in text
+        assert "no restore point" in text
+
+    def test_deploy_md_documents_the_legacy_volume_names(self):
+        text = (REPO_ROOT / "docs" / "DEPLOY.md").read_text()
+        for volume in (
+            "product-intelligence-staging_pgdata_staging",
+            "product-intelligence-staging_caddy_data",
+            "product-intelligence-production_pgdata",
+        ):
+            assert volume in text, volume
+
+    def test_deploy_md_contains_no_secret_shaped_value(self):
+        """Placeholders and command names only — never an actual key."""
+        text = (REPO_ROOT / "docs" / "DEPLOY.md").read_text()
+        for line in text.splitlines():
+            if line.lstrip().startswith(("*", "-", "|", ">")):
+                continue
+            name, sep, value = line.partition("=")
+            if not sep or not name.strip().isupper() or " " in name.strip():
+                continue
+            assert value.strip() in ("", "'", '"'), line
+
+    def test_staging_md_points_at_deploy_md(self):
+        text = (REPO_ROOT / "docs" / "STAGING.md").read_text()
+        assert "docs/DEPLOY.md" in text
+        assert "Superseded" in text

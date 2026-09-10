@@ -1,5 +1,22 @@
 # Staging deployment (Milestone 3)
 
+> **Superseded as an operational guide by `docs/DEPLOY.md` (M7).** Operating
+> staging — deploying, reading the ledger, rolling back, secrets, Caddy — is
+> described there. Three things below are no longer true:
+>
+> * Caddy is no longer a service of the staging Compose project. It is its own
+>   project, `product-intelligence-shared`, serving both hostnames.
+> * The host-proxy alternative and the loopback-port sketch are **not**
+>   supported shapes any more. No application port is published to the host;
+>   Caddy reaches each environment over a private network alias.
+> * The API entrypoint no longer migrates or runs `collectstatic` on start. A
+>   container restarted by the Docker daemon must never change database schema,
+>   so both are explicit one-shot release steps.
+>
+> The rest of this file is kept as the historical M3 record of how staging
+> first came to exist, and why.
+
+
 A temporary but real environment whose only purpose is completing the Google
 OAuth round-trip on a public HTTPS hostname. It is **not** the production
 deployment: Milestone 7 owns that, along with backups, monitoring and CI.

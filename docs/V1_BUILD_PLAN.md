@@ -168,16 +168,34 @@ M6 design and approved before implementation:
 **Demo:** the whole V1 flow on the real HTTPS domain with the production Google
 OAuth client.
 
-Adds: production `apps/api/Dockerfile` (gunicorn, non-root, `collectstatic`) and
-`apps/web/Dockerfile` (standalone build), `compose.yaml` (caddy/web/api/postgres
-with healthchecks, restart policies, named volumes), `docker/caddy/Caddyfile`,
-`scripts/deploy.sh`, `scripts/backup.sh`, `docs/DEPLOY.md`.
+Adds: production `apps/api/Dockerfile` (gunicorn, non-root) and
+`apps/web/Dockerfile` (standalone build); **per-environment** manifests
+`compose.staging.yaml` and `compose.production.yaml`, each its own Compose
+project with healthchecks, restart policies and external-by-name volumes;
+Caddy as a **separate** shared project serving both hostnames
+(`docker/caddy/Caddyfile`, `deploy/caddy/`); artefacts built once **in CI** and
+deployed by digest, never rebuilt on the server; a **restricted deploy path** —
+SSH forced commands, a two-verb grammar, sudo to two exact root-owned scripts,
+and a control plane that no deployment can modify (`deploy/scripts/`,
+`deploy/sudoers/`, `deploy/ssh/`); and `docs/DEPLOY.md`.
+
+No single all-environment manifest, and no deploy or backup script in the
+working tree: one manifest cannot serve two environments on one host, and the
+deploy path is privileged code installed by a human with root, precisely so
+that a merge cannot change it.
+
+**Backups are explicitly deferred.** No automated pre-deploy database backup
+exists in M7 — a deliberate decision, with the consequence that a migration
+which destroys production data has no restore point. Recorded as a deferred
+risk in the M7 design §17.1 and in `docs/DEPLOY.md` §8, and the first thing to
+revisit after launch.
 
 Pre-flight, before any server change and requiring approval: inspect the server
 for existing services, ports 80/443 usage, existing proxy and containers;
 present the required DNS records, public IP, ports, and the production OAuth
 redirect URI; move the Google consent screen out of "Testing" (otherwise refresh
-tokens expire in 7 days); test a database restore once.
+tokens expire in 7 days). Restore testing is out of scope while backups are
+deferred — there is nothing to restore from.
 
 Tests: not unit tests — a written smoke checklist executed against production.
 
