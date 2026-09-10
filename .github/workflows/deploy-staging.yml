@@ -1,10 +1,34 @@
 # Build once, publish, deploy staging. Runs only after CI has passed on main.
 #
-# This is the only workflow permitted to write packages, and the only one that
-# reaches the staging server. It sends release DATA — a SHA and two digests —
-# over a forced SSH command. It cannot install a script, a manifest or a key on
-# that host; the control plane is installed by a human with root, from a
-# reviewed commit, and nothing here can change it.
+# Two jobs, deliberately separated by a readiness gate.
+#
+#   publish  — always runs on a green CI. Builds both images, pushes them, and
+#              proves the provenance chain. This is a quality gate: it must be
+#              exercised on every commit to main, long before any server
+#              exists, so that a broken Dockerfile or a broken provenance chain
+#              is caught here rather than during infrastructure bootstrap.
+#
+#   deploy   — runs only when the repository variable STAGING_DEPLOY_READY is
+#              exactly "true". Until the staging host has been bootstrapped and
+#              its control plane installed, there is nothing to deploy to, and
+#              an attempt would fail on a missing SSH secret with an error that
+#              says nothing about the real reason.
+#
+# The gate is a repository *variable*, not a secret and not a file in this
+# tree. That matters: a variable is set by a human with repository admin
+# rights, outside the merge path, so arming the deploy is a deliberate act in
+# repository settings rather than something a merged commit can do. It is the
+# same principle the server-side control plane follows — the thing that
+# authorises deployment is not modifiable by the automatic path it authorises.
+#
+# It is fail-closed by absence. Unset, misspelled or set to anything other than
+# "true" all mean not ready. There is no default that arms it.
+#
+# This is still the only workflow permitted to write packages, and the only one
+# that reaches the staging server. It sends release DATA — a SHA and two
+# digests — over a forced SSH command. It cannot install a script, a manifest
+# or a key on that host; the control plane is installed by a human with root,
+# from a reviewed commit, and nothing here can change it.
 name: Deploy staging
 
 on:
@@ -24,10 +48,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-and-deploy:
+  publish:
     # A red gate publishes nothing and deploys nothing.
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ github.event.workflow_run.head_sha }}
+      api_digest: ${{ steps.api.outputs.digest }}
+      web_digest: ${{ steps.web.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,6 +134,64 @@ jobs:
             esac
           done
 
+      # Says, in the run itself, whether a deploy follows and why. A skipped
+      # job with no explanation is the "silent failure" this gate exists to
+      # avoid: someone reading the run should not have to guess whether staging
+      # was deployed, or infer it from the absence of a job.
+      - name: Report the staging deployment readiness gate
+        env:
+          READY: ${{ vars.STAGING_DEPLOY_READY }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          {
+            echo "### Staging deployment readiness"
+            echo
+            echo "Images for \`${SHA}\` were built, pushed and provenance-verified."
+            echo
+            if [ "$READY" = "true" ]; then
+              echo "\`STAGING_DEPLOY_READY\` is \`true\` — the deploy job will run."
+            else
+              echo "\`STAGING_DEPLOY_READY\` is not \`true\` — **the deploy job is skipped**."
+              echo
+              echo "This is expected until the staging host has been bootstrapped."
+              echo "Nothing failed. The images are published and usable."
+              echo
+              echo "To arm staging deployment, once the host and its control"
+              echo "plane exist and the deploy secrets are configured, set the"
+              echo "repository variable \`STAGING_DEPLOY_READY\` to \`true\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: publish
+    # The gate. Fail-closed: anything other than exactly "true" — unset,
+    # empty, "TRUE", "yes" — leaves this job unrun.
+    if: ${{ vars.STAGING_DEPLOY_READY == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Setting the variable does not conjure the secrets. Checked here so the
+      # failure names what is actually missing, rather than surfacing as an
+      # opaque ssh error against an empty host.
+      - name: Verify the deploy secrets are configured
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          STAGING_DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=""
+          for name in DEPLOY_HOST DEPLOY_USER STAGING_DEPLOY_KEY DEPLOY_KNOWN_HOSTS; do
+            # Presence only. The value is never printed, compared or logged.
+            if [ -z "${!name}" ]; then
+              missing="${missing} ${name}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "STAGING_DEPLOY_READY is true but these secrets are not set:${missing}" >&2
+            echo "Either configure them, or set STAGING_DEPLOY_READY back to false." >&2
+            exit 1
+          fi
+
       - name: Prepare SSH
         run: |
           install -d -m 700 ~/.ssh
@@ -119,9 +205,9 @@ jobs:
       # however it is written.
       - name: Deploy staging
         env:
-          SHA: ${{ github.event.workflow_run.head_sha }}
-          API_DIGEST: ${{ steps.api.outputs.digest }}
-          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+          SHA: ${{ needs.publish.outputs.sha }}
+          API_DIGEST: ${{ needs.publish.outputs.api_digest }}
+          WEB_DIGEST: ${{ needs.publish.outputs.web_digest }}
         run: |
           ssh -o StrictHostKeyChecking=yes \
               -i ~/.ssh/id_ed25519 \

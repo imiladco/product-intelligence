@@ -201,10 +201,40 @@ credential with these properties:
 
 ## 6. Staging: automatic deploys, and reading the ledger
 
-Staging deploys itself. `.github/workflows/ci.yml` gates every change;
-`deploy-staging.yml` runs only after CI succeeds on `main`, builds both images
-once, pushes them tagged with the full commit SHA, verifies the provenance
-chain, and then sends one SSH command:
+### The readiness gate
+
+`deploy-staging.yml` is two jobs. **`publish`** runs on every green CI on
+`main`: it builds both images, pushes them, and verifies the provenance chain.
+**`deploy`** runs only when the repository variable `STAGING_DEPLOY_READY` is
+exactly `true`.
+
+Until the staging host is bootstrapped and its control plane installed, leave
+the variable unset. Publishing still runs, so a broken Dockerfile or a broken
+provenance chain is caught on the commit that introduced it rather than during
+bootstrap; the deploy job is skipped, and the run's summary says so explicitly
+rather than leaving a reader to infer it from an absent job.
+
+The gate is a **variable, not a secret and not a file in this repository**.
+A variable is set in repository settings by a human with admin rights, outside
+the merge path — the same principle the control plane follows on the server:
+what authorises deployment is not modifiable by the automatic path it
+authorises. It is fail-closed by absence; unset, empty, `TRUE` and `yes` all
+mean not ready, and there is no default that arms it.
+
+**To arm staging**, once the host exists, the control plane is installed, and
+`STAGING_DEPLOY_KEY`, `DEPLOY_KNOWN_HOSTS`, `DEPLOY_USER` and `DEPLOY_HOST`
+are configured: set `STAGING_DEPLOY_READY` to `true` in
+Settings → Secrets and variables → Actions → Variables. To disarm — during a
+maintenance window, or an incident — set it to anything else. The deploy job
+verifies the four secrets are present before touching SSH, so arming the gate
+without them fails naming what is missing rather than inside `ssh`.
+
+### The deploy itself
+
+Staging deploys itself once armed. `.github/workflows/ci.yml` gates every
+change; `deploy-staging.yml` runs only after CI succeeds on `main`, builds both
+images once, pushes them tagged with the full commit SHA, verifies the
+provenance chain, and then sends one SSH command:
 
 ```
 deploy <sha> <api-digest> <web-digest>

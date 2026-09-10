@@ -253,6 +253,76 @@ class TestStagingPublishAndDeploy:
             # A tag reference would be repo:sha rather than repo@sha256:.
             assert "/api:" not in block and "/web:" not in block, block
 
+    def test_deployment_is_gated_on_an_explicit_readiness_variable(self, staging):
+        """Deploying must be armed deliberately, not by merging something.
+
+        The gate is a repository variable rather than a file in this tree: a
+        variable is set in repository settings by a human with admin rights,
+        outside the merge path. That is the same principle the server-side
+        control plane follows -- what authorises deployment is not modifiable
+        by the automatic path it authorises.
+        """
+        deploy_jobs = {
+            name: job
+            for name, job in staging["jobs"].items()
+            for step in (job.get("steps") or [])
+            if "ssh " in str(step.get("run", ""))
+        }
+        assert deploy_jobs, "no deploy job found"
+        for name, job in deploy_jobs.items():
+            condition = str(job.get("if", ""))
+            assert "STAGING_DEPLOY_READY" in condition, f"{name} is not gated: {condition!r}"
+            assert "vars." in condition, f"{name}'s gate is not a repository variable"
+
+    def test_the_readiness_gate_is_fail_closed(self, staging):
+        """Only the exact string `true` may arm it.
+
+        An unset variable is the empty string, so a truthiness test or a `!=
+        'false'` would arm staging by default -- which is the failure mode
+        this gate exists to remove.
+        """
+        for job in staging["jobs"].values():
+            condition = str(job.get("if", ""))
+            if "STAGING_DEPLOY_READY" not in condition:
+                continue
+            assert "== 'true'" in condition or '== "true"' in condition, condition
+            assert "!=" not in condition, f"a negated gate arms by default: {condition}"
+
+    def test_publishing_is_not_gated_on_readiness(self, staging):
+        """Building, pushing and verifying provenance are quality gates.
+
+        They must keep running on every green main long before a server
+        exists -- otherwise a broken Dockerfile or a broken provenance chain
+        stays hidden until infrastructure bootstrap, which is the worst moment
+        to discover it.
+        """
+        publishing = [
+            (name, job)
+            for name, job in staging["jobs"].items()
+            for step in (job.get("steps") or [])
+            if "build-push-action" in str(step.get("uses", ""))
+        ]
+        assert publishing, "nothing publishes images"
+        for name, job in publishing:
+            assert "STAGING_DEPLOY_READY" not in str(job.get("if", "")), (
+                f"{name} must not be gated on deployment readiness"
+            )
+
+    def test_the_deploy_job_checks_its_secrets_are_present(self, staging):
+        """Arming the gate does not conjure the secrets.
+
+        Without this the first armed run fails inside `ssh` against an empty
+        host, which says nothing about the real cause.
+        """
+        text = all_run_steps(staging)
+        assert "STAGING_DEPLOY_READY is true but these secrets are not set" in text
+
+    def test_the_run_says_why_a_deploy_did_not_happen(self, staging):
+        """A skipped job with no explanation is the silent failure itself."""
+        text = all_run_steps(staging)
+        assert "GITHUB_STEP_SUMMARY" in text
+        assert "STAGING_DEPLOY_READY" in text
+
     def test_it_uses_only_the_staging_key(self, staging):
         text = str(staging)
         assert "STAGING_DEPLOY_KEY" in text
@@ -290,21 +360,47 @@ class TestStagingPublishAndDeploy:
         assert "RepoDigests" in text, "the reported digest is never checked against the registry"
 
     def test_the_provenance_check_precedes_the_deploy_step(self, staging):
-        """An unverified image must never reach the server."""
-        for job in staging["jobs"].values():
-            steps = job.get("steps") or []
-            names = [str(step.get("name", "")) for step in steps]
-            verify = next(
-                (i for i, step in enumerate(steps) if PROVENANCE_SCRIPT in str(step.get("run", ""))),
-                None,
-            )
-            deploy = next(
-                (i for i, step in enumerate(steps) if "ssh " in str(step.get("run", ""))),
-                None,
-            )
-            if verify is None or deploy is None:
+        """An unverified image must never reach the server.
+
+        Publishing and deploying are separate jobs, so ordering is expressed
+        by `needs` rather than by step order. Asserted across jobs on purpose:
+        the same-job version of this test would pass vacuously now, proving
+        nothing at all.
+        """
+        verify_jobs = {
+            name
+            for name, job in staging["jobs"].items()
+            for step in (job.get("steps") or [])
+            if PROVENANCE_SCRIPT in str(step.get("run", ""))
+        }
+        deploy_jobs = {
+            name
+            for name, job in staging["jobs"].items()
+            for step in (job.get("steps") or [])
+            if "ssh " in str(step.get("run", ""))
+        }
+        assert verify_jobs, "nothing verifies provenance"
+        assert deploy_jobs, "nothing deploys"
+
+        for name in deploy_jobs:
+            job = staging["jobs"][name]
+            if name in verify_jobs:
+                steps = job["steps"]
+                verify = next(
+                    i
+                    for i, step in enumerate(steps)
+                    if PROVENANCE_SCRIPT in str(step.get("run", ""))
+                )
+                deploy = next(
+                    i for i, step in enumerate(steps) if "ssh " in str(step.get("run", ""))
+                )
+                assert verify < deploy, f"{name}: provenance is verified after deploying"
                 continue
-            assert verify < deploy, f"provenance is verified after deploying: {names}"
+            needs = job.get("needs") or []
+            needs = [needs] if isinstance(needs, str) else needs
+            assert verify_jobs & set(needs), (
+                f"{name} deploys without depending on a job that verifies provenance"
+            )
 
     def test_it_is_the_only_workflow_with_packages_write(self, staging):
         assert staging["permissions"]["packages"] == "write"
