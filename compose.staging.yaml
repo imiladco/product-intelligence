@@ -1,19 +1,19 @@
-# Staging for the Milestone 3 Google OAuth round-trip.
+# Staging deployment.
 #
-# Deliberately NOT compose.yaml: that name is reserved for the real production
-# stack in Milestone 7. This file is the minimum needed to run the M3 branch on
-# a public HTTPS hostname, and nothing more.
+# Consumes images built by CI and published to private GHCR; it never builds.
+# The deploy script writes .release/images.env with the exact digests it pulled
+# and passes it through, so API_IMAGE and WEB_IMAGE are always
+# `…@sha256:…` references and never mutable tags.
 #
-#   docker compose -f compose.staging.yaml --env-file .env up -d --build
+#   docker compose -f compose.staging.yaml up -d
 #
-# The reverse proxy is optional, so this works both on a clean VPS and on a
-# server that already terminates TLS:
+# Never pass -p, and never set COMPOSE_PROJECT_NAME: both override the `name:`
+# key below, and every volume lookup would follow them to a project that does
+# not exist. The deploy script unsets the variable and asserts the resolved
+# name before it touches anything.
 #
-#   --profile caddy   → Caddy owns :80/:443 and obtains its own certificate
-#   (no profile)      → an existing proxy owns :80/:443; this publishes the two
-#                       app ports on loopback only for it to proxy to
-#
-# Postgres is never published. It is reachable only on the private network.
+# Postgres is on the internal network only. It is unreachable from the edge
+# network, from the host, and from the internet.
 
 name: product-intelligence-staging
 
@@ -35,13 +35,14 @@ services:
     networks: [internal]
 
   api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
+    image: ${API_IMAGE}
     restart: unless-stopped
     env_file: [.env]
     environment:
       DJANGO_STATIC_ROOT: /srv/static
+      # Reported by /api/health so the deploy gate can prove this host serves
+      # the release it was just given.
+      RELEASE_SHA: ${RELEASE_SHA}
     volumes:
       # Shared with the proxy, which serves /static/ so Django does not have to.
       - static:/srv/static
@@ -53,23 +54,25 @@ services:
       interval: 15s
       timeout: 10s
       retries: 12
-      # Generous: on a single vCPU the entrypoint runs collectstatic and
-      # migrations before gunicorn accepts its first request.
-      start_period: 120s
-    # Loopback only: an existing host proxy can reach it, the internet cannot.
-    # Harmless when the bundled Caddy is used, which talks over the private
-    # network instead.
-    ports:
-      - "127.0.0.1:8001:8000"
-    networks: [internal]
+      # 45s, down from the 120s that covered collectstatic and migrations on
+      # every start. Those are an explicit release step now, so startup is just
+      # gunicorn coming up.
+      start_period: 45s
+    networks:
+      internal:
+      edge:
+        # Explicit, because shared Caddy joins both edge networks and a bare
+        # `api` would be ambiguous across environments.
+        aliases: [staging-api]
 
   web:
-    build:
-      context: .
-      dockerfile: apps/web/Dockerfile
+    image: ${WEB_IMAGE}
     restart: unless-stopped
     environment:
-      # Server-side rendering talks to the API over the private network.
+      # Server-side rendering talks to the API over the INTERNAL network, using
+      # the plain service name. Not the edge alias: that would require
+      # DJANGO_ALLOWED_HOSTS to carry `staging-api` too, and forgetting it
+      # returns 400 DisallowedHost with sign-in failing silently.
       INTERNAL_API_BASE_URL: http://api:8000
       NODE_ENV: production
     depends_on:
@@ -82,36 +85,34 @@ services:
       timeout: 10s
       retries: 10
       start_period: 45s
-    ports:
-      - "127.0.0.1:3001:3000"
-    networks: [internal]
+    networks:
+      internal:
+      edge:
+        aliases: [staging-web]
 
-  caddy:
-    image: caddy:2-alpine
-    profiles: [caddy]
-    restart: unless-stopped
-    environment:
-      APP_DOMAIN: ${APP_DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL}
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-      - static:/srv/static:ro
-    depends_on:
-      - web
-      - api
-    networks: [internal]
-
+# Every volume is external and pinned to the exact name that already exists on
+# the server. An external volume that is missing is a hard error, so there is
+# no path where a drifted name silently produces an empty database.
+#
+# The legacy names are kept deliberately. `pgdata_staging` inside a project
+# called `product-intelligence-staging` yields the doubled
+# `product-intelligence-staging_pgdata_staging`; renaming the key to `pgdata`
+# would point at a different volume, and renaming the volume would mean copying
+# a live database for cosmetics.
 volumes:
   pgdata_staging:
-  caddy_data:
-  caddy_config:
+    external: true
+    name: product-intelligence-staging_pgdata_staging
   static:
+    external: true
+    name: product-intelligence-staging_static
 
+# External too, created once by the storage skeleton. A deployment can never
+# invent a network by accident.
 networks:
   internal:
-    driver: bridge
+    external: true
+    name: product-intelligence-staging-internal
+  edge:
+    external: true
+    name: product-intelligence-staging-edge

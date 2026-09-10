@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Staging deploy. Invoked as root by the wrapper, never run by hand in anger.
+#
+#   deploy <sha> <api-digest> <web-digest>
+#   status
+#
+# The digests come from CI, which already knows them the moment buildx
+# finishes. Staging deploys by digest from its very first release: between a
+# tag push and a tag pull a tag can move, and a design that resolved the digest
+# afterwards would be trusting a pointer it never had to trust.
+#
+# Order matters and is asserted by tests: preflight before anything is
+# mutated, postgres up before the --no-deps migration (which will not start it
+# for you), migration before the application is recreated, and the ledger's
+# success entry written only after the health gate returns clean. Production's
+# entire safety argument rests on that last one meaning what it says.
+set -euo pipefail
+
+PI_ENVIRONMENT="staging"
+PI_HOST="${PI_STAGING_HOST:-staging.arkav.lol}"
+PI_PROJECT="product-intelligence-staging"
+
+PI_LIB_DIR="${PI_LIB_DIR:-/usr/local/lib/pi-deploy}"
+PI_DEPLOY_ROOT="${PI_DEPLOY_ROOT:-/opt/product-intelligence}"
+
+# shellcheck source=lib/validate.sh
+source "${PI_LIB_DIR}/validate.sh"
+# shellcheck source=lib/ledger.sh
+source "${PI_LIB_DIR}/ledger.sh"
+# shellcheck source=lib/preflight.sh
+source "${PI_LIB_DIR}/preflight.sh"
+# shellcheck source=lib/healthgate.sh
+source "${PI_LIB_DIR}/healthgate.sh"
+# shellcheck source=lib/rollback.sh
+source "${PI_LIB_DIR}/rollback.sh"
+
+PI_ENV_DIR="${PI_DEPLOY_ROOT}/${PI_ENVIRONMENT}"
+PI_MANIFEST="${PI_COMPOSE_MANIFEST:-${PI_ENV_DIR}/compose.${PI_ENVIRONMENT}.yaml}"
+PI_RELEASE_DIR="${PI_RELEASE_DIR:-${PI_ENV_DIR}/.release}"
+export PI_COMPOSE_MANIFEST="$PI_MANIFEST"
+export PI_RELEASE_DIR
+
+# Serialize deploys for this environment. Non-blocking on purpose: a second
+# deploy fails fast with a distinct code rather than queueing, because on a
+# single-core host queued deploys pile up behind each other and turn one slow
+# release into a stall. CI can simply be re-run.
+#
+# flock -E sets the exit status used when the lock cannot be taken, which keeps
+# "another deploy is running" distinguishable from "this deploy failed".
+PI_LOCK_FILE="${PI_LOCK_FILE:-/var/lock/pi-deploy-${PI_ENVIRONMENT}.lock}"
+if [[ -z "${PI_LOCK_HELD:-}" ]]; then
+    export PI_LOCK_HELD=1
+    exec flock -n -E 75 "$PI_LOCK_FILE" "$0" "$@"
+fi
+
+compose() {
+    env -u COMPOSE_PROJECT_NAME docker compose -f "$PI_MANIFEST" "$@"
+}
+
+main() {
+    local parsed
+    # The client string is a single argument to the parser and never reaches a
+    # shell. Rejection exits 2 without echoing what was sent.
+    parsed="$(pi_parse_command "$PI_ENVIRONMENT" "${SSH_ORIGINAL_COMMAND:-}")" || exit 2
+
+    local -a words=()
+    read -r -a words <<< "$parsed"
+
+    case "${words[0]}" in
+        status) report_status; return 0 ;;
+        deploy) ;;
+        *) exit 2 ;;
+    esac
+
+    local sha="${words[1]}" api_digest="${words[2]}" web_digest="${words[3]}"
+    run_deploy "$sha" "$api_digest" "$web_digest"
+}
+
+report_status() {
+    local current
+    current="$(pi_ledger_read_current_sha "$PI_ENVIRONMENT" 2>/dev/null || echo "none")"
+    echo "environment: ${PI_ENVIRONMENT}"
+    echo "current: ${current}"
+}
+
+run_deploy() {
+    local sha="$1" api_digest="$2" web_digest="$3"
+    local api_image web_image compat
+
+    api_image="$(pi_api_image_ref "$api_digest")"
+    web_image="$(pi_web_image_ref "$web_digest")"
+
+    # --- Preflight: nothing below this block has mutated anything ------------
+    pi_preflight_env_file "${PI_ENV_DIR}/.env"
+    pi_preflight_compose_project "$PI_MANIFEST" "$PI_PROJECT"
+    pi_preflight_docker_available
+    [[ -n "${PI_SKIP_DISK_CHECK:-}" ]] || pi_preflight_disk_free
+
+    docker pull "$api_image" >/dev/null || {
+        echo "deploy: could not pull $api_image" >&2
+        exit 1
+    }
+    docker pull "$web_image" >/dev/null || {
+        echo "deploy: could not pull $web_image" >&2
+        exit 1
+    }
+
+    # Both images must come from the requested commit. A web image built from
+    # another commit is exactly as wrong as an API image built from one.
+    pi_preflight_image_revision "$api_image" "$sha"
+    pi_preflight_image_revision "$web_image" "$sha"
+
+    # Recorded, not enforced: staging is where an incompatible migration is
+    # meant to be discovered. Production is what refuses it.
+    if pi_preflight_migration_compatibility "$api_image" 2>/dev/null; then
+        compat="true"
+    else
+        compat="false"
+    fi
+
+    # --- Mutation begins ----------------------------------------------------
+    pi_ledger_set_candidate "$PI_ENVIRONMENT" "$sha" "$api_digest" "$web_digest" "$compat"
+    write_release_file "$sha" "$api_image" "$web_image"
+
+    # `run --no-deps` starts no dependencies, so the database has to be up
+    # first or the one-shot has nothing to migrate.
+    compose up -d postgres
+    compose run --rm --no-deps api python manage.py migrate --noinput || fail "migrate" "$compat"
+    compose run --rm --no-deps api python manage.py collectstatic --noinput || fail "collectstatic" "$compat"
+
+    compose up -d || fail "recreate" "$compat"
+
+    if ! pi_health_gate "$PI_ENVIRONMENT" "$PI_HOST" "$sha"; then
+        fail "health_gate" "$compat"
+    fi
+
+    pi_ledger_promote_candidate "$PI_ENVIRONMENT"
+    pi_ledger_append_history "$PI_ENVIRONMENT" "$sha" "success" "-"
+    echo "deployed ${PI_ENVIRONMENT} ${sha} api=${api_digest} web=${web_digest}"
+}
+
+write_release_file() {
+    local sha="$1" api_image="$2" web_image="$3"
+    mkdir -p "$PI_RELEASE_DIR"
+    local tmp="${PI_RELEASE_DIR}/images.env.tmp.$$"
+    {
+        printf 'API_IMAGE=%s\n' "$api_image"
+        printf 'WEB_IMAGE=%s\n' "$web_image"
+        printf 'RELEASE_SHA=%s\n' "$sha"
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "${PI_RELEASE_DIR}/images.env"
+}
+
+# A failed attempt never becomes a successful ledger entry: promotion is the
+# only writer of that, and it is unreachable from here.
+fail() {
+    local stage="$1" compat="$2"
+    local sha
+    sha="$(python3 -c '
+import json,sys
+try:
+    print((json.load(open(sys.argv[1])).get("candidate") or {}).get("sha",""))
+except Exception:
+    print("")' "${PI_STATE_DIR:-/opt/product-intelligence/state}/${PI_ENVIRONMENT}.json" 2>/dev/null || echo "")"
+
+    echo "deploy: ${PI_ENVIRONMENT} failed at ${stage}" >&2
+    pi_collect_diagnostics "$PI_ENVIRONMENT" \
+        "${PI_STATE_DIR:-/opt/product-intelligence/state}/history/diagnostics-${PI_ENVIRONMENT}-$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null 2>&1 || true
+
+    if pi_rollback_is_permitted "$PI_ENVIRONMENT" "$compat" 2>/dev/null; then
+        pi_rollback_execute "$PI_ENVIRONMENT" "$PI_HOST" || true
+    else
+        echo "deploy: no rollback performed (not permitted for this release)" >&2
+    fi
+
+    pi_ledger_append_history "$PI_ENVIRONMENT" "$sha" "failure" "$stage" || true
+    pi_ledger_clear_candidate "$PI_ENVIRONMENT" || true
+    exit 1
+}
+
+main "$@"

@@ -34,3 +34,18 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 USER nextjs
 EXPOSE 3000
 CMD ["node", "server.js"]
+
+# --- Release provenance ------------------------------------------------------
+# Which commit built this image. A web image from another commit is exactly as
+# wrong as an API image from another commit, so the deploy path verifies this
+# label on both before running a release step.
+#
+# Declared in the runner stage: an ARG or LABEL in a builder stage never
+# reaches the published image. Last in the file so it cannot invalidate the
+# dependency or build layers.
+#
+# There is deliberately no migration-compatibility label here: only the API has
+# migrations, and a second answer to a question this image cannot have would be
+# one more thing to keep in sync.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA

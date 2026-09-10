@@ -1,0 +1,185 @@
+# Quality gates. Runs on every pull request and on main.
+#
+# This workflow proves the code and the images are sound. It publishes nothing:
+# no registry login, no push, no SSH. Publishing and deploying live in
+# deploy-staging.yml, which runs only after these gates pass.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only. The one workflow that needs to write packages says so itself.
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: product_intelligence_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/product_intelligence_test
+      DJANGO_SECRET_KEY: ci-only-not-a-real-secret
+      DJANGO_DEBUG: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.lock.txt
+          pip install -r apps/api/requirements-dev.lock.txt
+
+      # Generated per run rather than written into this file: the tests need a
+      # structurally valid Fernet key, not a particular one, and a literal key
+      # committed here would read as a credential to every future reader.
+      # Locally this comes from the repository-root .env, which CI has not got.
+      - name: Generate a CI-only credential encryption key
+        run: |
+          python -c "from cryptography.fernet import Fernet; \
+            print('CREDENTIAL_ENCRYPTION_KEYS=' + Fernet.generate_key().decode())" \
+            >> "$GITHUB_ENV"
+
+      - name: Backend tests
+        working-directory: apps/api
+        run: python -m pytest -q
+
+      - name: Migration drift
+        working-directory: apps/api
+        run: python manage.py makemigrations --check --dry-run
+
+      # The deploy scripts are tested like any other code, and they gate every
+      # change: a broken parser or ledger must not reach main.
+      - name: Deploy script tests
+        run: python -m pytest deploy/tests -q -p no:cacheprovider
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - run: npm ci
+
+      - name: Frontend tests
+        run: npm run test
+
+      - name: Types
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+        env:
+          # Matches the container build cap, so an OOM shows up here rather
+          # than on the VPS — which no longer builds anything at all.
+          NODE_OPTIONS: --max-old-space-size=640
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built, never pushed. A pull request must prove the Dockerfiles still
+      # work without publishing artefacts for unmerged code.
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          load: true
+          tags: pi-api:ci
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
+            MIGRATIONS_BACKWARD_COMPATIBLE=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          load: true
+          tags: pi-web:ci
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The provenance chain's first link, on a real image: the label a
+      # Dockerfile declares must be the label a built image carries. The digest
+      # half is checked in deploy-staging.yml, where images are actually pushed.
+      - name: Verify image provenance
+        run: |
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          COMPAT="$(python3 -c "import json;print(str(json.load(open('deploy/release-metadata.json'))['migrations_backward_compatible']).lower())")"
+          deploy/scripts/verify-image-provenance.sh pi-api:ci "$SHA" "$COMPAT"
+          deploy/scripts/verify-image-provenance.sh pi-web:ci "$SHA"
+
+      # `caddy validate` needs a Docker daemon. CI has one; the development
+      # environment does not, so this is where the real check happens before
+      # the live cutover depends on it.
+      # ACME_EMAIL is supplied here because the runtime supplies it there: the
+      # Caddyfiles use `email {$ACME_EMAIL}`, and Caddy expands that at parse
+      # time. Unset, it becomes a bare `email` with no argument and the file
+      # does not parse. That is the correct behaviour on the server -- a Caddy
+      # with no ACME contact should refuse to start rather than run -- so the
+      # placeholder belongs in CI, not as a default in the Caddyfile.
+      - name: Validate Caddy configuration
+        env:
+          ACME_EMAIL: ci@example.invalid
+        run: |
+          for caddyfile in docker/caddy/Caddyfile deploy/caddy/Caddyfile.staging-only; do
+            docker run --rm -e ACME_EMAIL -v "$PWD/$caddyfile:/etc/caddy/Caddyfile:ro" \
+              caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          done
+
+      # Both manifests declare `env_file: [.env]`, and Compose requires that
+      # file to exist even to render the configuration. On a deploy host it is
+      # real -- generated by hand, 0600 root:root -- so an empty placeholder
+      # stands in for it here and is removed again. Marking the declaration
+      # optional instead would let a deploy come up with no configuration at
+      # all, which is precisely what it exists to prevent.
+      - name: Validate deployment manifests
+        run: |
+          trap 'rm -f .env' EXIT
+          : > .env
+          for manifest in compose.staging.yaml compose.production.yaml; do
+            API_IMAGE=x WEB_IMAGE=y RELEASE_SHA=z \
+            POSTGRES_DB=d POSTGRES_USER=u POSTGRES_PASSWORD=p \
+              docker compose -f "$manifest" config >/dev/null
+          done

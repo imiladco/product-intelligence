@@ -1,0 +1,73 @@
+# Promote an already-built, already-staging-tested release to production.
+#
+# workflow_dispatch only. There is no push trigger, no schedule and no
+# workflow_run: production cannot be reached by merging anything.
+#
+# It takes a SHA. Not digests — the server reads those from the staging ledger
+# entry that passed — and not a confirmation or force input, because there is
+# nothing for one to unlock. A release that has not passed staging, or that
+# does not declare backward-compatible migrations, is refused by the server,
+# and no input available here changes that.
+#
+# It never builds. The artefacts were built once, on main, and validated on
+# staging; rebuilding would produce different bytes and discard that evidence.
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-character commit SHA that passed staging"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # A GitHub environment gate, so a human approves the promotion in the UI
+    # before the job runs. Configured in repository settings; documented in
+    # docs/DEPLOY.md.
+    environment: production
+    steps:
+      - name: Validate the requested SHA
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          # Shape only. Whether this SHA is deployable is the server's
+          # question, and it is the one that can answer it.
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "not a full lowercase 40-character commit SHA" >&2
+            exit 1
+          fi
+
+      - name: Prepare SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.PRODUCTION_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # The entire client request. The server verifies the staging proof, reads
+      # the digests it recorded, checks both images' revision labels, and
+      # refuses unless the API image declares exactly `true` for
+      # backward-compatible migrations.
+      - name: Promote to production
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes \
+              -i ~/.ssh/id_ed25519 \
+              "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+              "deploy ${SHA}"
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

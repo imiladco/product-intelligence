@@ -1,0 +1,109 @@
+# Production deployment.
+#
+# The same images as staging, promoted by digest after staging proved them.
+# This file never builds and never publishes a host port; shared Caddy reaches
+# both services over the production edge network.
+#
+#   docker compose -f compose.production.yaml up -d
+#
+# Never pass -p, and never set COMPOSE_PROJECT_NAME. Both override the `name:`
+# key below, and a redirected project name would send every volume lookup
+# somewhere else.
+#
+# Nothing here names a staging resource. Production has its own database, its
+# own volumes, its own networks, its own secrets, and starts empty.
+
+name: product-intelligence-production
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # Internal only. Unreachable from the edge network, the host, or the
+    # internet — and unreachable from staging, which is on different networks
+    # entirely.
+    networks: [internal]
+
+  api:
+    image: ${API_IMAGE}
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DJANGO_STATIC_ROOT: /srv/static
+      # Reported by /api/health so the deploy gate can prove app.arkav.lol
+      # serves the release just promoted to it, and not staging's.
+      RELEASE_SHA: ${RELEASE_SHA}
+    volumes:
+      - static:/srv/static
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      # Migrations are an explicit release step, so startup is gunicorn alone.
+      start_period: 45s
+    networks:
+      internal:
+      edge:
+        # Distinct from staging's alias on purpose: shared Caddy joins both
+        # edge networks, and two projects claiming the same name would let
+        # production traffic land on staging.
+        aliases: [production-api]
+
+  web:
+    image: ${WEB_IMAGE}
+    restart: unless-stopped
+    environment:
+      # Internal service name, exactly as in staging: the edge alias would
+      # require DJANGO_ALLOWED_HOSTS to carry it too, and forgetting that
+      # fails sign-in silently with 400 DisallowedHost.
+      INTERNAL_API_BASE_URL: http://api:8000
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/login || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    networks:
+      internal:
+      edge:
+        aliases: [production-web]
+
+# External and pinned by exact name. The database volume is created empty,
+# once, during production bootstrap; the static volume is created earlier with
+# the network skeleton because shared Caddy mounts it and cannot start without
+# it. An external volume that is missing is a hard error, so production can
+# never silently attach to the wrong data — including staging's.
+volumes:
+  pgdata:
+    external: true
+    name: product-intelligence-production_pgdata
+  static:
+    external: true
+    name: product-intelligence-production_static
+
+networks:
+  internal:
+    external: true
+    name: product-intelligence-production-internal
+  edge:
+    external: true
+    name: product-intelligence-production-edge

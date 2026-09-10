@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Install or update the privileged control plane. Run by a human with root, on
+# the server, from a checked-out repository at a reviewed commit.
+#
+#   sudo /path/to/repo/deploy/scripts/pi-install-control-plane /path/to/repo \
+#        --caddyfile /path/to/repo/deploy/caddy/Caddyfile.staging-only
+#
+# THIS IS NOT PART OF ANY DEPLOYMENT. No workflow runs it, no SSH grammar can
+# reach it, and the `deploy` user cannot execute it. That separation is the
+# point: the control plane is what enforces production's refusals and the
+# environment binding on the SSH keys, so an automatic path able to replace it
+# could rewrite the rules it is bound by.
+#
+# What it installs (Tier A):
+#   the wrapper, the two deploy scripts, the privileged libraries, the sudoers
+#   rule, the two compose manifests, and one Caddyfile chosen by the caller.
+#
+# What it never touches:
+#   .env files, the release ledger, authorized_keys (assembled by hand with the
+#   real public keys), and anything outside the paths below.
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "pi-install-control-plane: must run as root" >&2
+    exit 1
+fi
+
+repo="${1-}"
+shift || true
+
+caddyfile=""
+while (( $# > 0 )); do
+    case "$1" in
+        --caddyfile) caddyfile="${2-}"; shift 2 ;;
+        *) echo "pi-install-control-plane: unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$repo" || ! -d "$repo/.git" ]]; then
+    echo "pi-install-control-plane: first argument must be a git work tree" >&2
+    exit 2
+fi
+
+if [[ -z "$caddyfile" || ! -f "$caddyfile" ]]; then
+    echo "pi-install-control-plane: --caddyfile <path> is required" >&2
+    echo "  handoff, before app.arkav.lol resolves: deploy/caddy/Caddyfile.staging-only" >&2
+    echo "  once DNS is valid:                      docker/caddy/Caddyfile" >&2
+    exit 2
+fi
+
+commit="$(git -C "$repo" rev-parse HEAD)"
+
+echo "installing control plane from ${repo} @ ${commit}"
+
+# --- Privileged executables --------------------------------------------------
+install -d -m 0755 -o root -g root /usr/local/lib/pi-deploy
+install -m 0644 -o root -g root "$repo"/deploy/scripts/lib/*.sh /usr/local/lib/pi-deploy/
+install -m 0755 -o root -g root "$repo/deploy/scripts/pi-deploy-wrapper" /usr/local/bin/pi-deploy-wrapper
+install -m 0755 -o root -g root "$repo/deploy/scripts/pi-deploy-staging" /usr/local/sbin/pi-deploy-staging
+install -m 0755 -o root -g root "$repo/deploy/scripts/pi-deploy-production" /usr/local/sbin/pi-deploy-production
+
+# --- sudoers -----------------------------------------------------------------
+# Validated before installation: an invalid file in /etc/sudoers.d locks
+# everyone out of sudo on this host.
+staged="$(mktemp)"
+install -m 0440 -o root -g root "$repo/deploy/sudoers/pi-deploy" "$staged"
+if ! visudo -cf "$staged" >/dev/null; then
+    rm -f "$staged"
+    echo "pi-install-control-plane: sudoers file is invalid; nothing installed" >&2
+    exit 1
+fi
+install -m 0440 -o root -g root "$staged" /etc/sudoers.d/pi-deploy
+rm -f "$staged"
+
+# --- Deployment manifests ----------------------------------------------------
+install -d -m 0755 -o root -g root /opt/product-intelligence/staging
+install -d -m 0755 -o root -g root /opt/product-intelligence/production
+install -d -m 0755 -o root -g root /opt/product-intelligence/shared/caddy
+install -d -m 0755 -o root -g root /opt/product-intelligence/state
+
+install -m 0644 -o root -g root "$repo/compose.staging.yaml" \
+    /opt/product-intelligence/staging/compose.staging.yaml
+install -m 0644 -o root -g root "$repo/compose.production.yaml" \
+    /opt/product-intelligence/production/compose.production.yaml
+install -m 0644 -o root -g root "$repo/deploy/caddy/compose.yaml" \
+    /opt/product-intelligence/shared/caddy/compose.yaml
+install -m 0644 -o root -g root "$caddyfile" \
+    /opt/product-intelligence/shared/caddy/Caddyfile
+
+# --- Record what is live -----------------------------------------------------
+python3 - "$commit" "$caddyfile" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+commit, caddyfile = sys.argv[1], sys.argv[2]
+path = "/opt/product-intelligence/state/control-plane.json"
+tmp = path + ".tmp"
+with open(tmp, "w") as handle:
+    json.dump({
+        "installed_from_sha": commit,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "caddyfile": caddyfile,
+    }, handle, indent=2, sort_keys=True)
+import os
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+
+echo "installed:"
+echo "  /usr/local/bin/pi-deploy-wrapper"
+echo "  /usr/local/sbin/pi-deploy-{staging,production}"
+echo "  /usr/local/lib/pi-deploy/*.sh"
+echo "  /etc/sudoers.d/pi-deploy"
+echo "  /opt/product-intelligence/{staging,production}/compose.*.yaml"
+echo "  /opt/product-intelligence/shared/caddy/{compose.yaml,Caddyfile}"
+echo "  recorded in /opt/product-intelligence/state/control-plane.json"
+echo
+echo "NOT installed by this script, by design:"
+echo "  authorized_keys  — assembled by hand with the real public keys"
+echo "  .env files       — generated on the server, never from the repository"
+echo "  the ledger       — written only by deployments"

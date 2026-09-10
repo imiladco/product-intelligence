@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Production promotion. Invoked as root by the wrapper.
+#
+#   deploy <sha>
+#   status
+#
+# No digests. No confirmation token. No force flag. There is nothing in this
+# script that a caller can use to get past a refusal, because every refusal
+# here exists to stop something that cannot be undone.
+#
+# Production never builds and never trusts a client's idea of what to run. It
+# takes a SHA, requires the staging ledger to record that SHA as successful,
+# and pulls the exact digests staging validated.
+#
+# The compatibility gate runs BEFORE the migration, and that ordering is the
+# point: the previous application keeps serving traffic for the whole interval
+# between the one-shot migration and the candidate becoming healthy. An
+# incompatible migration therefore breaks production *during* the deploy, not
+# merely afterwards, and refusing before it runs is the only moment that is
+# preventable.
+set -euo pipefail
+
+PI_ENVIRONMENT="production"
+PI_HOST="${PI_PRODUCTION_HOST:-app.arkav.lol}"
+PI_PROJECT="product-intelligence-production"
+
+PI_LIB_DIR="${PI_LIB_DIR:-/usr/local/lib/pi-deploy}"
+PI_DEPLOY_ROOT="${PI_DEPLOY_ROOT:-/opt/product-intelligence}"
+
+# shellcheck source=lib/validate.sh
+source "${PI_LIB_DIR}/validate.sh"
+# shellcheck source=lib/ledger.sh
+source "${PI_LIB_DIR}/ledger.sh"
+# shellcheck source=lib/preflight.sh
+source "${PI_LIB_DIR}/preflight.sh"
+# shellcheck source=lib/healthgate.sh
+source "${PI_LIB_DIR}/healthgate.sh"
+# shellcheck source=lib/rollback.sh
+source "${PI_LIB_DIR}/rollback.sh"
+
+PI_ENV_DIR="${PI_DEPLOY_ROOT}/${PI_ENVIRONMENT}"
+PI_MANIFEST="${PI_COMPOSE_MANIFEST:-${PI_ENV_DIR}/compose.${PI_ENVIRONMENT}.yaml}"
+PI_RELEASE_DIR="${PI_RELEASE_DIR:-${PI_ENV_DIR}/.release}"
+export PI_COMPOSE_MANIFEST="$PI_MANIFEST"
+export PI_RELEASE_DIR
+
+PI_LOCK_FILE="${PI_LOCK_FILE:-/var/lock/pi-deploy-${PI_ENVIRONMENT}.lock}"
+if [[ -z "${PI_LOCK_HELD:-}" ]]; then
+    export PI_LOCK_HELD=1
+    exec flock -n -E 75 "$PI_LOCK_FILE" "$0" "$@"
+fi
+
+compose() {
+    env -u COMPOSE_PROJECT_NAME docker compose -f "$PI_MANIFEST" "$@"
+}
+
+main() {
+    local parsed
+    parsed="$(pi_parse_command "$PI_ENVIRONMENT" "${SSH_ORIGINAL_COMMAND:-}")" || exit 2
+
+    local -a words=()
+    read -r -a words <<< "$parsed"
+
+    case "${words[0]}" in
+        status) report_status; return 0 ;;
+        deploy) ;;
+        *) exit 2 ;;
+    esac
+
+    run_promotion "${words[1]}"
+}
+
+report_status() {
+    local current
+    current="$(pi_ledger_read_current_sha "$PI_ENVIRONMENT" 2>/dev/null || echo "none")"
+    echo "environment: ${PI_ENVIRONMENT}"
+    echo "current: ${current}"
+}
+
+run_promotion() {
+    local sha="$1"
+    local digests api_digest web_digest api_image web_image
+
+    # --- Refusals, all before anything is fetched or mutated -----------------
+
+    # 1. The staging ledger is the only evidence that this release works. An
+    #    unproven SHA does not reach an image pull.
+    if ! pi_ledger_has_successful_release staging "$sha"; then
+        echo "refused: ${sha} has no successful staging release" >&2
+        exit 1
+    fi
+
+    # 2. The digests come from that entry. The client supplied none — the
+    #    grammar has no room for one — and none is read from anywhere else.
+    digests="$(pi_ledger_digests_for_sha staging "$sha")" || {
+        echo "refused: no digests recorded for ${sha}" >&2
+        exit 1
+    }
+    read -r api_digest web_digest <<< "$digests"
+
+    api_image="$(pi_api_image_ref "$api_digest")" || {
+        echo "refused: recorded API digest for ${sha} is malformed" >&2
+        exit 1
+    }
+    web_image="$(pi_web_image_ref "$web_digest")" || {
+        echo "refused: recorded web digest for ${sha} is malformed" >&2
+        exit 1
+    }
+
+    pi_preflight_env_file "${PI_ENV_DIR}/.env"
+    pi_preflight_compose_project "$PI_MANIFEST" "$PI_PROJECT"
+    pi_preflight_docker_available
+    [[ -n "${PI_SKIP_DISK_CHECK:-}" ]] || pi_preflight_disk_free
+
+    docker pull "$api_image" >/dev/null || {
+        echo "refused: could not pull $api_image" >&2
+        exit 1
+    }
+    docker pull "$web_image" >/dev/null || {
+        echo "refused: could not pull $web_image" >&2
+        exit 1
+    }
+
+    # 3. Both images must come from this commit.
+    pi_preflight_image_revision "$api_image" "$sha"
+    pi_preflight_image_revision "$web_image" "$sha"
+
+    # 4. Fail closed on migration compatibility, read from the image that was
+    #    actually pulled. Exactly `true` continues; everything else stops here,
+    #    before the migration and before any candidate is written.
+    if ! pi_preflight_migration_compatibility "$api_image"; then
+        echo "refused: ${sha} does not declare backward-compatible migrations" >&2
+        echo "refused: a backward-incompatible migration is a separate, manual maintenance procedure" >&2
+        exit 1
+    fi
+
+    # --- Mutation begins ----------------------------------------------------
+    pi_ledger_set_candidate "$PI_ENVIRONMENT" "$sha" "$api_digest" "$web_digest" "true"
+    write_release_file "$sha" "$api_image" "$web_image"
+
+    compose up -d postgres
+    compose run --rm --no-deps api python manage.py migrate --noinput || fail "migrate"
+    compose run --rm --no-deps api python manage.py collectstatic --noinput || fail "collectstatic"
+
+    compose up -d || fail "recreate"
+
+    if ! pi_health_gate "$PI_ENVIRONMENT" "$PI_HOST" "$sha"; then
+        fail "health_gate"
+    fi
+
+    pi_ledger_promote_candidate "$PI_ENVIRONMENT"
+    pi_ledger_append_history "$PI_ENVIRONMENT" "$sha" "success" "-"
+    echo "promoted ${PI_ENVIRONMENT} ${sha} api=${api_digest} web=${web_digest}"
+}
+
+write_release_file() {
+    local sha="$1" api_image="$2" web_image="$3"
+    mkdir -p "$PI_RELEASE_DIR"
+    local tmp="${PI_RELEASE_DIR}/images.env.tmp.$$"
+    {
+        printf 'API_IMAGE=%s\n' "$api_image"
+        printf 'WEB_IMAGE=%s\n' "$web_image"
+        printf 'RELEASE_SHA=%s\n' "$sha"
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "${PI_RELEASE_DIR}/images.env"
+}
+
+# Anything that gets this far declared backward-compatible migrations, so image
+# rollback is meaningful. It still restores images only; the schema is not
+# reversed, here or anywhere.
+fail() {
+    local stage="$1"
+    local sha
+    sha="$(python3 -c '
+import json,sys
+try:
+    print((json.load(open(sys.argv[1])).get("candidate") or {}).get("sha",""))
+except Exception:
+    print("")' "${PI_STATE_DIR:-/opt/product-intelligence/state}/${PI_ENVIRONMENT}.json" 2>/dev/null || echo "")"
+
+    echo "deploy: ${PI_ENVIRONMENT} failed at ${stage}" >&2
+    pi_collect_diagnostics "$PI_ENVIRONMENT" \
+        "${PI_STATE_DIR:-/opt/product-intelligence/state}/history/diagnostics-${PI_ENVIRONMENT}-$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null 2>&1 || true
+
+    if pi_rollback_is_permitted "$PI_ENVIRONMENT" "true" 2>/dev/null; then
+        pi_rollback_execute "$PI_ENVIRONMENT" "$PI_HOST" || true
+    else
+        echo "deploy: no previous release to roll back to" >&2
+    fi
+
+    pi_ledger_append_history "$PI_ENVIRONMENT" "$sha" "failure" "$stage" || true
+    pi_ledger_clear_candidate "$PI_ENVIRONMENT" || true
+    exit 1
+}
+
+main "$@"

@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Collect static, apply migrations, then serve.
+# Serve the application, or run exactly the command given.
 #
-# Migrations run here rather than in a separate step because staging runs a
-# single API replica, so there is no concurrent-migration hazard. With more
-# than one replica this must move to a one-shot job.
+# Migrations and collectstatic are deliberately NOT here. Until M7 they ran on
+# every container start, which meant a container restarted by the Docker daemon
+# applied database migrations with nobody watching. They are now an explicit
+# one-shot release step run by the deploy scripts (design §9.2), so ordinary
+# startup never mutates schema.
+#
+#   <no args> | serve    -> start gunicorn, and nothing else
+#   anything else        -> exec it verbatim
+#
+# The passthrough is what makes `docker compose run --rm api python manage.py
+# migrate` actually run migrate. Without it the arguments were silently
+# discarded and the server started instead — succeeding while doing something
+# else entirely.
 set -euo pipefail
 
-echo "==> collectstatic"
-python manage.py collectstatic --noinput --clear
-
-echo "==> migrate"
-python manage.py migrate --noinput
+if [ "$#" -gt 0 ] && [ "$1" != "serve" ]; then
+    exec "$@"
+fi
 
 echo "==> gunicorn"
 # Access log format: identical to gunicorn's default except that the request
