@@ -49,6 +49,16 @@ jobs:
           pip install -r apps/api/requirements.lock.txt
           pip install -r apps/api/requirements-dev.lock.txt
 
+      # Generated per run rather than written into this file: the tests need a
+      # structurally valid Fernet key, not a particular one, and a literal key
+      # committed here would read as a credential to every future reader.
+      # Locally this comes from the repository-root .env, which CI has not got.
+      - name: Generate a CI-only credential encryption key
+        run: |
+          python -c "from cryptography.fernet import Fernet; \
+            print('CREDENTIAL_ENCRYPTION_KEYS=' + Fernet.generate_key().decode())" \
+            >> "$GITHUB_ENV"
+
       - name: Backend tests
         working-directory: apps/api
         run: python -m pytest -q

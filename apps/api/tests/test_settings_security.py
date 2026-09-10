@@ -32,10 +32,16 @@ def load_settings(env: dict[str, str], monkeypatch):
 def production_settings(monkeypatch):
     module = load_settings(PROD_ENV, monkeypatch)
     yield module
-    # Restore the module to the ambient (development) configuration so later
-    # tests are unaffected.
-    for key in PROD_ENV:
-        monkeypatch.delenv(key, raising=False)
+    # Restore the module to the ambient configuration so later tests are
+    # unaffected. `monkeypatch.undo()` first, then reload -- the same order
+    # test_missing_secret_key_fails_loudly uses, and for the same reason.
+    #
+    # Deleting the PROD_ENV names instead would leave DJANGO_SECRET_KEY unset
+    # during the restoring reload, so settings.py takes its DEBUG=False branch
+    # and env_required raises. That only survived locally because
+    # load_dotenv() put a developer's repository-root .env back. CI has no
+    # .env, so every test using this fixture errored at teardown.
+    monkeypatch.undo()
     importlib.reload(sys.modules["config.settings"])
 
 
