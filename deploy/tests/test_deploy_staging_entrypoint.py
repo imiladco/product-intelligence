@@ -28,6 +28,7 @@ LIB_DIR = REPO_ROOT / "deploy" / "scripts" / "lib"
 SHA = "a" * 40
 API_DIGEST = "sha256:" + "1" * 64
 WEB_DIGEST = "sha256:" + "2" * 64
+GHCR_TOKEN = "ghp_EntrypointHarnessSecret0123456789"
 API_REPO = "ghcr.io/imiladco/product-intelligence/api"
 WEB_REPO = "ghcr.io/imiladco/product-intelligence/web"
 
@@ -53,11 +54,20 @@ def env(tmp_path: Path):
     env_file = deploy_dir / ".env"
     env_file.write_text("\n".join(f"{k}=value-for-{k}" for k in REQUIRED_ENV_KEYS) + "\n")
     env_file.chmod(0o600)
+    credential = tmp_path / "ghcr.env"
+    credential.write_text("GHCR_USERNAME=pi-deploy-bot\nGHCR_TOKEN=" + GHCR_TOKEN + "\n")
+    credential.chmod(0o600)
+
     (deploy_dir / "compose.staging.yaml").write_text("name: product-intelligence-staging\n")
 
     (bin_dir / "docker").write_text(f"""#!/usr/bin/env bash
 echo "docker $@" >> {calls}
 case "$1 $2" in
+  "login "*|"login")
+      # Consumes stdin exactly as the real client does with --password-stdin,
+      # so a token sent that way never reaches the call log.
+      cat >/dev/null
+      exit "$(cat {tmp_path}/login_status 2>/dev/null || echo 0)" ;;
   "image inspect")
       # Label lookups: revision, then compatibility.
       if [[ "$*" == *"revision"* ]]; then
@@ -119,6 +129,7 @@ def deploy(env, command: str) -> subprocess.CompletedProcess:
             "PI_HEALTH_ATTEMPTS_ROUTE": "1",
             "PI_SKIP_DISK_CHECK": "1",
             "PI_LOCK_FILE": str(env["tmp"] / "deploy.lock"),
+            "PI_GHCR_CREDENTIAL_FILE": str(env["tmp"] / "ghcr.env"),
         },
     )
 
@@ -281,3 +292,54 @@ class TestSourceLevelGuarantees:
     def test_the_repository_is_never_taken_from_input(self):
         code = SCRIPT.read_text()
         assert "ghcr.io" not in code, "image references come from validate.sh constants"
+
+
+class TestRegistryAuthenticationPrecedesPulls:
+    """Both images are private, so a pull without a login is a pull that only
+    works by accident -- off whatever /root/.docker/config.json remembers from
+    an admin's manual login. That works until the remembered token expires,
+    then fails as "could not pull" with nothing naming the real cause.
+    """
+
+    def test_it_authenticates_before_pulling(self, env):
+        deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        log = calls(env)
+        assert "docker login" in log, "no registry authentication happened"
+        assert log.index("docker login") < log.index("docker pull"), (
+            "pulled before authenticating"
+        )
+
+    def test_a_missing_credential_stops_before_any_pull(self, env):
+        (env["tmp"] / "ghcr.env").unlink()
+        result = deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        assert result.returncode != 0
+        assert "pull" not in calls(env), "pulled without a credential"
+
+    def test_a_loose_credential_mode_stops_before_any_pull(self, env):
+        (env["tmp"] / "ghcr.env").chmod(0o644)
+        result = deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        assert result.returncode != 0
+        assert "pull" not in calls(env)
+
+    def test_a_rejected_credential_stops_before_any_pull(self, env):
+        (env["tmp"] / "login_status").write_text("1")
+        result = deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        assert result.returncode != 0
+        assert "pull" not in calls(env)
+
+    def test_the_token_never_reaches_the_call_log(self, env):
+        deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        assert GHCR_TOKEN not in calls(env), "the token was passed as an argument"
+
+    def test_the_token_never_reaches_the_ledger(self, env):
+        deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        assert GHCR_TOKEN not in (env["state"] / "staging.json").read_text()
+
+    def test_it_still_pulls_only_the_validated_digests(self, env):
+        """Authentication must not disturb digest-only deployment identity."""
+        deploy(env, f"deploy {SHA} {API_DIGEST} {WEB_DIGEST}")
+        log = calls(env)
+        assert f"docker pull {API_REPO}@{API_DIGEST}" in log
+        assert f"docker pull {WEB_REPO}@{WEB_DIGEST}" in log
+        assert f"{API_REPO}:" not in log, "pulled by tag"
+        assert f"{WEB_REPO}:" not in log, "pulled by tag"

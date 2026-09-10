@@ -220,8 +220,29 @@ credential with these properties:
    repository scope. A read credential on a deploy host cannot become a supply
    chain write.
 3. It lives at `/etc/product-intelligence/ghcr.env`, `0600 root:root`, and is
-   read only by the root-owned deploy script to `docker login ghcr.io`. The
-   `deploy` user cannot read it.
+   read only by the root-owned deploy scripts. The `deploy` user cannot read
+   it. The schema is exactly two keys:
+
+   ```
+   GHCR_USERNAME=<github username or bot account>
+   GHCR_TOKEN=<read-only packages token>
+   ```
+
+   `deploy/scripts/lib/registry.sh` parses that file — it never sources it —
+   and authenticates with `--password-stdin`, so the token is never a process
+   argument. Both `pi-deploy-staging` and `pi-deploy-production` call
+   `pi_registry_login` **before** pulling, on every deploy.
+
+   That last point is the whole reason the helper exists. A `docker login`
+   typed once by an admin persists in `/root/.docker/config.json`, and pulls
+   keep working from it — so the credential file is never exercised, and the
+   day the remembered token expires deploys fail with `could not pull` and
+   nothing on the host points at the cause. Authenticating from the file every
+   time means the credential documented here is the credential actually in use.
+
+   It fails closed: a missing file, an owner other than root, a mode other than
+   `0600`, a missing or empty key, or a rejected credential each stop the
+   deploy before any pull.
 4. It is never committed, never passed as an argument, never echoed.
 
 **Rotation** (manual, and the only supported procedure):
@@ -229,9 +250,17 @@ credential with these properties:
 1. Create the new credential with the same two properties.
 2. Write `/etc/product-intelligence/ghcr.env` using the non-echoing pattern in
    §4; keep the mode `0600 root:root`.
-3. Prove the new credential works *before* revoking the old one:
-   `docker login ghcr.io` with it, then pull the current release's API digest
-   (`jq -r .current.api_digest` from the production ledger).
+3. Prove the new credential works *before* revoking the old one, through the
+   same code path a deploy uses:
+
+   ```bash
+   sudo bash -c 'source /usr/local/lib/pi-deploy/registry.sh && pi_registry_login'
+   sudo docker pull "ghcr.io/imiladco/product-intelligence/api@$(sudo python3 -c \
+     "import json;print(json.load(open('/opt/product-intelligence/state/production.json'))['current']['api_digest'])")"
+   ```
+
+   Verifying with a bare `docker login` instead would only prove that *some*
+   credential works, which on a host with a cached login can be the old one.
 4. Revoke the old credential.
 5. Run one staging deploy and confirm it reaches `success` in the ledger.
 

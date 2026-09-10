@@ -37,6 +37,8 @@ source "${PI_LIB_DIR}/preflight.sh"
 source "${PI_LIB_DIR}/healthgate.sh"
 # shellcheck source=lib/rollback.sh
 source "${PI_LIB_DIR}/rollback.sh"
+# shellcheck source=lib/registry.sh
+source "${PI_LIB_DIR}/registry.sh"
 
 PI_ENV_DIR="${PI_DEPLOY_ROOT}/${PI_ENVIRONMENT}"
 PI_MANIFEST="${PI_COMPOSE_MANIFEST:-${PI_ENV_DIR}/compose.${PI_ENVIRONMENT}.yaml}"
@@ -111,6 +113,15 @@ run_promotion() {
     pi_preflight_compose_project "$PI_MANIFEST" "$PI_PROJECT"
     pi_preflight_docker_available
     [[ -n "${PI_SKIP_DISK_CHECK:-}" ]] || pi_preflight_disk_free
+
+    # Both images are private, so authenticate first, from the root-only
+    # credential file. Never from whatever /root/.docker/config.json happens to
+    # remember: that works until the remembered token expires, and then fails
+    # as "could not pull" with nothing pointing at the real cause.
+    pi_registry_login >/dev/null || {
+        echo "refused: could not authenticate to the image registry" >&2
+        exit 1
+    }
 
     docker pull "$api_image" >/dev/null || {
         echo "refused: could not pull $api_image" >&2
