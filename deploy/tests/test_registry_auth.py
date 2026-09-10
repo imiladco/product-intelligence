@@ -51,14 +51,22 @@ def env(tmp_path: Path):
     # Records argv and whatever arrived on stdin, so a test can prove the token
     # travelled by stdin and never as an argument.
     (bin_dir / "docker").write_text(f"""#!/usr/bin/env bash
-echo "docker $@" >> {calls}
+echo "docker $@ [DOCKER_CONFIG=${{DOCKER_CONFIG-unset}}]" >> {calls}
 if [[ "$1" == "login" ]]; then
   cat >> {stdin_seen}
+  # Record what a real client would persist, so a test can prove the
+  # credential lands in the ephemeral config and not the default one.
+  if [[ -n "${{DOCKER_CONFIG-}}" ]]; then
+    printf '{{"auths":{{"ghcr.io":{{"auth":"persisted"}}}}}}' > "$DOCKER_CONFIG/config.json"
+  fi
   exit "$(cat {tmp_path}/login_status 2>/dev/null || echo 0)"
 fi
-exit 0
+exit "$(cat {tmp_path}/pull_status 2>/dev/null || echo 0)"
 """)
     (bin_dir / "docker").chmod(0o755)
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
 
     credential = tmp_path / "ghcr.env"
     credential.write_text(f"GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\n")
@@ -70,6 +78,7 @@ exit 0
         "calls": calls,
         "stdin": stdin_seen,
         "credential": credential,
+        "scratch": scratch,
     }
 
 
@@ -84,6 +93,7 @@ def login(env, *, credential: Path | None = None) -> subprocess.CompletedProcess
         env={
             "PATH": f"{env['bin']}:/usr/bin:/bin",
             "PI_GHCR_CREDENTIAL_FILE": str(path),
+            "TMPDIR": str(env["scratch"]),
         },
     )
 
@@ -313,3 +323,211 @@ class TestTheBootstrapProcedureIsValid:
             p.read_text() for p in (REPO_ROOT / "docs" / "superpowers" / "plans").glob("*.md")
         )
         assert "pi_registry_login" in text, "L06 never exercises the deploy path's own helper"
+
+
+def docker_configs(env) -> list[str]:
+    """The DOCKER_CONFIG each docker invocation actually ran with."""
+    seen = []
+    for line in calls(env).splitlines():
+        if "[DOCKER_CONFIG=" in line:
+            seen.append(line.rsplit("[DOCKER_CONFIG=", 1)[1].rstrip("]"))
+    return seen
+
+
+def session(env, body: str) -> subprocess.CompletedProcess:
+    """Run a full authenticate → pull → cleanup lifecycle in one shell."""
+    script = f'source "{REGISTRY_LIB}"\n{body}'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            "PATH": f"{env['bin']}:/usr/bin:/bin",
+            "PI_GHCR_CREDENTIAL_FILE": str(env["credential"]),
+            "HOME": str(env["tmp"] / "home"),
+            "TMPDIR": str(env["scratch"]),
+        },
+    )
+
+
+class TestEphemeralDockerConfig:
+    """`docker login` persists credentials into the Docker config it is given.
+
+    Left at the default, that writes the token into /root/.docker/config.json,
+    where it outlives the deploy and duplicates the secret outside the one file
+    that is supposed to hold it. Each authentication therefore gets its own
+    throwaway config directory, and the pulls run inside the same one.
+    """
+
+    def test_login_runs_with_an_isolated_docker_config(self, env):
+        result = session(env, "pi_registry_login")
+        assert result.returncode == 0, result.stderr
+        configs = docker_configs(env)
+        assert configs, "no docker call recorded"
+        assert configs[0] not in ("unset", ""), "login used the default Docker config"
+
+    def test_the_directory_is_private(self, env):
+        result = session(
+            env, 'pi_registry_login && stat -c "%a" "$DOCKER_CONFIG"'
+        )
+        assert result.stdout.strip().endswith("700"), result.stdout
+
+    def test_login_and_both_pulls_share_one_config(self, env):
+        session(env, (
+            "pi_registry_login\n"
+            "docker pull repo/api@sha256:aaa\n"
+            "docker pull repo/web@sha256:bbb\n"
+            "pi_registry_logout"
+        ))
+        configs = docker_configs(env)
+        assert len(configs) == 3, configs
+        assert len(set(configs)) == 1, f"the pulls did not reuse the login's config: {configs}"
+
+    def test_the_directory_is_removed_after_success(self, env):
+        result = session(env, (
+            'pi_registry_login\n'
+            'saved="$DOCKER_CONFIG"\n'
+            'pi_registry_logout\n'
+            '[[ -e "$saved" ]] && echo LEFT_BEHIND || echo REMOVED'
+        ))
+        assert "REMOVED" in result.stdout, result.stdout
+
+    def test_the_directory_is_removed_when_login_fails(self, env):
+        """Scoped to this test's own TMPDIR.
+
+        Globbing /tmp instead would make the assertion depend on whatever else
+        the machine has lying around -- which is exactly how this test first
+        failed, on leftovers from an unrelated run.
+        """
+        (env["tmp"] / "login_status").write_text("1")
+        result = session(env, "pi_registry_login || true")
+        assert result.returncode == 0
+        leftovers = list(env["scratch"].glob("pi-registry-*"))
+        assert leftovers == [], f"a session directory survived a failed login: {leftovers}"
+
+    def test_the_directory_is_removed_when_a_pull_fails_and_the_shell_exits(self, env):
+        """The EXIT trap is the backstop: a deploy that aborts between login
+        and logout must not leave an authenticated config on disk."""
+        (env["tmp"] / "pull_status").write_text("1")
+        marker = env["tmp"] / "config_path"
+        session(env, (
+            'pi_registry_login\n'
+            f'printf "%s" "$DOCKER_CONFIG" > {marker}\n'
+            'docker pull repo/api@sha256:aaa || exit 1\n'
+        ))
+        left = Path(marker.read_text())
+        assert not left.exists(), f"an authenticated Docker config survived: {left}"
+
+    def test_the_default_docker_config_is_never_written(self, env):
+        home = env["tmp"] / "home"
+        home.mkdir(exist_ok=True)
+        session(env, "pi_registry_login && pi_registry_logout")
+        assert not (home / ".docker").exists(), "the default Docker config was created"
+
+    def test_the_default_docker_config_is_not_required(self, env):
+        """A host that has never run `docker login` must deploy fine."""
+        assert not (env["tmp"] / "home" / ".docker").exists()
+        assert session(env, "pi_registry_login").returncode == 0
+
+    def test_the_token_is_not_in_the_call_log(self, env):
+        session(env, "pi_registry_login && pi_registry_logout")
+        assert TOKEN not in calls(env)
+
+
+class TestStrictSchema:
+    """Exactly two keys, each exactly once, nothing else.
+
+    A parser that hunts for the keys it wants and ignores the rest will
+    happily accept a file with a typo'd second token, a stray assignment, or
+    a duplicate — and silently use whichever line it happened to reach first.
+    """
+
+    def write(self, env, content: str):
+        env["credential"].write_text(content)
+        env["credential"].chmod(0o600)
+
+    def test_the_documented_schema_is_accepted(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\n")
+        assert login(env).returncode == 0
+
+    def test_comments_and_blank_lines_are_accepted(self, env):
+        self.write(env, (
+            "# GHCR read-only credential\n"
+            "\n"
+            f"GHCR_USERNAME={USERNAME}\n"
+            "   \n"
+            "# the token below is read-only\n"
+            f"GHCR_TOKEN={TOKEN}\n"
+        ))
+        assert login(env).returncode == 0, "comments and blank lines must stay legal"
+
+    def test_an_unknown_key_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\nGHCR_REGISTRY=example.com\n")
+        result = login(env)
+        assert result.returncode != 0
+        assert "docker login" not in calls(env)
+
+    def test_a_duplicate_username_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nGHCR_USERNAME=someone-else\nGHCR_TOKEN={TOKEN}\n")
+        result = login(env)
+        assert result.returncode != 0
+        assert "docker login" not in calls(env)
+
+    def test_a_duplicate_token_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\nGHCR_TOKEN=another\n")
+        result = login(env)
+        assert result.returncode != 0
+        assert "docker login" not in calls(env)
+
+    def test_a_malformed_line_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nthis line has no equals sign\nGHCR_TOKEN={TOKEN}\n")
+        result = login(env)
+        assert result.returncode != 0
+        assert "docker login" not in calls(env)
+
+    def test_an_indented_assignment_is_rejected(self, env):
+        """Leading whitespace usually means a heredoc was pasted wrong."""
+        self.write(env, f"  GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\n")
+        assert login(env).returncode != 0
+
+    def test_a_missing_key_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\n")
+        assert login(env).returncode != 0
+
+    def test_an_empty_value_is_rejected(self, env):
+        self.write(env, f"GHCR_USERNAME=\nGHCR_TOKEN={TOKEN}\n")
+        assert login(env).returncode != 0
+
+    def test_a_rejection_never_prints_the_token(self, env):
+        self.write(env, f"GHCR_USERNAME={USERNAME}\nGHCR_TOKEN={TOKEN}\nSTRAY=1\n")
+        result = login(env)
+        assert TOKEN not in result.stdout
+        assert TOKEN not in result.stderr
+
+
+class TestDocumentationMatchesTheImplementation:
+    """The last review found documentation describing a mechanism that did not
+    exist. These assert the reverse cannot happen quietly again."""
+
+    def doc(self) -> str:
+        return " ".join((REPO_ROOT / "docs" / "DEPLOY.md").read_text().split())
+
+    def test_it_documents_the_ephemeral_docker_config(self):
+        text = self.doc()
+        assert "DOCKER_CONFIG" in text
+        assert "0700" in text
+
+    def test_it_documents_that_the_root_docker_config_is_untouched(self):
+        text = self.doc()
+        assert "/root/.docker/config.json" in text
+        assert "never read, never written" in text
+
+    def test_it_documents_the_strict_schema(self):
+        text = self.doc()
+        assert "each exactly once" in text
+
+    def test_it_documents_the_source_of_truth(self):
+        text = self.doc()
+        assert "Source of truth" in text
+        assert "/etc/product-intelligence/ghcr.env" in text

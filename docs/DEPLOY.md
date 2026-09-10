@@ -228,10 +228,39 @@ credential with these properties:
    GHCR_TOKEN=<read-only packages token>
    ```
 
+   **Exactly two keys, each exactly once, and nothing else.** Blank lines and
+   whole-line `#` comments are allowed; an unknown key, a duplicate, an
+   indented assignment or a line without `=` is a hard error. A parser that
+   hunted for the keys it wanted and ignored the rest would accept a file with
+   a typo'd second token and silently use whichever line it reached first.
+
    `deploy/scripts/lib/registry.sh` parses that file — it never sources it —
    and authenticates with `--password-stdin`, so the token is never a process
    argument. Both `pi-deploy-staging` and `pi-deploy-production` call
    `pi_registry_login` **before** pulling, on every deploy.
+
+   **Two kinds of state, kept apart:**
+
+   | | Where | Lifetime |
+   |---|---|---|
+   | **Source of truth** | `/etc/product-intelligence/ghcr.env` | permanent, `0600 root:root` |
+   | **Authenticated Docker state** | a fresh `DOCKER_CONFIG` directory, mode `0700` | one deploy |
+   | **Default root Docker config** | `/root/.docker/config.json` | **never read, never written** |
+
+   `docker login` persists the credential into whatever Docker config it is
+   given. Left at the default it would copy the token into
+   `/root/.docker/config.json`, where it outlives the deploy and duplicates the
+   secret outside the one file meant to hold it. So each authentication gets
+   its own throwaway config directory; the pulls run inside it; and it is
+   removed after the second pull, with an `EXIT` trap covering every path that
+   does not get there. The lifecycle is explicit:
+
+   ```
+   pi_registry_login → docker pull <api@digest> → docker pull <web@digest> → pi_registry_logout
+   ```
+
+   A host that has never run `docker login` deploys normally, and a host that
+   has is neither consulted nor modified.
 
    That last point is the whole reason the helper exists. A `docker login`
    typed once by an admin persists in `/root/.docker/config.json`, and pulls
@@ -260,7 +289,9 @@ credential with these properties:
    ```
 
    Verifying with a bare `docker login` instead would only prove that *some*
-   credential works, which on a host with a cached login can be the old one.
+   credential works, which on a host with a cached login can be the old one —
+   and it would write that credential into the root Docker config, which the
+   deploy path deliberately never touches.
 4. Revoke the old credential.
 5. Run one staging deploy and confirm it reaches `success` in the ledger.
 

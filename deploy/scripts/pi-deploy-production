@@ -132,6 +132,12 @@ run_promotion() {
         exit 1
     }
 
+    # Both images are local now, so the authenticated Docker config has done
+    # its job. Destroying it here keeps the credential live for the shortest
+    # possible window; the EXIT trap covers every path that does not reach
+    # this line.
+    pi_registry_logout
+
     # 3. Both images must come from this commit.
     pi_preflight_image_revision "$api_image" "$sha"
     pi_preflight_image_revision "$web_image" "$sha"

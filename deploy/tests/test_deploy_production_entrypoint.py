@@ -66,7 +66,7 @@ def env(tmp_path: Path):
     (deploy_dir / "compose.production.yaml").write_text("name: product-intelligence-production\n")
 
     (bin_dir / "docker").write_text(f"""#!/usr/bin/env bash
-echo "docker $@" >> {calls}
+echo "docker $@ [DOCKER_CONFIG=${{DOCKER_CONFIG-unset}}]" >> {calls}
 case "$1 $2" in
   "login "*|"login")
       # Consumes stdin exactly as the real client does with --password-stdin,
@@ -85,6 +85,7 @@ case "$1 $2" in
         printf '{{"name": "product-intelligence-production"}}'
       fi
       exit 0 ;;
+  "pull "*) exit "$(cat {tmp_path}/pull_status 2>/dev/null || echo 0)" ;;
   *) exit 0 ;;
 esac
 """)
@@ -378,3 +379,44 @@ class TestRegistryAuthenticationPrecedesPulls:
         assert f"docker pull {WEB_REPO}@{WEB_DIGEST}" in log
         assert f"{API_REPO}:" not in log, "pulled by tag"
         assert f"{WEB_REPO}:" not in log, "pulled by tag"
+
+
+class TestRegistrySessionIsEphemeralAndShared:
+    """`docker login` persists into whatever Docker config it is given.
+
+    Left at the default it would copy the token into /root/.docker/config.json,
+    outliving the deploy. The session is a throwaway directory instead -- and
+    the pulls must run inside it, or they would be unauthenticated.
+    """
+
+    def configs(self, env) -> list[str]:
+        return [
+            line.rsplit("[DOCKER_CONFIG=", 1)[1].rstrip("]")
+            for line in calls(env).splitlines()
+            if "[DOCKER_CONFIG=" in line
+        ]
+
+    def test_login_and_both_pulls_share_one_isolated_config(self, env):
+        staging_passed(env)
+        promote(env, f"deploy {SHA}")
+        lines = [ln for ln in calls(env).splitlines() if " login " in ln or " pull " in ln]
+        assert len(lines) >= 3, lines
+        used = {ln.rsplit("[DOCKER_CONFIG=", 1)[1].rstrip("]") for ln in lines}
+        assert len(used) == 1, f"login and pulls used different configs: {used}"
+        only = used.pop()
+        assert only not in ("unset", ""), "the default Docker config was used"
+        assert "pi-registry-" in only, only
+
+    def test_the_session_directory_does_not_survive_the_deploy(self, env):
+        staging_passed(env)
+        promote(env, f"deploy {SHA}")
+        for path in {c for c in self.configs(env) if "pi-registry-" in c}:
+            assert not Path(path).exists(), f"an authenticated config survived: {path}"
+
+    def test_it_does_not_survive_a_failed_pull_either(self, env):
+        (env["tmp"] / "pull_status").write_text("1")
+        staging_passed(env)
+        result = promote(env, f"deploy {SHA}")
+        assert result.returncode != 0
+        for path in {c for c in self.configs(env) if "pi-registry-" in c}:
+            assert not Path(path).exists(), f"an authenticated config survived: {path}"

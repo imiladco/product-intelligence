@@ -116,6 +116,12 @@ run_deploy() {
         exit 1
     }
 
+    # Both images are local now, so the authenticated Docker config has done
+    # its job. Destroying it here keeps the credential live for the shortest
+    # possible window; the EXIT trap covers every path that does not reach
+    # this line.
+    pi_registry_logout
+
     # Both images must come from the requested commit. A web image built from
     # another commit is exactly as wrong as an API image built from one.
     pi_preflight_image_revision "$api_image" "$sha"
