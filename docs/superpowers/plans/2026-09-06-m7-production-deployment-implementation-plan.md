@@ -1677,7 +1677,14 @@ pre-pulls images and needs headroom.
   by the user; this plan never creates or reads GitHub secrets.
 - [ ] On the VPS, as root:
   ```bash
-  useradd --system --create-home --shell /usr/sbin/nologin deploy
+  # /bin/bash, NOT /usr/sbin/nologin. sshd runs a forced command through the
+  # account's login shell as `shell -c "<command>"`, so nologin would print
+  # "This account is currently not available." and exit before
+  # pi-deploy-wrapper ever ran -- every deploy would fail. The security
+  # boundary is the forced command plus the key restrictions below, not the
+  # shell: `restrict,no-pty` denies PTY, agent, port and X11 forwarding, and
+  # the client's string is never executed.
+  useradd --system --create-home --shell /bin/bash deploy
   install -d -m 0700 -o deploy -g deploy /home/deploy/.ssh
   # authorized_keys built from deploy/ssh/authorized_keys.template with the two
   # real public keys substituted; installed root-owned so `deploy` cannot edit it:
@@ -1700,11 +1707,14 @@ pre-pulls images and needs headroom.
   ls -l /usr/local/bin/pi-deploy-wrapper /usr/local/sbin/pi-deploy-*
   ls -l /etc/sudoers.d/pi-deploy && visudo -cf /etc/sudoers.d/pi-deploy
   id deploy
+  getent passwd deploy
   ```
-  Expected: `0755 root:root` scripts, `0440 root:root` sudoers, `parsed OK`, and
-  `deploy` **not** in the `docker` group.
+  Expected: `0755 root:root` scripts, `0440 root:root` sudoers, `parsed OK`,
+  `deploy` **not** in the `docker` group, and a login shell of `/bin/bash` --
+  a forced command cannot run without one.
 
-**STOP if:** `id deploy` shows the `docker` group, or `visudo -cf` fails.
+**STOP if:** `id deploy` shows the `docker` group, `visudo -cf` fails, or
+`getent passwd deploy` shows `nologin` or `/bin/false`.
 
 ---
 
