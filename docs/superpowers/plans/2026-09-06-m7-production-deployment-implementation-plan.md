@@ -80,7 +80,7 @@ docs/superpowers/specs/2026-09-06-m7-production-deployment-design.md
 
 ## 1. Task inventory
 
-**Part 1 — repository implementation (19 tasks, merged before any server work)**
+**Part 1 — repository implementation (20 tasks, merged before any server work)**
 
 | # | Task | Commit subject |
 |---|---|---|
@@ -100,6 +100,7 @@ docs/superpowers/specs/2026-09-06-m7-production-deployment-design.md
 | 14 | SSH wrapper and control-plane installer | `feat(deploy): environment-bound wrapper and control-plane installer` |
 | 15 | CI — quality gates and image builds | `ci: quality gates and image builds` |
 | 16 | CI — publish and auto-deploy staging | `ci: publish images and deploy staging by digest` |
+| 16B | **Artifact provenance chain (SHA → label → digest)** | `ci: verify artifact provenance for both images` |
 | 17 | CI — production promotion workflow | `ci: manual production promotion` |
 | 18 | Examples and documentation | `docs: deployment runbooks and production env example` |
 | 19 | Merged-tree verification and PR | `chore: M7 repository verification` |
@@ -336,6 +337,13 @@ Both Dockerfiles accept two build arguments and stamp labels:
 |---|---|---|
 | api, web | `org.opencontainers.image.revision` | `--build-arg GIT_SHA` |
 | api | `org.arkav.pi.migrations-backward-compatible` | `--build-arg MIGRATIONS_BACKWARD_COMPATIBLE` |
+
+**Provenance requirement (added at review).** The labels are one link in a
+three-link chain that must hold end to end: **Git SHA → OCI label → image
+digest**. This task creates the labels on **both** images; Task 09 verifies them
+on a pulled image; Tasks 12 and 13 verify them for the API **and** the web image
+before any release step; Task 16B proves the whole chain against really-built,
+really-pushed images. No link may be assumed.
 
 **Behavioural requirements**
 1. `ARG GIT_SHA=unknown` and `LABEL org.opencontainers.image.revision=$GIT_SHA`
@@ -806,7 +814,9 @@ pi_preflight_migration_compatibility "$api_image_ref"   # exit 0 iff label is ex
 4. `pi_preflight_image_revision` compares the `org.opencontainers.image.revision`
    label to the requested SHA and fails on mismatch — this is what stops a
    digest from a different commit being promoted under a SHA it does not belong
-   to.
+   to. It is a **per-image** function and callers must invoke it for the API
+   **and** the web image; a web image from another commit is exactly as wrong as
+   an API image from another commit.
 5. `pi_preflight_disk_free` takes a minimum in GiB and reads
    `df --output=avail -BG /var/lib/docker` (falling back to `/` if that path
    does not exist), failing below the floor. Default floor: **3 GiB**.
@@ -999,7 +1009,8 @@ status
 3. Preflight (Task 09), in order: env file → compose project → docker available
    → disk floor → external networks and volumes → pull **by digest** (image
    references built by `pi_api_image_ref`/`pi_web_image_ref` from the validated
-   digests) → image revision labels match the requested SHA.
+   digests) → `pi_preflight_image_revision` for **both** the API and the web
+   image, each against the requested SHA.
 4. Read the compatibility label from the pulled API image and **record** it.
    Staging does **not** refuse on `false` (§11.2) — it records the value.
 5. `pi_ledger_set_candidate staging <sha> <api> <web> <compat>`.
@@ -1032,6 +1043,10 @@ with `docker`, `flock` and `curl` stubbed on `PATH` and `PI_STATE_DIR` /
 - `test_rejects_an_invalid_digest`.
 - `test_pulls_by_digest_not_by_tag` — assert every stubbed `docker pull`
   argument contains `@sha256:` and none contains `:<sha>` as a tag.
+- `test_revision_is_verified_for_both_images` — the stubbed `docker` records
+  its `image inspect` calls; assert the revision label was read for the API
+  **and** the web image, and that a mismatching web revision aborts the deploy
+  with no migration call.
 - `test_migration_runs_before_the_app_is_recreated` — the stub records call
   order; assert `run --rm --no-deps api python manage.py migrate` precedes
   `up -d` (without a service argument).
@@ -1101,7 +1116,8 @@ No digest input. No confirmation token. No force flag. No override of any kind.
   candidate was written. Plus one case for `"true"` proceeding.
 - `test_no_override_exists` — source scan: the script contains none of
   `--force`, `FORCE`, `--yes`, `CONFIRM`, `override`, `skip-compat`.
-- `test_revision_mismatch_is_refused`.
+- `test_revision_mismatch_is_refused` — parametrised over the API image and the
+  web image, so neither is left unverified.
 - `test_second_concurrent_production_deploy_exits_75`.
 - `test_a_failing_health_gate_does_not_mark_production_current`.
 
@@ -1297,6 +1313,112 @@ Implements spec §10.2, §8.1, §8.2.
   real workflows to scan.
 
 **Commit:** `ci: publish images and deploy staging by digest`
+
+---
+
+## Task 16B — Artifact provenance chain (SHA → label → digest)
+
+**Added at review.** Implements the requirement that both images preserve the
+Git SHA through OCI labels, and that the whole chain is proven **before** Task
+19 closes Part 1.
+
+**Why this is its own task.** Tasks 03, 09, 12 and 13 each assert one link by
+reading source or by stubbing Docker. None of them ever builds a real image, so
+none can prove that the label a Dockerfile *declares* is the label a built image
+actually *carries* at a given digest. Only a real build can, and only CI has a
+Docker daemon.
+
+**Files**
+- Modified: `.github/workflows/ci.yml` (pull-request half)
+- Modified: `.github/workflows/deploy-staging.yml` (main half)
+- Created: `deploy/scripts/verify-image-provenance.sh`
+- Modified: `deploy/tests/test_workflows.py`
+- Created: `deploy/tests/test_image_provenance_script.py`
+
+**Interfaces produced**
+```bash
+deploy/scripts/verify-image-provenance.sh <image-ref> <expected-sha> [<expected-compat>]
+# exit 0 iff:
+#   org.opencontainers.image.revision == <expected-sha>
+#   and, when <expected-compat> is given,
+#       org.arkav.pi.migrations-backward-compatible == <expected-compat>
+```
+It reads labels with `docker image inspect` and prints, on failure, which label
+mismatched and what was found. It is a **verification** script: it mutates
+nothing, pulls nothing, and is safe to run against any local image reference.
+
+**Behavioural requirements**
+1. **Pull request (no push, no digest).** The `images` job builds both images
+   with `load: true` and runs the script against each **by local tag**, checking
+   the revision label equals `github.event.pull_request.head.sha`, and for the
+   API also that the compatibility label equals the value in
+   `deploy/release-metadata.json`. A PR that would produce a mislabelled image
+   fails before merge.
+2. **`main` (pushed, digest known).** After the push step, for **each** image:
+   - resolve the reference as `<repo>@${{ steps.<id>.outputs.digest }}`;
+   - `docker pull` that digest reference (proving the digest is real and
+     fetchable, not merely reported);
+   - run the script against the **digest reference**, not the tag — this is the
+     link the tag-based check cannot make;
+   - assert the digest reported by the build step equals the digest recorded in
+     `docker image inspect --format '{{index .RepoDigests 0}}'`.
+3. The job **fails the workflow** on any mismatch, and the staging deploy step
+   `needs:` it — so a mislabelled or misreported artifact is never deployed and
+   never reaches the ledger.
+4. The script itself is provider-neutral and takes the image reference as an
+   argument; it hard-codes no registry.
+
+**Failing tests first**
+
+`deploy/tests/test_image_provenance_script.py`, stubbing `docker` on `PATH`
+exactly as Task 09 does:
+- `test_matching_revision_passes`.
+- `test_mismatching_revision_fails` — and the message names the label.
+- `test_missing_revision_label_fails` — empty and absent both fail.
+- `test_compatibility_is_checked_when_expected_value_is_given`.
+- `test_compatibility_is_not_checked_when_omitted` — the web image has no such
+  label and must still pass.
+- `test_inspect_failure_fails_closed`.
+- `test_script_pulls_nothing_and_mutates_nothing` — the stub records argv;
+  assert no `pull`, `run`, `push`, `rm`, `tag` or `build` invocation.
+
+Additions to `deploy/tests/test_workflows.py`:
+- `test_pr_job_verifies_provenance_for_both_images` — the script is invoked
+  twice in `ci.yml`, once per image.
+- `test_main_job_verifies_provenance_by_digest_for_both_images` — in
+  `deploy-staging.yml`, both invocations use an `@${{ steps.` digest reference,
+  and neither uses a `:` tag reference.
+- `test_main_job_pulls_each_digest_before_verifying`.
+- `test_staging_deploy_step_needs_the_provenance_job` — the deploy step or job
+  declares `needs:` on the provenance job, so provenance gates deployment.
+- `test_provenance_script_is_not_part_of_the_control_plane` — it lives under
+  `deploy/scripts/` but is **not** installed by `pi-install-control-plane`
+  (Task 14 installs an explicit list); assert the installer does not reference
+  it. It runs in CI, never on the VPS, so it grants CI no server capability.
+
+```bash
+cd /home/user/product-intelligence && .venv/bin/python -m pytest deploy/tests -q -p no:cacheprovider
+```
+**Expected failure:** `FileNotFoundError` on
+`deploy/scripts/verify-image-provenance.sh`, then workflow assertions failing
+until both workflows call it.
+
+**Verification**
+```bash
+bash -n deploy/scripts/verify-image-provenance.sh && echo "SYNTAX OK"
+cd /home/user/product-intelligence && .venv/bin/python -m pytest deploy/tests -q -p no:cacheprovider
+python3 -c "import yaml;[yaml.safe_load(open(f)) for f in ['.github/workflows/ci.yml','.github/workflows/deploy-staging.yml']];print('WORKFLOW YAML OK')"
+```
+
+**Environment note, stated rather than discovered later.** This implementation
+environment has no Docker daemon (`docker ps` fails; `docker compose config`
+works because it renders locally). The label-on-a-real-image assertions
+therefore cannot execute here — they execute in CI, on the pull request that
+Task 19 opens, which is **before** Part 1 merges. Task 19 records the CI run
+result as the evidence for this task. Do not mark Task 16B verified on the
+strength of the stubbed tests alone.
+
+**Commit:** `ci: verify artifact provenance for both images`
 
 ---
 
@@ -2021,7 +2143,7 @@ Every section of the approved design maps to at least one task.
 | §5 Docker and network topology | 04, 05, 06, L07 |
 | §6 Staging relocation | L02, L07, L08, L09, L10 |
 | §7 Caddy migration | 06, L09, L10 |
-| §8 Artifacts, GHCR, digests | 03, 12, 13, 16, L06, L08 |
+| §8 Artifacts, GHCR, digests | 03, 12, 13, 16, **16B**, L06, L08 |
 | §9 Migration as a release step | 02, 12, 13 |
 | §10 CI design | 15, 16, 17; §10.4 → 01 |
 | §11 Migration policy | 03, 09, 13 |
@@ -2065,6 +2187,7 @@ Run against the 15 required checks.
 | 12 | No live work before repository merge | Part 2 preamble plus the Task 19 GATE |
 | 13 | No task touches unrelated services | Plan §0 rule 3; L01 and L10/L15 baseline-compare their uptimes; forbidden-command grep in Task 19 |
 | 14 | Capacity is a GO/STOP gate, not a claim | Task L12 states the decision table **before** the numbers, forbids adding swap or degrading staging, and blocks all production tasks |
+| 16 | Provenance chain SHA → label → digest proven before Task 19 | Task **16B**: real builds in CI verify both images' revision labels, the API compatibility label, and that the reported digest is the fetchable one; the staging deploy `needs:` that job. Static links are held by 03, 09, 12, 13 |
 | 15 | Rollback never claims to restore the database | Task 11 requirement 1 and `test_rollback_never_touches_the_database`; `docs/DEPLOY.md` §8 states plainly that no database rollback and no backup exist in M7 |
 
 **Issues found and fixed inline while writing this plan**
