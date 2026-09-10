@@ -28,6 +28,10 @@ next-env.d.ts
 # Local data
 /postgres-data/
 
+# collectstatic output. Generated, never authored: the container writes it to
+# DJANGO_STATIC_ROOT, and running the API locally writes it here.
+/apps/api/staticfiles/
+
 # Google OAuth client downloads. Narrow on purpose: only Google's own
 # client_secret*.json naming, so unrelated JSON stays tracked.
 client_secret*.json

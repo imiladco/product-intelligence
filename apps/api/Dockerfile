@@ -36,3 +36,7 @@ EXPOSE 8000
 
 COPY --chown=appuser:appuser docker/api/entrypoint.sh /app/entrypoint.sh
 ENTRYPOINT ["/app/entrypoint.sh"]
+# Explicit, so the default is a word the entrypoint recognises rather than an
+# empty argument list. `docker compose run api python manage.py migrate`
+# replaces it and runs that instead (design §9.1).
+CMD ["serve"]
