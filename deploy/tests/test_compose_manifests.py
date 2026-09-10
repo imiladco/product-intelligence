@@ -245,3 +245,34 @@ class TestBothManifests:
 
     def test_api_start_period_is_the_reduced_value(self, manifest):
         assert manifest["services"]["api"]["healthcheck"]["start_period"] == "45s"
+
+
+class TestEnvFileStaysRequired:
+    """`env_file: [.env]` must stay mandatory in both manifests.
+
+    Compose refuses to render a manifest whose env_file is missing, which is
+    what makes a deploy with no configuration impossible. Marking it
+    `required: false` would turn that hard stop into a container starting with
+    no database URL, no secret key and no encryption keys.
+
+    This is the same shape of decision as the ACME email: CI supplies a
+    placeholder for the file, rather than the manifest excusing its absence.
+    """
+
+    def test_both_manifests_require_the_env_file(self):
+        for path in (STAGING, PRODUCTION):
+            manifest = load(path)
+            for name, service in manifest["services"].items():
+                declared = service.get("env_file")
+                if declared is None:
+                    continue
+                entries = declared if isinstance(declared, list) else [declared]
+                for entry in entries:
+                    assert not isinstance(entry, dict) or entry.get("required") is not False, (
+                        f"{path.name}: {name} makes its env_file optional"
+                    )
+
+    def test_the_api_service_reads_the_env_file(self):
+        for path in (STAGING, PRODUCTION):
+            manifest = load(path)
+            assert manifest["services"]["api"].get("env_file"), path.name
