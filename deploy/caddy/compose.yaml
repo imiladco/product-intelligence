@@ -1,0 +1,68 @@
+# Shared reverse proxy — its own Compose project, independent of both
+# application deployments.
+#
+#   docker compose -f compose.yaml up -d
+#
+# Deploying staging or production touches only that environment's project, so
+# nothing in an ordinary release recreates or restarts this container. Changing
+# Caddy is its own explicit operation, and adding a site block later is a
+# `caddy reload`, not a recreate.
+#
+# This container owns host ports 80 and 443. Only one process can, which is why
+# the one-time handoff stops the old staging Caddy before starting this one.
+
+name: product-intelligence-shared
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # One mount per environment, at distinct paths. Read-only: the proxy
+      # serves these assets, the release step writes them.
+      - staging_static:/srv/static/staging:ro
+      - production_static:/srv/static/production:ro
+    # Deliberately no depends_on: coupling the proxy's lifecycle to an
+    # application service would make a deployment able to take the proxy down.
+    networks: [staging_edge, production_edge]
+
+volumes:
+  # Legacy staging names, adopted rather than recreated. They hold the ACME
+  # account and the live staging certificate, and they now serve both
+  # hostnames. Reusing them means the handoff issues no new certificate and
+  # stays well inside Let's Encrypt's rate limits; renaming them would mean
+  # copying certificate state for the sake of a tidier string.
+  caddy_data:
+    external: true
+    name: product-intelligence-staging_caddy_data
+  caddy_config:
+    external: true
+    name: product-intelligence-staging_caddy_config
+
+  staging_static:
+    external: true
+    name: product-intelligence-staging_static
+  # Created empty by the storage skeleton before the handoff. It is external,
+  # so Caddy cannot start without it — which would otherwise make the proxy
+  # wait on production bootstrap, a circular dependency.
+  production_static:
+    external: true
+    name: product-intelligence-production_static
+
+# Both edge networks, and neither internal network: the proxy has no route to
+# either database.
+networks:
+  staging_edge:
+    external: true
+    name: product-intelligence-staging-edge
+  production_edge:
+    external: true
+    name: product-intelligence-production-edge

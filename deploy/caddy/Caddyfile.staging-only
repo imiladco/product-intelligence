@@ -1,0 +1,40 @@
+# Shared reverse proxy — STAGING ONLY.
+#
+# This is the file installed for the one-time Caddy handoff, before
+# app.arkav.lol has a DNS record. A site block for a hostname that does not
+# resolve makes Caddy retry the ACME challenge against it indefinitely, so
+# production is deliberately absent here.
+#
+# Once app.arkav.lol resolves to this host, an explicit control-plane update
+# installs docker/caddy/Caddyfile (both sites) and reloads Caddy. A reload, not
+# a recreate: the running staging site is not disturbed.
+#
+# Everything below is identical to the staging half of that file.
+
+{
+	email {$ACME_EMAIL}
+}
+
+staging.arkav.lol {
+	encode zstd gzip
+
+	# Django admin and DRF assets, written by the release step into this
+	# environment's own static volume. Mounted at its own path, so the two
+	# environments' assets cannot be served from one root.
+	handle_path /static/* {
+		root * /srv/static/staging
+		file_server
+	}
+
+	handle /api/* {
+		reverse_proxy staging-api:8000
+	}
+
+	handle /admin/* {
+		reverse_proxy staging-api:8000
+	}
+
+	handle {
+		reverse_proxy staging-web:3000
+	}
+}
