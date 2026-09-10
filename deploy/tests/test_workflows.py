@@ -288,6 +288,61 @@ class TestStagingPublishAndDeploy:
             assert "== 'true'" in condition or '== "true"' in condition, condition
             assert "!=" not in condition, f"a negated gate arms by default: {condition}"
 
+    def test_the_deploy_job_requires_publish_to_have_succeeded(self, staging):
+        """The success requirement is written out, not left to the default.
+
+        GitHub already skips a job whose `needs` dependency failed, so this is
+        redundant today. It is stated because the default is silently lost the
+        moment a job-level `if` uses a status function -- see the test below,
+        which is the other half of this guard.
+        """
+        for name, job in staging["jobs"].items():
+            if not any("ssh " in str(step.get("run", "")) for step in (job.get("steps") or [])):
+                continue
+            condition = str(job.get("if", ""))
+            assert "needs.publish.result == 'success'" in condition, (
+                f"{name} does not explicitly require a successful publish: {condition!r}"
+            )
+
+    def test_no_job_level_status_function_can_defeat_the_needs_gate(self, staging):
+        """A job-level always(), failure() or cancelled() overrides `needs`.
+
+        This is the specific edit that would turn the whole gate into
+        decoration: with always() on the deploy job, a *failed* publish -- one
+        whose provenance verification did not pass, or which never pushed the
+        images at all -- would still be followed by an SSH deploy.
+
+        Checked on every job in this workflow, not only the deploy job: which
+        job holds the ssh step is an implementation detail that has already
+        changed once.
+        """
+        for name, job in staging["jobs"].items():
+            condition = str(job.get("if", ""))
+            for function in ("always()", "failure()", "cancelled()"):
+                assert function not in condition, (
+                    f"job-level {function} on {name!r} overrides its needs gate: {condition!r}"
+                )
+
+    def test_step_level_always_stays_allowed(self, staging):
+        """The guard above must not over-reach.
+
+        Cleanup that has to run even when the step before it failed is exactly
+        what step-level always() is for -- removing the deploy key is the case
+        here -- and step conditions have no bearing on job gating. A guard that
+        banned always() everywhere would force that key to be left behind on a
+        failed deploy, trading a real secret-hygiene property for nothing.
+        """
+        cleanup = [
+            step
+            for job in staging["jobs"].values()
+            for step in (job.get("steps") or [])
+            if str(step.get("if", "")) == "always()"
+        ]
+        assert cleanup, "expected at least one step-level always() to remain permitted"
+        assert any("rm -f ~/.ssh/id_ed25519" in str(step.get("run", "")) for step in cleanup), (
+            "the deploy key removal must still run unconditionally"
+        )
+
     def test_publishing_is_not_gated_on_readiness(self, staging):
         """Building, pushing and verifying provenance are quality gates.
 

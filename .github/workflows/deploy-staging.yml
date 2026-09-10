@@ -164,9 +164,19 @@ jobs:
 
   deploy:
     needs: publish
-    # The gate. Fail-closed: anything other than exactly "true" — unset,
-    # empty, "TRUE", "yes" — leaves this job unrun.
-    if: ${{ vars.STAGING_DEPLOY_READY == 'true' }}
+    # Two conditions, both required, both fail-closed.
+    #
+    # `needs.publish.result == 'success'` is redundant under GitHub's default
+    # semantics — a job whose dependency failed or was skipped is skipped too.
+    # It is stated anyway because that default is silently lost the moment a
+    # job-level `if` uses always(), failure() or cancelled(): the job would
+    # then run on a *failed* publish, deploying images whose provenance was
+    # never verified. Written out, the requirement survives such an edit, and
+    # a test rejects job-level status functions here so the edit is caught.
+    #
+    # The readiness gate itself admits exactly "true". Unset, empty, "TRUE"
+    # and "yes" all leave this job unrun; no value defaults it on.
+    if: ${{ needs.publish.result == 'success' && vars.STAGING_DEPLOY_READY == 'true' }}
     runs-on: ubuntu-latest
     steps:
       # Setting the variable does not conjure the secrets. Checked here so the
