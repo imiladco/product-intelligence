@@ -241,7 +241,13 @@ class TestDeploymentDocumentation:
             name, sep, value = line.partition("=")
             if not sep or not name.strip().isupper() or " " in name.strip():
                 continue
-            assert value.strip() in ("", "'", '"'), line
+            value = value.strip()
+            # A `<…>` placeholder is unambiguously not a value: it cannot be
+            # pasted anywhere and work. Anything else that looks assigned is
+            # treated as a committed credential.
+            if value.startswith("<") and value.endswith(">"):
+                continue
+            assert value in ("", "'", '"'), line
 
     def test_staging_md_points_at_deploy_md(self):
         text = (REPO_ROOT / "docs" / "STAGING.md").read_text()

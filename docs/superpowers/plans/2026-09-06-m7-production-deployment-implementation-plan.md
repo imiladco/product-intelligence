@@ -1754,17 +1754,43 @@ pre-pulls images and needs headroom.
 
 - [ ] The user creates a credential meeting the §8.3 properties. **This plan
   does not read, print or store the value in any transcript.**
-- [ ] Install it as `0600 root:root` at `/etc/product-intelligence/ghcr.env`
-  using a non-echoing heredoc (the pattern in `docs/STAGING.md`).
+- [ ] Install it as `0600 root:root` at `/etc/product-intelligence/ghcr.env`,
+  with exactly this schema, written by a non-echoing heredoc so the token never
+  enters shell history:
+  ```bash
+  sudo install -d -m 0755 -o root -g root /etc/product-intelligence
+  sudo install -m 0600 -o root -g root /dev/null /etc/product-intelligence/ghcr.env
+  sudo tee /etc/product-intelligence/ghcr.env >/dev/null <<'ENV'
+  GHCR_USERNAME=<github username or bot account>
+  GHCR_TOKEN=<read-only packages token>
+  ENV
+  sudo stat -c '%U:%G %a' /etc/product-intelligence/ghcr.env   # expect: root:root 600
+  ```
+  Do not `echo` the token, and do not pass it as a command argument — arguments
+  are visible in `ps` to every user on the host.
+- [ ] **Verify the credential authenticates**, using the same code path a real
+  deploy uses. This is the check that matters: it proves the *file* works,
+  rather than proving that some earlier manual login is still cached.
+  ```bash
+  sudo bash -c 'source /usr/local/lib/pi-deploy/registry.sh && pi_registry_login'
+  ```
+  Expected: `Login Succeeded`. The token is read from the file and sent on
+  stdin; it never appears in `ps` or in the output.
+
+  A bare `docker login … --password-stdin < /dev/null` proves nothing — it
+  sends an empty password, and on a host with a cached login it can even appear
+  to succeed. Do not use it.
 - [ ] **Demonstrate pull capability** (property 1) and **absence of write**
   (property 2):
   ```bash
-  # as root, using the stored credential:
-  docker login ghcr.io --username <user> --password-stdin < /dev/null   # see DEPLOY.md for the exact non-echoing form
-  docker pull ghcr.io/imiladco/product-intelligence/api:<some-pushed-sha>
-  docker push ghcr.io/imiladco/product-intelligence/api:probe-should-fail   # EXPECTED TO FAIL
+  sudo docker pull ghcr.io/imiladco/product-intelligence/api:<some-pushed-sha>
+  sudo docker push ghcr.io/imiladco/product-intelligence/api:probe-should-fail   # EXPECTED TO FAIL
   ```
   Expected: pull succeeds; push is **denied**. Record both outcomes.
+- [ ] Confirm the `deploy` user cannot read the credential:
+  ```bash
+  sudo -u deploy cat /etc/product-intelligence/ghcr.env   # expect: Permission denied
+  ```
 
 **STOP if:** the push succeeds — the credential is over-privileged and must be
 replaced before continuing.
