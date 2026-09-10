@@ -73,8 +73,14 @@ pi_registry_login() {
         owner="$(stat -c '%u' "$file" 2>/dev/null)" || owner=""
         mode="$(stat -c '%a' "$file" 2>/dev/null)" || mode=""
 
-        if [[ "$owner" != "0" ]]; then
-            _pi_registry_fail "credential file must be owned by root: ${file} (uid ${owner:-unknown})"
+        # Owned by whoever is running this script. On a deploy host that is
+        # root, because sudo runs the deploy scripts as root -- so in
+        # production this is exactly "must be owned by root". Stating it as
+        # EUID rather than a literal 0 keeps the real invariant ("no account
+        # but the one performing the deploy can read this") true wherever it
+        # runs, with no environment override to weaken it.
+        if [[ "$owner" != "$EUID" ]]; then
+            _pi_registry_fail "credential file must be owned by the deploying user (uid ${EUID}): ${file} (uid ${owner:-unknown})"
             status=1
         elif [[ "$mode" != "600" ]]; then
             # Anything a second user can read is not a secret any more.

@@ -240,6 +240,27 @@ class TestCredentialRemainsOutOfReachOfTheDeployUser:
     property is enforced at every deploy rather than only at bootstrap.
     """
 
+    def test_ownership_is_checked_against_the_deploying_user(self):
+        """On a deploy host sudo makes that root, so this is "owned by root"
+        in production. Written as EUID rather than a literal 0 so the check is
+        the real invariant -- no account but the one performing the deploy can
+        read it -- and so the tests exercise the same code path CI runs."""
+        code = executable_lines(REGISTRY_LIB)
+        assert '"$EUID"' in code
+
+    def test_there_is_no_override_for_the_ownership_or_mode_checks(self):
+        """A knob to relax these would be a test-only escape hatch that ships.
+
+        Only the file path and the registry may come from the environment.
+        """
+        code = executable_lines(REGISTRY_LIB)
+        overridable = {
+            line.split("=", 1)[0].strip()
+            for line in code.splitlines()
+            if ":-" in line and line.strip().startswith("PI_")
+        }
+        assert overridable <= {"PI_GHCR_REGISTRY", "PI_GHCR_CREDENTIAL_FILE"}, overridable
+
     def test_the_helper_requires_root_ownership_and_0600(self):
         code = executable_lines(REGISTRY_LIB)
         assert "'%u'" in code, "ownership is never checked"
