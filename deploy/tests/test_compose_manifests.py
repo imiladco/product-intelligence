@@ -147,3 +147,101 @@ class TestStagingTopology:
     def test_staging_api_start_period_is_reduced(self, staging):
         """120s was sized for entrypoint migrations, which no longer run."""
         assert staging["services"]["api"]["healthcheck"]["start_period"] == "45s"
+
+
+@pytest.fixture(scope="module")
+def production() -> dict:
+    return load(PRODUCTION)
+
+
+class TestProductionIdentity:
+    def test_production_manifest_exists(self):
+        assert PRODUCTION.is_file()
+
+    def test_production_project_name_is_pinned(self, production):
+        assert production["name"] == PRODUCTION_PROJECT
+
+    def test_production_volumes_are_external_by_exact_name(self, production):
+        names = external_volume_names(production)
+        assert names["pgdata"] == PRODUCTION_PGDATA
+        assert names["static"] == PRODUCTION_STATIC
+
+    def test_production_networks_are_external_by_exact_name(self, production):
+        names = external_network_names(production)
+        assert names["internal"] == "product-intelligence-production-internal"
+        assert names["edge"] == "product-intelligence-production-edge"
+
+    def test_no_production_volume_or_network_names_a_staging_resource(self, production):
+        """A copy-paste that left a staging name behind would attach production
+        to the staging database — the worst outcome available in this file."""
+        for spec in (production.get("volumes") or {}).values():
+            assert "staging" not in spec["name"]
+        for spec in (production.get("networks") or {}).values():
+            assert "staging" not in spec["name"]
+
+
+class TestProductionTopology:
+    def test_production_edge_aliases_do_not_collide_with_staging(
+        self, staging, production
+    ):
+        """The single most dangerous copy-paste in this milestone.
+
+        Two projects both aliasing `staging-api` on their own edge network
+        would leave shared Caddy resolving whichever it found, and production
+        traffic could land on staging.
+        """
+        staging_aliases = set(edge_aliases(staging, "api")) | set(
+            edge_aliases(staging, "web")
+        )
+        production_aliases = set(edge_aliases(production, "api")) | set(
+            edge_aliases(production, "web")
+        )
+        assert staging_aliases.isdisjoint(production_aliases)
+        assert production_aliases == {"production-api", "production-web"}
+
+    def test_production_postgres_is_not_on_the_edge_network(self, production):
+        assert list(production["services"]["postgres"]["networks"]) == ["internal"]
+
+    def test_production_ssr_targets_the_internal_service_name(self, production):
+        env = production["services"]["web"]["environment"]
+        assert env["INTERNAL_API_BASE_URL"] == "http://api:8000"
+        assert "production-api" not in str(env)
+
+    def test_production_api_receives_the_release_sha(self, production):
+        assert (
+            production["services"]["api"]["environment"]["RELEASE_SHA"]
+            == "${RELEASE_SHA}"
+        )
+
+
+class TestBothManifests:
+    """Invariants that must hold for every environment, checked together so a
+    new environment cannot be added without them."""
+
+    @pytest.fixture(params=[STAGING, PRODUCTION], ids=["staging", "production"])
+    def manifest(self, request) -> dict:
+        return load(request.param)
+
+    def test_neither_manifest_contains_a_build_section(self, manifest):
+        for name, service in manifest["services"].items():
+            assert "build" not in service, f"{name} would build on the server"
+
+    def test_neither_manifest_publishes_ports(self, manifest):
+        for name, service in manifest["services"].items():
+            assert "ports" not in service, f"{name} publishes a host port"
+
+    def test_neither_manifest_runs_caddy(self, manifest):
+        assert "caddy" not in manifest["services"]
+
+    def test_every_volume_is_external(self, manifest):
+        external_volume_names(manifest)  # asserts internally
+
+    def test_every_network_is_external(self, manifest):
+        external_network_names(manifest)  # asserts internally
+
+    def test_api_and_web_consume_image_variables(self, manifest):
+        assert manifest["services"]["api"]["image"] == "${API_IMAGE}"
+        assert manifest["services"]["web"]["image"] == "${WEB_IMAGE}"
+
+    def test_api_start_period_is_the_reduced_value(self, manifest):
+        assert manifest["services"]["api"]["healthcheck"]["start_period"] == "45s"
