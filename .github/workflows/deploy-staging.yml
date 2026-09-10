@@ -1,0 +1,103 @@
+# Build once, publish, deploy staging. Runs only after CI has passed on main.
+#
+# This is the only workflow permitted to write packages, and the only one that
+# reaches the staging server. It sends release DATA — a SHA and two digests —
+# over a forced SSH command. It cannot install a script, a manifest or a key on
+# that host; the control plane is installed by a human with root, from a
+# reviewed commit, and nothing here can change it.
+name: Deploy staging
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One staging deploy at a time. The server also holds a lock, but queuing
+  # here keeps the workflow log honest about what is waiting.
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  publish-and-deploy:
+    # A red gate publishes nothing and deploys nothing.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read the migration compatibility declaration
+        id: metadata
+        run: |
+          COMPAT="$(python3 -c "import json;print(str(json.load(open('deploy/release-metadata.json'))['migrations_backward_compatible']).lower())")"
+          echo "compat=${COMPAT}" >> "$GITHUB_OUTPUT"
+
+      # Tagged by the full commit SHA for human lookup. Nothing deploys by that
+      # tag: the digests below are the deployment identity.
+      - name: Build and push API image
+        id: api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: ghcr.io/imiladco/product-intelligence/api:${{ github.event.workflow_run.head_sha }}
+          build-args: |
+            GIT_SHA=${{ github.event.workflow_run.head_sha }}
+            MIGRATIONS_BACKWARD_COMPATIBLE=${{ steps.metadata.outputs.compat }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push web image
+        id: web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: ghcr.io/imiladco/product-intelligence/web:${{ github.event.workflow_run.head_sha }}
+          build-args: |
+            GIT_SHA=${{ github.event.workflow_run.head_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Prepare SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.STAGING_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # The whole client request: a verb, a SHA and two digests. The server's
+      # forced command supplies the environment, so this cannot name production
+      # however it is written.
+      - name: Deploy staging
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes \
+              -i ~/.ssh/id_ed25519 \
+              "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+              "deploy ${SHA} ${API_DIGEST} ${WEB_DIGEST}"
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

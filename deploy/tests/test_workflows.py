@@ -35,6 +35,13 @@ def load(path: Path) -> dict:
 
 
 def all_run_steps(workflow: dict) -> str:
+    """Everything a step actually carries: its command, its action, its inputs
+    and its environment.
+
+    `env` matters as much as the rest — a digest passed to a step arrives that
+    way, and a helper that skipped it would report the workflow as sending no
+    digest at all.
+    """
     lines = []
     for job in workflow.get("jobs", {}).values():
         for step in job.get("steps", []) or []:
@@ -44,6 +51,8 @@ def all_run_steps(workflow: dict) -> str:
                 lines.append(str(step["uses"]))
             for value in (step.get("with") or {}).values():
                 lines.append(str(value))
+            for key, value in (step.get("env") or {}).items():
+                lines.append(f"{key}: {value}")
     return "\n".join(lines)
 
 
@@ -104,8 +113,14 @@ class TestStagingPublishAndDeploy:
         assert "pull_request" not in staging["on"]
 
     def test_it_pushes_by_full_sha_tag(self, staging):
+        """Either github.sha or workflow_run.head_sha.
+
+        On a workflow_run trigger the second is the correct one: github.sha is
+        main's head when the event fired, which can already have moved past the
+        commit CI actually validated.
+        """
         text = all_run_steps(staging)
-        assert "github.sha" in text
+        assert "github.sha" in text or "workflow_run.head_sha" in text
 
     def test_it_passes_both_build_args(self, staging):
         text = all_run_steps(staging)
@@ -117,16 +132,27 @@ class TestStagingPublishAndDeploy:
 
     def test_it_sends_both_digests_to_the_deploy_command(self, staging):
         text = all_run_steps(staging)
-        assert "outputs.digest" in text
-        assert "deploy ${{ github.sha }}" in text or "deploy $SHA" in text
+        assert text.count("outputs.digest") >= 2, "both digests must be sent"
+        assert "deploy ${SHA}" in text or "deploy $SHA" in text
 
     def test_it_never_deploys_by_tag(self, staging):
-        """The deploy command must carry digests, not a tag reference."""
-        text = all_run_steps(staging)
-        deploy_lines = [ln for ln in text.splitlines() if "deploy " in ln and "ssh" in ln.lower()]
-        assert deploy_lines, "no ssh deploy command found"
-        for line in deploy_lines:
-            assert "outputs.digest" in line, line
+        """The deploy command carries digests, not a tag reference.
+
+        Checked per run-step, not per line: the ssh invocation is wrapped
+        across several lines, so a line-based grep would miss it entirely.
+        """
+        ssh_steps = [
+            str(step["run"])
+            for job in staging["jobs"].values()
+            for step in (job.get("steps") or [])
+            if "run" in step and "ssh " in str(step["run"])
+        ]
+        assert ssh_steps, "no ssh deploy step found"
+        for block in ssh_steps:
+            assert "deploy ${SHA}" in block, block
+            assert "${API_DIGEST}" in block and "${WEB_DIGEST}" in block, block
+            # A tag reference would be repo:sha rather than repo@sha256:.
+            assert "/api:" not in block and "/web:" not in block, block
 
     def test_it_uses_only_the_staging_key(self, staging):
         text = str(staging)
@@ -211,8 +237,23 @@ class TestNoWorkflowTouchesTheControlPlane:
             assert "/opt/product-intelligence" not in text, workflow.name
 
     def test_deploy_workflows_send_only_the_deploy_grammar(self):
-        """The SSH command is `deploy …` or `status`, never a shell command."""
+        """The SSH command is `deploy …`, never a shell command.
+
+        The forced command on the server would reject anything else, but a
+        workflow that tried is a design error worth catching here.
+        """
         for path in (STAGING, PRODUCTION):
-            for line in all_run_steps(load(path)).splitlines():
-                if "ssh " in line and "deploy@" in line:
-                    assert '"deploy' in line or "'deploy" in line, line
+            if not path.exists():
+                continue
+            workflow = load(path)
+            ssh_steps = [
+                str(step["run"])
+                for job in workflow["jobs"].values()
+                for step in (job.get("steps") or [])
+                if "run" in step and "ssh " in str(step["run"])
+            ]
+            for block in ssh_steps:
+                assert '"deploy ' in block, block
+                for forbidden in ("&&", ";", "|", "$(", "`"):
+                    remote = block.split('"deploy ', 1)[1].split('"', 1)[0]
+                    assert forbidden not in remote, f"{path.name}: {remote}"
