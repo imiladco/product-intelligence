@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# The forced command. Every deploy over SSH enters here and nowhere else.
+#
+#   command="/usr/local/bin/pi-deploy-wrapper staging",restrict,no-pty ssh-ed25519 …
+#
+# The environment is THIS SCRIPT'S FIRST ARGUMENT, written by root into a file
+# `deploy` cannot modify. The client's text arrives only in SSH_ORIGINAL_COMMAND
+# and is never consulted to choose an environment, never executed, and never
+# interpolated into a shell. A stolen staging key can therefore deploy staging
+# with any SHA it likes — and cannot address production at all.
+set -euo pipefail
+
+PI_LIB_DIR="${PI_LIB_DIR:-/usr/local/lib/pi-deploy}"
+# shellcheck source=lib/validate.sh
+source "${PI_LIB_DIR}/validate.sh"
+
+environment="${1-}"
+
+if ! pi_validate_environment "$environment"; then
+    echo "invalid command" >&2
+    exit 2
+fi
+
+# Parsed here so a malformed request never reaches sudo. The parser returns the
+# accepted words; anything else exits 2 without echoing the input.
+parsed="$(pi_parse_command "$environment" "${SSH_ORIGINAL_COMMAND:-}")" || exit 2
+
+# Read into an array and passed as separate arguments. Never a single string,
+# and never through a shell.
+declare -a words=()
+read -r -a words <<< "$parsed"
+
+exec sudo -n "/usr/local/sbin/pi-deploy-${environment}" "${words[@]}"

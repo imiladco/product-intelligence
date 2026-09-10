@@ -1,0 +1,17 @@
+# ~deploy/.ssh/authorized_keys — installed ROOT-OWNED so `deploy` cannot edit it.
+#
+# The environment is an argument of the FORCED COMMAND, not something the client
+# sends. That is what makes a stolen staging key unable to address production:
+# it can ask for anything it likes, and it still reaches pi-deploy-wrapper with
+# the word `staging`.
+#
+# `restrict` disables port forwarding, agent forwarding, X11 and PTY
+# allocation; `no-pty` is kept explicit so a future sshd default cannot quietly
+# re-enable it. Do not add any option that re-enables forwarding.
+#
+# Replace PUBLIC_KEY_HERE with the real public keys. Public keys are not
+# secrets, but none is committed here — the file in the repository is a
+# template, and the real one is assembled on the server.
+
+command="/usr/local/bin/pi-deploy-wrapper staging",restrict,no-pty ssh-ed25519 PUBLIC_KEY_HERE deploy-staging
+command="/usr/local/bin/pi-deploy-wrapper production",restrict,no-pty ssh-ed25519 PUBLIC_KEY_HERE deploy-production
