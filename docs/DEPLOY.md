@@ -99,6 +99,44 @@ Adding the production site block before DNS resolves produces repeated ACME
 failures against a hostname that does not exist. Adding it later is a
 `caddy reload`, not a recreate, so it does not disturb the running staging site.
 
+### The `deploy` account
+
+Created once, by hand, as root:
+
+```bash
+useradd --system --create-home --shell /bin/bash deploy
+install -d -m 0700 -o deploy -g deploy /home/deploy/.ssh
+install -m 0644 -o root -g root ./authorized_keys /home/deploy/.ssh/authorized_keys
+```
+
+**The login shell must be a real shell.** sshd executes a forced command
+through the account's login shell, as `shell -c "<command>"`. With
+`/usr/sbin/nologin` or `/bin/false` the shell prints its refusal and exits
+before `pi-deploy-wrapper` is ever reached, so every deploy fails — and it
+fails in a way that looks like a key or network problem rather than a shell
+problem.
+
+A normal shell does not weaken anything, because the shell was never the
+boundary. Three other things are:
+
+* **The forced command.** Every key carries
+  `command="/usr/local/bin/pi-deploy-wrapper <environment>"`. sshd runs that and
+  only that. The client's own string is passed as `SSH_ORIGINAL_COMMAND`, which
+  the wrapper parses and never executes — so `ssh deploy@host "docker ps"` runs
+  the wrapper, not `docker ps`.
+* **The key restrictions.** `restrict` denies port forwarding, agent
+  forwarding, X11 and PTY allocation; `no-pty` is repeated explicitly so a
+  future sshd default cannot quietly re-enable it. There is no interactive
+  session to be had with either key.
+* **sudo, allow-listed to two exact paths.** `deploy` may run
+  `/usr/local/sbin/pi-deploy-{staging,production}` as root and nothing else,
+  cannot edit them (they are `root:root`), and is **not** in the `docker` group.
+
+`authorized_keys` is installed `root:root` so `deploy` can read it but never
+rewrite its own restrictions. Each key is bound to one environment by the
+forced command's argument, which is why a stolen staging key cannot address
+production however it is used.
+
 The installer places, all `root:root`:
 
 ```

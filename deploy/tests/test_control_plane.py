@@ -183,6 +183,89 @@ class TestAuthorizedKeysTemplate:
                 assert blobs == [], "a real public key was committed"
 
 
+class TestDeployAccountShell:
+    """The deploy account must have a real login shell.
+
+    sshd runs a forced command through the account's login shell, as
+    `shell -c "<command>"`. With /usr/sbin/nologin or /bin/false the shell
+    prints its refusal and exits before pi-deploy-wrapper is reached, so every
+    deploy fails -- and it fails looking like a key or network fault rather
+    than a shell fault, which is the expensive part.
+
+    A normal shell costs nothing here because the shell was never the security
+    boundary: the forced command, the key restrictions and the sudo allow-list
+    are, and each is asserted elsewhere in this file. This class exists so the
+    tempting "harden it with nologin" edit cannot be made silently.
+    """
+
+    NON_COMMAND_SHELLS = ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false")
+
+    def instructions(self) -> list[tuple[Path, str]]:
+        """Every repository file that tells a human how to create the account.
+
+        This directory is excluded: a source scan that reads its own assertions
+        back as findings reports itself, not the repository.
+        """
+        tests_dir = Path(__file__).resolve().parent
+        found = []
+        for path in sorted(REPO_ROOT.glob("docs/**/*.md")) + sorted(
+            REPO_ROOT.glob("deploy/**/*")
+        ):
+            if not path.is_file() or tests_dir in path.resolve().parents:
+                continue
+            try:
+                text = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            if "useradd" in text and "deploy" in text:
+                found.append((path, text))
+        return found
+
+    def test_the_account_creation_is_documented_somewhere(self):
+        assert self.instructions(), "no file explains how to create the deploy user"
+
+    def test_no_instruction_gives_the_deploy_user_a_non_command_shell(self):
+        for path, text in self.instructions():
+            for line in text.splitlines():
+                if "useradd" not in line or line.lstrip().startswith("#"):
+                    continue
+                for shell in self.NON_COMMAND_SHELLS:
+                    assert shell not in line, (
+                        f"{path.relative_to(REPO_ROOT)} creates deploy with {shell}, "
+                        "which cannot run a forced command"
+                    )
+
+    def test_every_instruction_sets_an_explicit_shell(self):
+        """Omitting --shell would inherit whatever /etc/default/useradd says,
+        which on a hardened base image is often nologin."""
+        for path, text in self.instructions():
+            for line in text.splitlines():
+                if "useradd" not in line or line.lstrip().startswith("#"):
+                    continue
+                assert "--shell" in line or "-s " in line, (
+                    f"{path.relative_to(REPO_ROOT)} leaves the shell to the system default: {line.strip()}"
+                )
+
+    def test_the_boundary_is_still_the_forced_command_not_the_shell(self):
+        """The restrictions that actually contain this account, asserted here
+        too, so a shell change can never land without them."""
+        text = AUTHORIZED_KEYS.read_text()
+        forced = [line for line in text.splitlines() if line.startswith("command=")]
+        assert len(forced) == 2, "expected one staging and one production key"
+        for line in forced:
+            assert "pi-deploy-wrapper" in line, line
+            assert "restrict" in line, line
+            assert "no-pty" in line, line
+
+    def test_the_documentation_explains_why_a_real_shell_is_required(self):
+        """A future reader must find the reason, or the nologin edit gets
+        made again by someone doing the responsible-looking thing."""
+        text = (REPO_ROOT / "docs" / "DEPLOY.md").read_text()
+        normalised = " ".join(text.split())
+        assert "nologin" in normalised
+        assert "forced command" in normalised
+
+
 class TestInstaller:
     def test_it_requires_root(self):
         code = executable_lines(INSTALLER)
