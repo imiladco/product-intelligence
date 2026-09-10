@@ -140,7 +140,39 @@ class TestCiGates:
 
     def test_it_validates_the_caddyfiles(self, ci):
         """`caddy validate` needs a daemon, which CI has and the dev box does not."""
-        assert "caddy validate" in all_run_steps(ci)
+        text = all_run_steps(ci)
+        assert "caddy validate" in text
+        assert "docker/caddy/Caddyfile" in text
+        assert "deploy/caddy/Caddyfile.staging-only" in text
+
+    def test_the_caddy_validation_supplies_an_acme_email(self, ci):
+        """The Caddyfiles read `email {$ACME_EMAIL}`, which Caddy expands at
+        parse time. Unset, it becomes a bare `email` with no argument and the
+        file does not parse -- so validation fails on a perfectly good config.
+
+        The placeholder belongs in CI rather than as a default in the
+        Caddyfile: a Caddy with no ACME contact should refuse to start on the
+        server, and a default would quietly take that guard away.
+        """
+        steps = [
+            step
+            for job in ci["jobs"].values()
+            for step in (job.get("steps") or [])
+            if "caddy validate" in str(step.get("run", ""))
+        ]
+        assert steps, "no caddy validation step"
+        for step in steps:
+            assert "ACME_EMAIL" in (step.get("env") or {}), step.get("name")
+
+    def test_no_caddyfile_defaults_the_acme_email(self):
+        """A `{$ACME_EMAIL:something}` default would make a misconfigured
+        server start with the wrong ACME contact instead of failing."""
+        for caddyfile in (
+            REPO_ROOT / "docker" / "caddy" / "Caddyfile",
+            REPO_ROOT / "deploy" / "caddy" / "Caddyfile.staging-only",
+        ):
+            assert "{$ACME_EMAIL}" in caddyfile.read_text(), caddyfile
+            assert "{$ACME_EMAIL:" not in caddyfile.read_text(), caddyfile
 
     def test_it_has_no_registry_login_and_no_ssh(self, ci):
         text = all_run_steps(ci)

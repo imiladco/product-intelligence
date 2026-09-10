@@ -153,12 +153,20 @@ jobs:
       # `caddy validate` needs a Docker daemon. CI has one; the development
       # environment does not, so this is where the real check happens before
       # the live cutover depends on it.
+      # ACME_EMAIL is supplied here because the runtime supplies it there: the
+      # Caddyfiles use `email {$ACME_EMAIL}`, and Caddy expands that at parse
+      # time. Unset, it becomes a bare `email` with no argument and the file
+      # does not parse. That is the correct behaviour on the server -- a Caddy
+      # with no ACME contact should refuse to start rather than run -- so the
+      # placeholder belongs in CI, not as a default in the Caddyfile.
       - name: Validate Caddy configuration
+        env:
+          ACME_EMAIL: ci@example.invalid
         run: |
-          docker run --rm -v "$PWD/docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-          docker run --rm -v "$PWD/deploy/caddy/Caddyfile.staging-only:/etc/caddy/Caddyfile:ro" \
-            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          for caddyfile in docker/caddy/Caddyfile deploy/caddy/Caddyfile.staging-only; do
+            docker run --rm -e ACME_EMAIL -v "$PWD/$caddyfile:/etc/caddy/Caddyfile:ro" \
+              caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          done
 
       - name: Validate deployment manifests
         run: |
