@@ -72,6 +72,42 @@ jobs:
       - name: Deploy script tests
         run: python -m pytest deploy/tests -q -p no:cacheprovider
 
+  # Does GitHub actually know about the workflow files in this repository?
+  #
+  # A workflow can be committed, valid, reviewed and merged and still never
+  # run: workflow_run, workflow_dispatch and schedule are only ever delivered
+  # to a file on the DEFAULT branch. push and pull_request are not, because
+  # they run the file from the ref that triggered them -- which is why this
+  # job can be green while every deployment workflow is inert.
+  #
+  # Its own job so the failure reads as what it is, rather than as a test
+  # failure inside the backend suite.
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install pyyaml
+
+      # GitHub's own schema, not PyYAML's. The repository tests parse these
+      # files with PyYAML and assert what they contain, which cannot tell the
+      # difference between a workflow GitHub accepts and one it rejects.
+      - name: Validate workflow syntax against GitHub's schema
+        run: |
+          curl -sSfL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          tar xzf actionlint.tar.gz actionlint
+          ./actionlint -no-color -oneline .github/workflows/*.yml
+
+      - name: Every workflow is registered and reachable by its triggers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python deploy/scripts/check_workflow_registration.py
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

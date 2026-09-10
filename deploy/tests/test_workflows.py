@@ -174,6 +174,32 @@ class TestCiGates:
             assert "{$ACME_EMAIL}" in caddyfile.read_text(), caddyfile
             assert "{$ACME_EMAIL:" not in caddyfile.read_text(), caddyfile
 
+    def test_it_checks_that_github_registered_every_workflow(self, ci):
+        """The gap that let two inert deployment workflows look healthy.
+
+        Reading the YAML proves what a file says, never that GitHub has a
+        record of it or will ever deliver an event to it.
+        """
+        assert "check_workflow_registration.py" in all_run_steps(ci)
+
+    def test_the_registration_check_gets_a_token(self, ci):
+        """It queries the API; without credentials it exits 2 rather than
+        reporting success it cannot establish."""
+        steps = [
+            step
+            for job in ci["jobs"].values()
+            for step in (job.get("steps") or [])
+            if "check_workflow_registration.py" in str(step.get("run", ""))
+        ]
+        assert steps, "no registration check step"
+        for step in steps:
+            assert "GITHUB_TOKEN" in (step.get("env") or {}), step.get("name")
+
+    def test_it_validates_workflows_against_githubs_own_schema(self, ci):
+        """PyYAML parsing is not GitHub's schema. A workflow can parse cleanly
+        here and still be rejected or ignored there."""
+        assert "actionlint" in all_run_steps(ci)
+
     def test_it_has_no_registry_login_and_no_ssh(self, ci):
         text = all_run_steps(ci)
         assert "docker/login-action" not in text
