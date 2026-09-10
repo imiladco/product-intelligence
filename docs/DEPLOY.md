@@ -299,6 +299,26 @@ credential with these properties:
 
 ## 6. Staging: automatic deploys, and reading the ledger
 
+### The default branch must be the branch you merge to
+
+`deploy-staging.yml` uses `workflow_run` and `deploy-production.yml` uses
+`workflow_dispatch`. GitHub delivers **neither** to a workflow file that is not
+on the repository's **default branch** — and it does so silently: no error, no
+annotation, no run. The workflow's runs URL simply reports that it does not
+exist.
+
+`push` and `pull_request` have no such requirement, because they run the
+workflow file from the ref that triggered them. That asymmetry is the trap: CI
+passes on every commit while both deployment workflows are inert, and nothing
+in the repository looks wrong.
+
+So the repository's default branch must be the branch these workflows are
+merged to. CI enforces this on every run —
+`deploy/scripts/check_workflow_registration.py` asks GitHub which workflows it
+has registered and which exist on the default branch, and fails naming any that
+can never be triggered. It is read-only: two GETs and a per-file existence
+check, no mutation.
+
 ### The readiness gate
 
 `deploy-staging.yml` is two jobs. **`publish`** runs on every green CI on
